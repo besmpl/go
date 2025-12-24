@@ -1,0 +1,122 @@
+// Copyright 2025 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+//go:build race && !cgo
+
+package runtime
+
+import (
+	"internal/runtime/atomic"
+	_ "unsafe" // for go:linkname
+)
+
+// Kolkov detector state.
+// These are used for local tracking. The full implementation
+// is in runtime/race/kolkov/api/ and connected via linkname.
+
+var (
+	kolkovEnabled    atomic.Uint32
+	kolkovInited     atomic.Uint32
+	kolkovErrors     atomic.Uint64
+	kolkovReadCount  atomic.Uint64 // Debug counter
+	kolkovWriteCount atomic.Uint64 // Debug counter
+)
+
+// kolkovDetectorInit initializes the Kolkov race detector.
+//
+//go:nosplit
+func kolkovDetectorInit() {
+	if kolkovInited.CompareAndSwap(0, 1) {
+		kolkovEnabled.Store(1)
+		// Note: Kolkov API initializes via init()
+	}
+}
+
+// kolkovDetectorFini finalizes the Kolkov race detector.
+func kolkovDetectorFini() {
+	kolkovEnabled.Store(0)
+	// Debug: Print counters
+	print("[Kolkov] Reads: ", kolkovReadCount.Load(), " Writes: ", kolkovWriteCount.Load(), "\n")
+	// Call API Fini to print full report
+	kolkovApiFini()
+}
+
+// kolkovRaceErrors returns the number of races detected.
+//
+//go:nosplit
+func kolkovRaceErrors() int {
+	return int(kolkovErrors.Load())
+}
+
+// kolkovIncrementErrors is called by Kolkov API when a race is detected.
+//
+//go:nosplit
+func kolkovIncrementErrors() {
+	kolkovErrors.Add(1)
+}
+
+// kolkovOnRead handles a memory read access.
+// Delegates to the Kolkov API implementation.
+//
+//go:nosplit
+func kolkovOnRead(addr, pc uintptr) {
+	kolkovReadCount.Add(1)
+	// Debug: Check if linkname works by printing before call
+	// print("[DEBUG] kolkovOnRead calling API\n")  // Uncomment for verbose debug
+	kolkovApiOnRead(addr)
+}
+
+// kolkovOnWrite handles a memory write access.
+// Delegates to the Kolkov API implementation.
+//
+//go:nosplit
+func kolkovOnWrite(addr, pc uintptr) {
+	kolkovWriteCount.Add(1)
+	kolkovApiOnWrite(addr)
+}
+
+// kolkovOnAcquire handles a synchronization acquire operation.
+// This is called when a mutex is locked or a channel receive completes.
+//
+//go:nosplit
+func kolkovOnAcquire(addr uintptr) {
+	kolkovApiOnAcquire(addr)
+}
+
+// kolkovOnRelease handles a synchronization release operation.
+// This is called when a mutex is unlocked or a channel send completes.
+//
+//go:nosplit
+func kolkovOnRelease(addr uintptr) {
+	kolkovApiOnRelease(addr)
+}
+
+// kolkovOnReleaseMerge handles a release-merge synchronization operation.
+// This is like release but also merges with prior releases on the same address.
+//
+//go:nosplit
+func kolkovOnReleaseMerge(addr uintptr) {
+	kolkovApiOnReleaseMerge(addr)
+}
+
+// Linkname imports from runtime/race/kolkov/api package.
+// These functions are implemented in the Kolkov API and exported to runtime.
+
+//go:linkname kolkovApiOnRead runtime/race/kolkov/api.raceread
+func kolkovApiOnRead(addr uintptr)
+
+//go:linkname kolkovApiOnWrite runtime/race/kolkov/api.racewrite
+func kolkovApiOnWrite(addr uintptr)
+
+//go:linkname kolkovApiOnAcquire runtime/race/kolkov/api.raceacquire
+func kolkovApiOnAcquire(addr uintptr)
+
+//go:linkname kolkovApiOnRelease runtime/race/kolkov/api.racerelease
+func kolkovApiOnRelease(addr uintptr)
+
+//go:linkname kolkovApiOnReleaseMerge runtime/race/kolkov/api.racereleasemerge
+func kolkovApiOnReleaseMerge(addr uintptr)
+
+//go:linkname kolkovApiFini runtime/race/kolkov/api.Fini
+func kolkovApiFini()

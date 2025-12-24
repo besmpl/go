@@ -142,6 +142,9 @@ func printcomplex64(c complex64) {
 	gwrite(strconv.AppendComplex(buf[:0], complex128(c), 'g', -1, 64))
 }
 
+// Allow runtime/race/kolkov to use this via linkname.
+//
+//go:linkname printuint
 func printuint(v uint64) {
 	// Note: Avoiding strconv.AppendUint so that it's clearer
 	// that there are no allocations in this routine.
@@ -241,6 +244,9 @@ func printuintptr(p uintptr) {
 	printhex(uint64(p))
 }
 
+// Allow runtime/race/kolkov to use this via linkname.
+//
+//go:linkname printstring
 func printstring(s string) {
 	gwrite(bytes(s))
 }

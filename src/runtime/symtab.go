@@ -77,6 +77,10 @@ type Frame struct {
 // CallersFrames takes a slice of PC values returned by [Callers] and
 // prepares to return function/file/line information.
 // Do not change the slice until you are done with the [Frames].
+//
+// Allow runtime/race/kolkov to use this via linkname.
+//
+//go:linkname CallersFrames
 func CallersFrames(callers []uintptr) *Frames {
 	f := &Frames{callers: callers}
 	f.frames = f.frameStore[:0]
@@ -198,6 +202,14 @@ func (ci *Frames) Next() (frame Frame, more bool) {
 		frame.File, frame.Line = file, int(line)
 	}
 	return
+}
+// framesNext is a wrapper for (*Frames).Next to allow linkname access.
+//
+// Allow runtime/race/kolkov to use this via linkname.
+//
+//go:linkname framesNext
+func framesNext(ci *Frames) (frame Frame, more bool) {
+	return ci.Next()
 }
 
 // runtime_FrameStartLine returns the start line of the function in a Frame.

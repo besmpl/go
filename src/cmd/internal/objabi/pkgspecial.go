@@ -78,6 +78,15 @@ var runtimePkgs = []string{
 // should have NoInstrument set.
 var extraNoInstrumentPkgs = []string{
 	"runtime/race",
+	// Kolkov pure-Go race detector packages (used when CGO_ENABLED=0)
+	"runtime/race/kolkov/api",
+	"runtime/race/kolkov/detector",
+	"runtime/race/kolkov/epoch",
+	"runtime/race/kolkov/goroutine",
+	"runtime/race/kolkov/shadowmem",
+	"runtime/race/kolkov/stackdepot",
+	"runtime/race/kolkov/syncshadow",
+	"runtime/race/kolkov/vectorclock",
 	"runtime/msan",
 	"runtime/asan",
 	// We omit bytealg even though it's imported by runtime because it also

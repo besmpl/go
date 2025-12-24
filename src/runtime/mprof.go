@@ -1694,6 +1694,9 @@ func saveg(pc, sp uintptr, gp *g, r *profilerecord.StackRecord, pcbuf []uintptr)
 	copy(r.Stack, pcbuf)
 }
 
+// Allow runtime/race/kolkov to use this via linkname.
+//
+//go:linkname Stack
 // Stack formats a stack trace of the calling goroutine into buf
 // and returns the number of bytes written to buf.
 // If all is true, Stack formats stack traces of all other goroutines

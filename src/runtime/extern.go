@@ -297,6 +297,7 @@ package runtime
 import (
 	"internal/goarch"
 	"internal/goos"
+	_ "unsafe" // for go:linkname
 )
 
 // Caller reports file and line number information about function invocations on
@@ -306,6 +307,10 @@ import (
 // the program counter, the file name (using forward slashes as path separator, even
 // on Windows), and the line number within the file of the corresponding call.
 // The boolean ok is false if it was not possible to recover the information.
+//
+// Allow runtime/race/kolkov to use this via linkname.
+//
+//go:linkname Caller
 func Caller(skip int) (pc uintptr, file string, line int, ok bool) {
 	rpc := make([]uintptr, 1)
 	n := callers(skip+1, rpc)
@@ -329,6 +334,10 @@ func Caller(skip int) (pc uintptr, file string, line int, ok bool) {
 // directly is discouraged, as is using [FuncForPC] on any of the
 // returned PCs, since these cannot account for inlining or return
 // program counter adjustment.
+//
+// Allow runtime/race/kolkov to use this via linkname.
+//
+//go:linkname Callers
 func Callers(skip int, pc []uintptr) int {
 	// runtime.callers uses pc.array==nil as a signal
 	// to print a stack trace. Pick off 0-length pc here
