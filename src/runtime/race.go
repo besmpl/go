@@ -562,6 +562,11 @@ func racegostart(pc uintptr) uintptr {
 }
 
 //go:nosplit
+func racegosetchildid(childGoid uint64) {
+	// TSAN: not needed, racectx already handles child identification
+}
+
+//go:nosplit
 func racegoend() {
 	racecall(&__tsan_go_end, getg().racectx, 0, 0, 0)
 }

@@ -100,6 +100,22 @@ func kolkovOnReleaseMerge(addr uintptr) {
 	kolkovApiOnReleaseMerge(addr)
 }
 
+// kolkovGetGoid returns the current user goroutine's ID.
+// Called from runtime/race/kolkov/api via linkname.
+//
+// Uses getg() compiler intrinsic — zero overhead, version-independent.
+// Handles g0/gsignal by checking m.curg for the actual user goroutine.
+//
+//go:linkname kolkovGetGoid
+//go:nosplit
+func kolkovGetGoid() int64 {
+	gp := getg()
+	if gp.m != nil && gp.m.curg != nil {
+		return int64(gp.m.curg.goid)
+	}
+	return int64(gp.goid)
+}
+
 // Linkname imports from runtime/race/kolkov/api package.
 // These functions are implemented in the Kolkov API and exported to runtime.
 
@@ -118,5 +134,20 @@ func kolkovApiOnRelease(addr uintptr)
 //go:linkname kolkovApiOnReleaseMerge runtime/race/kolkov/api.racereleasemerge
 func kolkovApiOnReleaseMerge(addr uintptr)
 
+//go:linkname kolkovApiOnAcquireForGoroutine runtime/race/kolkov/api.raceAcquireForGoroutine
+func kolkovApiOnAcquireForGoroutine(addr uintptr, goid int64)
+
+//go:linkname kolkovApiOnReleaseForGoroutine runtime/race/kolkov/api.raceReleaseForGoroutine
+func kolkovApiOnReleaseForGoroutine(addr uintptr, goid int64)
+
+//go:linkname kolkovApiGoSetChildID runtime/race/kolkov/api.raceGoSetChildID
+func kolkovApiGoSetChildID(childGoid int64)
+
 //go:linkname kolkovApiFini runtime/race/kolkov/api.Fini
 func kolkovApiFini()
+
+//go:linkname kolkovApiOnGoStart runtime/race/kolkov/api.raceGoStartFromRuntime
+func kolkovApiOnGoStart(pc uintptr, parentGoid int64)
+
+//go:linkname kolkovApiOnGoEnd runtime/race/kolkov/api.raceGoEndFromRuntime
+func kolkovApiOnGoEnd(goid int64)

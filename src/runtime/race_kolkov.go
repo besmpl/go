@@ -331,11 +331,21 @@ func racefree(p unsafe.Pointer, sz uintptr) {
 }
 
 // racegostart notifies the race detector that a new goroutine is starting.
-// It returns the race context for the new goroutine.
+// Called by proc.go's newproc1 (on systemstack) when creating a goroutine.
+//
+// IMPORTANT: This runs on g0 (systemstack), so getg() returns g0.
+// We use gp.m.curg to get the parent (spawning) goroutine and pass its
+// goid explicitly to the API, since the API cannot extract goid on g0.
+//
+// The return value is stored in newg.racectx by proc.go.
+// For Kolkov detector, racectx is not used (API tracks contexts by goid).
+// We return a non-zero value so proc.go doesn't think initialization failed.
 //
 //go:nosplit
 func racegostart(pc uintptr) uintptr {
 	gp := getg()
+	// Get the parent goroutine (the one that called 'go func()').
+	// On systemstack, gp is g0; gp.m.curg is the user goroutine.
 	var spawng *g
 	if gp.m.curg != nil {
 		spawng = gp.m.curg
@@ -343,30 +353,39 @@ func racegostart(pc uintptr) uintptr {
 		spawng = gp
 	}
 
-	// Allocate new TID for the child goroutine.
-	tid := kolkovAllocTID()
-
-	// Get parent's context for happens-before edge.
-	var parentClock *kolkovVectorClock
-	if spawng.racectx != 0 {
-		parentCtx := (*kolkovRaceContext)(unsafe.Pointer(spawng.racectx))
-		if parentCtx != nil {
-			parentClock = parentCtx.c
-		}
+	if spawng.raceignore != 0 {
+		return 0
 	}
+	spawng.raceignore++
+	kolkovApiOnGoStart(pc, int64(spawng.goid))
+	spawng.raceignore--
 
-	// Create child context with parent's clock (fork happens-before).
-	var ctx *kolkovRaceContext
-	if parentClock != nil {
-		ctx = kolkovAllocContextWithParent(tid, parentClock)
-	} else {
-		ctx = kolkovAllocContext(tid)
+	// Return non-zero so proc.go stores it in newg.racectx.
+	// The Kolkov API tracks contexts by goid, not racectx.
+	return 1
+}
+
+// racegosetchildid associates the most recently created spawn context with
+// the actual child goroutine goid. Called by proc.go right after racegostart.
+//
+//go:nosplit
+func racegosetchildid(childGoid uint64) {
+	gp := getg()
+	if gp.m != nil && gp.m.curg != nil {
+		gp = gp.m.curg
 	}
-
-	return uintptr(unsafe.Pointer(ctx))
+	if gp.raceignore != 0 {
+		return
+	}
+	gp.raceignore++
+	kolkovApiGoSetChildID(int64(childGoid))
+	gp.raceignore--
 }
 
 // racegoend notifies the race detector that the current goroutine is ending.
+// Called by proc.go when a goroutine exits.
+//
+// Passes the goroutine's goid explicitly to the API for context cleanup.
 //
 //go:nosplit
 func racegoend() {
@@ -374,14 +393,12 @@ func racegoend() {
 	if gp.m.curg != nil {
 		gp = gp.m.curg
 	}
-
-	if gp.racectx != 0 {
-		ctx := (*kolkovRaceContext)(unsafe.Pointer(gp.racectx))
-		if ctx != nil {
-			kolkovReleaseTID(ctx.tid)
-		}
-		gp.racectx = 0
+	if gp.raceignore != 0 {
+		return
 	}
+	gp.raceignore++
+	kolkovApiOnGoEnd(int64(gp.goid))
+	gp.raceignore--
 }
 
 // racectxstart creates a new race context for a goroutine.
@@ -445,25 +462,34 @@ func raceacquire(addr unsafe.Pointer) {
 }
 
 // raceacquireg records an acquire operation on the given address for a specific goroutine.
+// The target goroutine gp may differ from the current goroutine (e.g., in channel
+// operations where one goroutine acquires on behalf of its blocked partner).
 //
 //go:nosplit
 func raceacquireg(gp *g, addr unsafe.Pointer) {
 	if gp.raceignore != 0 {
 		return
 	}
-	gp.raceignore++
-	kolkovOnAcquire(uintptr(addr))
-	gp.raceignore--
+	// Protect the current goroutine from re-entrant race detector calls
+	// during the API call (which may trigger instrumented memory accesses).
+	curg := getg()
+	if curg.m != nil && curg.m.curg != nil {
+		curg = curg.m.curg
+	}
+	curg.raceignore++
+	kolkovApiOnAcquireForGoroutine(uintptr(addr), int64(gp.goid))
+	curg.raceignore--
 }
 
 // raceacquirectx records an acquire operation with an explicit context.
+// The racectx parameter is the context of the goroutine to acquire on behalf of.
+// For the Kolkov detector, we just perform the acquire on the current goroutine.
 //
 //go:nosplit
 func raceacquirectx(racectx uintptr, addr unsafe.Pointer) {
 	if racectx == 0 {
 		return
 	}
-	// Save current context, set explicit context, do acquire, restore.
 	gp := getg()
 	if gp.m != nil && gp.m.curg != nil {
 		gp = gp.m.curg
@@ -472,10 +498,7 @@ func raceacquirectx(racectx uintptr, addr unsafe.Pointer) {
 		return
 	}
 	gp.raceignore++
-	oldCtx := gp.racectx
-	gp.racectx = racectx
 	kolkovOnAcquire(uintptr(addr))
-	gp.racectx = oldCtx
 	gp.raceignore--
 }
 
@@ -487,15 +510,21 @@ func racerelease(addr unsafe.Pointer) {
 }
 
 // racereleaseg records a release operation on the given address for a specific goroutine.
+// The target goroutine gp may differ from the current goroutine (e.g., in channel
+// operations where one goroutine releases on behalf of its blocked partner).
 //
 //go:nosplit
 func racereleaseg(gp *g, addr unsafe.Pointer) {
 	if gp.raceignore != 0 {
 		return
 	}
-	gp.raceignore++
-	kolkovOnRelease(uintptr(addr))
-	gp.raceignore--
+	curg := getg()
+	if curg.m != nil && curg.m.curg != nil {
+		curg = curg.m.curg
+	}
+	curg.raceignore++
+	kolkovApiOnReleaseForGoroutine(uintptr(addr), int64(gp.goid))
+	curg.raceignore--
 }
 
 // racereleaseacquire records a combined release-acquire operation.
@@ -506,17 +535,21 @@ func racereleaseacquire(addr unsafe.Pointer) {
 }
 
 // racereleaseacquireg records a combined release-acquire operation for a specific goroutine.
+// The target goroutine gp may differ from the current goroutine.
 //
 //go:nosplit
 func racereleaseacquireg(gp *g, addr unsafe.Pointer) {
 	if gp.raceignore != 0 {
 		return
 	}
-	gp.raceignore++
-	// Release then acquire for combined operation.
-	kolkovOnRelease(uintptr(addr))
-	kolkovOnAcquire(uintptr(addr))
-	gp.raceignore--
+	curg := getg()
+	if curg.m != nil && curg.m.curg != nil {
+		curg = curg.m.curg
+	}
+	curg.raceignore++
+	kolkovApiOnReleaseForGoroutine(uintptr(addr), int64(gp.goid))
+	kolkovApiOnAcquireForGoroutine(uintptr(addr), int64(gp.goid))
+	curg.raceignore--
 }
 
 // racereleasemerge records a release-merge operation on the given address.

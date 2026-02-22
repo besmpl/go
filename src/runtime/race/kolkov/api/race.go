@@ -13,17 +13,11 @@
 //   - getCurrentContext (cached): < 5ns
 //   - getCurrentContext (first): < 100ns
 //
-// MVP Simplifications:
-//   - Goroutine ID extracted via runtimeStack() parsing (SLOW - ~500ns)
-//   - PC tracking collected but not used in reporting yet
-//   - TID allocation is simple atomic counter (no reuse)
-//   - No GoEnd() hook - contexts never freed
-//
-// Phase 2 Improvements (Future):
-//   - Replace getGoroutineID() with assembly getg() stub (~1ns)
-//   - Implement TID reuse pool
-//   - Add GoEnd() cleanup
-//   - Enable PC-based stack traces in reports
+// Runtime Integration:
+//   - Goroutine ID via getg().goid runtime bridge (~0ns)
+//   - PC capture via sys.GetCallerPC() compiler intrinsic (~0ns)
+//   - TID reuse pool for unlimited goroutine support
+//   - GoEnd() cleanup for context lifecycle management
 package api
 
 import (
@@ -292,6 +286,7 @@ func (m *tidToGIDMapType) Reset() {
 // This enables happens-before tracking across goroutine creation.
 type spawnInfo struct {
 	parentGID   int64                    // GID of parent goroutine
+	childGoid   int64                    // GID of child goroutine (0 = unknown, use FIFO)
 	parentClock *vectorclock.VectorClock // Snapshot of parent's clock at fork
 	pc          uintptr                  // Program counter of go statement (for stack traces)
 	createdAtNs int64                    // Creation time in nanoseconds (for TTL-based cleanup)
@@ -506,6 +501,104 @@ func racegostart(pc uintptr) uintptr {
 	return uintptr(spawnID)
 }
 
+// raceGoStartFromRuntime is called by the runtime's racegostart from systemstack.
+// Unlike racegostart, the caller is on g0 so getGoroutineID() would return
+// the wrong goroutine. The runtime passes parentGoid explicitly.
+//
+//go:linkname raceGoStartFromRuntime
+//go:nosplit
+func raceGoStartFromRuntime(pc uintptr, parentGoid int64) {
+	if enabled.Load() == 0 {
+		return
+	}
+
+	// Look up parent's context using explicit goid.
+	parentCtx, ok := contextsMap.Load(parentGoid)
+	if !ok {
+		// Parent context not found — parent hasn't done any memory accesses yet.
+		// Create a fresh spawn context without parent clock inheritance.
+		info := &spawnInfo{
+			parentGID:   parentGoid,
+			parentClock: nil,
+			pc:          pc,
+			createdAtNs: nanotime(),
+		}
+		spawnContextsMu.lock()
+		spawnContextsSlice = append(spawnContextsSlice, info)
+		spawnContextsMu.unlock()
+		return
+	}
+
+	// Snapshot parent's VectorClock before incrementing.
+	spawnClock := parentCtx.C.Clone()
+
+	// Advance parent's clock past the fork point.
+	parentCtx.IncrementClock()
+
+	// Store spawn context for child to consume (FIFO).
+	info := &spawnInfo{
+		parentGID:   parentGoid,
+		parentClock: spawnClock,
+		pc:          pc,
+		createdAtNs: nanotime(),
+	}
+	spawnContextsMu.lock()
+	spawnContextsSlice = append(spawnContextsSlice, info)
+	spawnContextsMu.unlock()
+}
+
+// raceGoEndFromRuntime is called by the runtime's racegoend.
+// Accepts explicit goid since the caller might be on systemstack.
+//
+//go:linkname raceGoEndFromRuntime
+//go:nosplit
+func raceGoEndFromRuntime(goid int64) {
+	if enabled.Load() == 0 {
+		return
+	}
+
+	// Load and delete context atomically.
+	if ctx, ok := contextsMap.LoadAndDelete(goid); ok {
+		// Return VectorClock to pool for reuse.
+		if ctx.C != nil {
+			ctx.C.Release()
+			ctx.C = nil
+		}
+
+		// Return TID to pool for reuse.
+		freeTID(ctx.TID)
+
+		// Clean up TID→GID mapping.
+		tidToGIDMap.Delete(ctx.TID)
+	}
+}
+
+// raceGoSetChildID associates the most recently created spawn context with
+// the actual child goroutine goid. This is called by the runtime right after
+// racegostart, when newg.goid is known.
+//
+// Without this call, spawn contexts are consumed in FIFO order which causes
+// incorrect parent-child matching when runtime creates background goroutines
+// (GC, finalizer, etc.) before user goroutines start.
+//
+//go:linkname raceGoSetChildID
+//go:nosplit
+func raceGoSetChildID(childGoid int64) {
+	if enabled.Load() == 0 {
+		return
+	}
+	spawnContextsMu.lock()
+	// Walk backwards to find the most recently added (un-keyed) spawn context.
+	for i := len(spawnContextsSlice) - 1; i >= 0; i-- {
+		info := spawnContextsSlice[i]
+		if info.consumed.Load() == 0 && info.childGoid == 0 {
+			info.childGoid = childGoid
+			break
+		}
+	}
+	spawnContextsMu.unlock()
+}
+
 // racegoend is called when a goroutine terminates.
 //
 // This function cleans up resources associated with the goroutine:
@@ -575,30 +668,49 @@ func RaceGoEnd() {
 //
 // Returns parent's VectorClock if found, nil otherwise.
 func findAndConsumeSpawnContext() *vectorclock.VectorClock {
+	// Get this goroutine's goid for targeted lookup.
+	myGoid := getGoroutineID()
+
 	spawnContextsMu.lock()
 	defer spawnContextsMu.unlock()
 
 	nowNs := nanotime()
 	var foundClock *vectorclock.VectorClock
 
-	// Find first valid spawn context (FIFO order - oldest first).
-	// This ensures strict ordering: first spawn -> first child match.
+	// First pass: try to find spawn context specifically keyed to this child goid.
+	// This is the primary path when raceGoSetChildID was called after racegostart.
 	for _, info := range spawnContextsSlice {
-		// Skip already consumed contexts.
 		if info.consumed.Load() != 0 {
 			continue
 		}
-
-		// Skip expired contexts (will be cleaned up below).
 		if nowNs-info.createdAtNs > spawnContextTTLNs {
 			continue
 		}
+		if info.childGoid == myGoid {
+			if info.consumed.CompareAndSwap(0, 1) {
+				foundClock = info.parentClock
+				break
+			}
+		}
+	}
 
-		// Found valid spawn context - consume it atomically.
-		// CAS provides extra safety even though we hold the lock.
-		if info.consumed.CompareAndSwap(0, 1) {
-			foundClock = info.parentClock
-			break
+	// Fallback: if no goid-keyed context found, try FIFO (for legacy/timer contexts).
+	if foundClock == nil {
+		for _, info := range spawnContextsSlice {
+			if info.consumed.Load() != 0 {
+				continue
+			}
+			if nowNs-info.createdAtNs > spawnContextTTLNs {
+				continue
+			}
+			// Only consume un-keyed contexts (childGoid == 0) in FIFO mode.
+			if info.childGoid != 0 {
+				continue
+			}
+			if info.consumed.CompareAndSwap(0, 1) {
+				foundClock = info.parentClock
+				break
+			}
 		}
 	}
 
@@ -733,6 +845,45 @@ func racereleasemerge(addr uintptr) {
 	// Perform sync release merge tracking.
 	// This merges current clock into lock's release clock.
 	det.OnReleaseMerge(addr, ctx)
+}
+
+// === Cross-Goroutine Acquire/Release (for channel sync) ===
+
+// raceAcquireForGoroutine performs an acquire operation on addr on behalf of
+// the goroutine identified by goid. This is called by the runtime when one
+// goroutine needs to acquire a sync object for another goroutine (e.g.,
+// raceacquireg in channel operations where the current goroutine wakes up
+// a blocked partner and must transfer HB to the partner, not to itself).
+//
+//go:linkname raceAcquireForGoroutine
+//go:nosplit
+func raceAcquireForGoroutine(addr uintptr, goid int64) {
+	if enabled.Load() == 0 {
+		return
+	}
+	ctx, ok := contextsMap.Load(goid)
+	if !ok {
+		return
+	}
+	det.OnAcquire(addr, ctx)
+}
+
+// raceReleaseForGoroutine performs a release operation on addr on behalf of
+// the goroutine identified by goid. This is the release counterpart of
+// raceAcquireForGoroutine — used in racereleaseg where the current goroutine
+// releases a sync object on behalf of a different goroutine.
+//
+//go:linkname raceReleaseForGoroutine
+//go:nosplit
+func raceReleaseForGoroutine(addr uintptr, goid int64) {
+	if enabled.Load() == 0 {
+		return
+	}
+	ctx, ok := contextsMap.Load(goid)
+	if !ok {
+		return
+	}
+	det.OnRelease(addr, ctx)
 }
 
 // === Channel Synchronization API (Phase 4 Task 4.2) ===
@@ -1399,8 +1550,7 @@ func parseAllGIDs(buf []byte) []int64 {
 }
 
 // NOTE: getGoroutineID() and parseGID() are defined in goid_generic.go
-// They use assembly-optimized path on amd64/arm64 (Go 1.23-1.25) via goid_fast.go
-// or fall back to runtimeStack parsing via goid_fallback.go
+// getGoroutineIDFast() uses runtime bridge (getg().goid) via goid_runtime.go
 
 // getcallerpc returns the program counter (PC) of the caller.
 //

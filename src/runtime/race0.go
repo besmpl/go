@@ -40,6 +40,7 @@ func racefingo()                                                            { th
 func racemalloc(p unsafe.Pointer, sz uintptr)                               { throw("race") }
 func racefree(p unsafe.Pointer, sz uintptr)                                 { throw("race") }
 func racegostart(pc uintptr) uintptr                                        { throw("race"); return 0 }
+func racegosetchildid(childGoid uint64)                                     { throw("race") }
 func racegoend()                                                            { throw("race") }
 func racectxstart(spawnctx, racectx uintptr) uintptr                        { throw("race"); return 0 }
 func racectxend(racectx uintptr)                                            { throw("race") }

@@ -5413,6 +5413,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 	// Set up race context.
 	if raceenabled {
 		newg.racectx = racegostart(callerpc)
+		racegosetchildid(newg.goid)
 		newg.raceignore = 0
 		if newg.labels != nil {
 			// See note in proflabel.go on labelSync's role in synchronizing
