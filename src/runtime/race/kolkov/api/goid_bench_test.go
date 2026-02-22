@@ -9,10 +9,9 @@ import (
 	"testing"
 )
 
-// BenchmarkGetGoroutineID_Fast benchmarks the optimized fast path.
+// BenchmarkGetGoroutineID_Fast benchmarks the runtime bridge path.
 //
-// Target: <1ns per operation on amd64 (assembly).
-// Expected: ~4.7µs per operation on other architectures (fallback).
+// Uses getg().goid via linkname — expected ~0ns per operation.
 func BenchmarkGetGoroutineID_Fast(b *testing.B) {
 	b.ReportAllocs()
 
@@ -23,7 +22,7 @@ func BenchmarkGetGoroutineID_Fast(b *testing.B) {
 
 // BenchmarkGetGoroutineID_Slow benchmarks the slow path (runtime.Stack parsing).
 //
-// Expected: ~4.7µs per operation (baseline before optimization).
+// Expected: ~1500ns per operation (baseline for comparison).
 func BenchmarkGetGoroutineID_Slow(b *testing.B) {
 	b.ReportAllocs()
 
@@ -33,8 +32,6 @@ func BenchmarkGetGoroutineID_Slow(b *testing.B) {
 }
 
 // BenchmarkGetGoroutineID benchmarks the current implementation.
-//
-// After Phase 2 optimization, this should use the fast path.
 func BenchmarkGetGoroutineID_Current(b *testing.B) {
 	b.ReportAllocs()
 
@@ -45,7 +42,7 @@ func BenchmarkGetGoroutineID_Current(b *testing.B) {
 
 // BenchmarkGetGoroutineID_Comparison runs fast and slow side-by-side.
 //
-// This clearly shows the speedup from assembly optimization.
+// Shows the speedup from runtime bridge vs runtime.Stack parsing.
 func BenchmarkGetGoroutineID_Comparison(b *testing.B) {
 	b.Run("Fast", func(b *testing.B) {
 		b.ReportAllocs()
@@ -63,8 +60,6 @@ func BenchmarkGetGoroutineID_Comparison(b *testing.B) {
 }
 
 // BenchmarkGetGoroutineID_Parallel benchmarks concurrent GID extraction.
-//
-// This tests scalability under parallel load.
 func BenchmarkGetGoroutineID_Parallel(b *testing.B) {
 	b.ReportAllocs()
 
@@ -97,8 +92,6 @@ func BenchmarkGetGoroutineID_FastVsSlow_Concurrent(b *testing.B) {
 }
 
 // BenchmarkGetCurrentContext_WithFastGID benchmarks context lookup with fast GID.
-//
-// This shows the end-to-end impact on getCurrentContext() performance.
 func BenchmarkGetCurrentContext_WithFastGID(b *testing.B) {
 	Reset()
 	Enable()
@@ -115,13 +108,10 @@ func BenchmarkGetCurrentContext_WithFastGID(b *testing.B) {
 }
 
 // BenchmarkGetCurrentContext_FirstCall_WithFastGID measures initial allocation cost.
-//
-// Phase 2 Target: <100ns (was ~3.5µs with slow GID in MVP).
 func BenchmarkGetCurrentContext_FirstCall_WithFastGID(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		// Reset to force fresh allocation.
 		Reset()
 
 		b.StartTimer()
@@ -130,14 +120,11 @@ func BenchmarkGetCurrentContext_FirstCall_WithFastGID(b *testing.B) {
 	}
 }
 
-// BenchmarkRaceRead_WithFastGID measures raceread with optimized GID extraction.
-//
-// This shows the impact on the critical hot path.
+// BenchmarkRaceRead_WithFastGID measures raceread with runtime bridge GID.
 func BenchmarkRaceRead_WithFastGID(b *testing.B) {
 	Reset()
 	Enable()
 
-	// Pre-allocate context.
 	getCurrentContext()
 
 	addr := uintptr(0x1000)
@@ -150,12 +137,11 @@ func BenchmarkRaceRead_WithFastGID(b *testing.B) {
 	}
 }
 
-// BenchmarkRaceWrite_WithFastGID measures racewrite with optimized GID extraction.
+// BenchmarkRaceWrite_WithFastGID measures racewrite with runtime bridge GID.
 func BenchmarkRaceWrite_WithFastGID(b *testing.B) {
 	Reset()
 	Enable()
 
-	// Pre-allocate context.
 	getCurrentContext()
 
 	addr := uintptr(0x2000)
@@ -169,8 +155,6 @@ func BenchmarkRaceWrite_WithFastGID(b *testing.B) {
 }
 
 // BenchmarkParseGID_Optimized benchmarks the string parsing logic.
-//
-// This isolates the parsing overhead in the slow path.
 func BenchmarkParseGID_Optimized(b *testing.B) {
 	input := []byte("goroutine 12345 [running]:\n")
 
@@ -194,69 +178,25 @@ func BenchmarkParseGID_LargeID(b *testing.B) {
 	}
 }
 
-// BenchmarkGetGoroutineID_CacheMisses measures performance on first context allocation.
-//
-// This simulates the worst case: many goroutines created, each needing GID extraction.
+// BenchmarkGetGoroutineID_CacheMisses measures performance with many goroutines.
 func BenchmarkGetGoroutineID_CacheMisses(b *testing.B) {
 	b.ReportAllocs()
 
-	// Pre-create goroutines to simulate realistic load.
 	const numGoroutines = 100
 
 	for i := 0; i < numGoroutines; i++ {
 		go func() {
-			// Each goroutine just extracts its GID once.
 			_ = getGoroutineIDFast()
 		}()
 	}
 
-	runtime.Gosched() // Let goroutines run.
+	runtime.Gosched()
 
 	b.ResetTimer()
 
-	// Now benchmark GID extraction in the benchmark goroutine.
 	for i := 0; i < b.N; i++ {
 		_ = getGoroutineIDFast()
 	}
-}
-
-// BenchmarkGetGoroutineID_Assembly benchmarks just the assembly stub (amd64 only).
-//
-// This isolates the raw TLS access performance.
-// NOTE: Disabled for v0.1.0 - assembly implementation is disabled for stability.
-func BenchmarkGetGoroutineID_Assembly(b *testing.B) {
-	b.Skip("Assembly implementation disabled - will be re-enabled in v0.4.0")
-
-	// Kept for future when assembly is re-enabled:
-	// if runtime.GOARCH != "amd64" {
-	// 	b.Skip("Assembly benchmark only relevant on amd64")
-	// }
-	// b.ReportAllocs()
-	// for i := 0; i < b.N; i++ {
-	// 	_ = getg()
-	// }
-}
-
-// BenchmarkGetGoroutineID_FieldAccess benchmarks the goid field dereference (amd64 only).
-// NOTE: Disabled for v0.1.0 - assembly implementation is disabled for stability.
-func BenchmarkGetGoroutineID_FieldAccess(b *testing.B) {
-	b.Skip("Assembly implementation disabled - will be re-enabled in v0.4.0")
-
-	// Kept for future when assembly is re-enabled:
-	// if runtime.GOARCH != "amd64" {
-	// 	b.Skip("Field access benchmark only relevant on amd64")
-	// }
-	// b.ReportAllocs()
-	// g := getg()
-	// if g == nil {
-	// 	b.Fatal("getg() returned nil")
-	// }
-	// b.ResetTimer()
-	// for i := 0; i < b.N; i++ {
-	// 	// Benchmark just the field access (no TLS lookup).
-	// 	goidPtr := (*int64)(unsafe.Pointer(uintptr(g) + goidOffset))
-	// 	_ = *goidPtr
-	// }
 }
 
 // BenchmarkGetGoroutineID_MultipleGoroutines benchmarks across many goroutines.
@@ -271,10 +211,6 @@ func BenchmarkGetGoroutineID_MultipleGoroutines(b *testing.B) {
 }
 
 // BenchmarkGetGoroutineID_UnderLoad simulates realistic workload.
-//
-// Mix of:
-//   - 90% cached context lookups (hot path)
-//   - 10% new goroutines needing GID extraction
 func BenchmarkGetGoroutineID_UnderLoad(b *testing.B) {
 	Reset()
 	Enable()
@@ -283,26 +219,19 @@ func BenchmarkGetGoroutineID_UnderLoad(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		if i%10 == 0 {
-			// 10% of time: simulate new goroutine (uncached).
 			Reset()
 		}
-
-		// Get context (may allocate on cache miss).
 		_ = getCurrentContext()
 	}
 }
 
 // BenchmarkGetGoroutineID_WorstCase measures worst-case performance.
-//
-// This is the scenario where getGoroutineIDSlow() would hurt most:
-// Many goroutines, each created and immediately needing GID.
 func BenchmarkGetGoroutineID_WorstCase(b *testing.B) {
 	Reset()
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	// Spawn many goroutines, each extracting GID once.
 	for i := 0; i < b.N; i++ {
 		done := make(chan bool)
 		go func() {
@@ -314,13 +243,10 @@ func BenchmarkGetGoroutineID_WorstCase(b *testing.B) {
 }
 
 // BenchmarkGetGoroutineID_BestCase measures best-case performance.
-//
-// Best case: same goroutine, repeated GID extraction (fully cached).
 func BenchmarkGetGoroutineID_BestCase(b *testing.B) {
 	Reset()
 	Enable()
 
-	// Pre-allocate context.
 	getCurrentContext()
 
 	b.ResetTimer()

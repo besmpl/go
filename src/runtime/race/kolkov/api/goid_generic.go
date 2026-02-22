@@ -4,17 +4,20 @@
 
 // Common goroutine ID extraction utilities.
 //
-// This file contains platform-independent code used by both the fast
-// (assembly) and slow (runtime.Stack) paths for goroutine ID extraction.
+// This file contains the main entry point and slow-path fallback for
+// goroutine ID extraction.
 //
-// The actual getGoroutineIDFast() function is provided by:
-//   - goid_fast.go: Assembly-optimized path (Go 1.23-1.25, amd64/arm64)
-//   - goid_fallback.go: Stack parsing path (all other configurations)
+// The fast path (getGoroutineIDFast) is provided by goid_runtime.go
+// which uses a runtime bridge to access getg().goid directly — zero cost,
+// version-independent, platform-independent.
+//
+// The slow path (getGoroutineIDSlow) parses runtime.Stack output and
+// is kept for testing/validation only.
 //
 // API:
-//   - getGoroutineID(): Main entry point, uses fast path
-//   - getGoroutineIDFast(): Provided by goid_fast.go or goid_fallback.go
-//   - getGoroutineIDSlow(): Always available, uses runtime.Stack parsing
+//   - getGoroutineID(): Main entry point, delegates to getGoroutineIDFast()
+//   - getGoroutineIDFast(): Runtime bridge via getg().goid (~0ns)
+//   - getGoroutineIDSlow(): runtime.Stack parsing (~1500ns, testing only)
 //   - parseGID(): Parses goroutine ID from stack trace bytes
 
 package api
@@ -22,9 +25,8 @@ package api
 // getGoroutineID returns the current goroutine ID.
 //
 // This is the main entry point for goroutine ID extraction. It delegates
-// to getGoroutineIDFast() which uses the best available implementation:
-//   - Assembly fast path on supported platforms (~1-2ns)
-//   - Stack parsing fallback on other platforms (~1500ns)
+// to getGoroutineIDFast() which calls into the runtime via linkname bridge
+// to access getg().goid directly (~0ns, zero allocations).
 //
 // Returns:
 //   - int64: Goroutine ID (always positive, unique per goroutine)
@@ -34,18 +36,12 @@ func getGoroutineID() int64 {
 
 // getGoroutineIDSlow extracts goroutine ID by parsing runtime.Stack output.
 //
-// This is the universal fallback method that works on all Go versions and
-// architectures. It parses the first line of the stack trace to extract
-// the goroutine ID.
+// This is the slow-path method used only for testing and validation.
+// It parses the first line of the stack trace to extract the goroutine ID.
 //
 // Stack trace format: "goroutine 123 [running]:\n..."
 //
 // Performance: ~1500ns per call (dominated by runtime.Stack allocation).
-//
-// This function is called:
-//   - Directly by goid_fallback.go on unsupported platforms
-//   - As fallback if assembly path returns nil g pointer
-//   - For testing/validation against assembly implementation
 //
 // Returns:
 //   - int64: Goroutine ID (always positive), or 0 if parsing fails

@@ -26,22 +26,21 @@ func TestGetGoroutineID_Basic(t *testing.T) {
 	}
 }
 
-// TestGetGoroutineID_FastVsSlow validates fast and slow paths match.
+// TestGetGoroutineID_FastVsSlow validates runtime bridge against Stack parsing.
 //
 // This is CRITICAL: if fast and slow paths disagree, the race detector
 // will malfunction (goroutines will be tracked incorrectly).
 func TestGetGoroutineID_FastVsSlow(t *testing.T) {
-	// Get ID via fast path (uses assembly on amd64).
+	// Get ID via fast path (runtime bridge: getg().goid).
 	fast := getGoroutineIDFast()
 
-	// Get ID via slow path (always uses runtime.Stack parsing).
+	// Get ID via slow path (runtime.Stack parsing).
 	slow := getGoroutineIDSlow()
 
 	// They MUST match exactly.
 	if fast != slow {
 		t.Errorf("Fast and slow paths disagree! fast=%d, slow=%d", fast, slow)
-		t.Error("This indicates incorrect goid offset in assembly code.")
-		t.Error("Run tools/calc_goid_offset.go to verify offset for your Go version.")
+		t.Error("This indicates a bug in the runtime bridge (kolkovGetGoid).")
 	}
 }
 
@@ -88,7 +87,6 @@ func TestGetGoroutineID_MultipleGoroutines(t *testing.T) {
 	}
 
 	// All GIDs should be unique (no duplicates).
-	// Build a set to check uniqueness.
 	seen := make(map[int64]bool)
 	for _, gid := range gids {
 		if seen[gid] {
@@ -100,7 +98,7 @@ func TestGetGoroutineID_MultipleGoroutines(t *testing.T) {
 
 // TestGetGoroutineID_Concurrent tests concurrent GID extraction.
 //
-// This stresses the TLS access mechanism to ensure no races or corruption.
+// This stresses the runtime bridge to ensure no races or corruption.
 func TestGetGoroutineID_Concurrent(t *testing.T) {
 	const numGoroutines = 50
 	const numIterations = 1000
@@ -155,12 +153,7 @@ func TestGetGoroutineID_FastVsSlow_Concurrent(t *testing.T) {
 }
 
 // TestGetGoroutineID_MainGoroutine tests main goroutine ID.
-//
-// By convention, the main goroutine typically has ID 1, though this
-// is not guaranteed by Go runtime. We just verify it's positive.
 func TestGetGoroutineID_MainGoroutine(t *testing.T) {
-	// This test runs in the test goroutine (which might not be main).
-	// Just verify we can extract a valid GID.
 	gid := getGoroutineID()
 
 	if gid <= 0 {
@@ -175,17 +168,13 @@ func TestGetGoroutineID_NewlyCreated(t *testing.T) {
 	for round := 0; round < numRounds; round++ {
 		done := make(chan int64)
 
-		// Spawn a new goroutine.
 		go func() {
-			// Extract GID immediately after creation.
 			gid := getGoroutineID()
 			done <- gid
 		}()
 
-		// Wait for result.
 		gid := <-done
 
-		// GID should be positive.
 		if gid <= 0 {
 			t.Errorf("Round %d: Newly created goroutine has non-positive ID: %d", round, gid)
 		}
@@ -196,10 +185,8 @@ func TestGetGoroutineID_NewlyCreated(t *testing.T) {
 func TestGetGoroutineID_StabilityExtended(t *testing.T) {
 	const numChecks = 10000
 
-	// Get initial GID.
 	initialGID := getGoroutineID()
 
-	// Call getGoroutineID many times - should never change.
 	for i := 0; i < numChecks; i++ {
 		gid := getGoroutineID()
 		if gid != initialGID {
@@ -207,7 +194,6 @@ func TestGetGoroutineID_StabilityExtended(t *testing.T) {
 				initialGID, i, gid)
 		}
 
-		// Occasionally yield to scheduler to make test more realistic.
 		if i%100 == 0 {
 			runtime.Gosched()
 		}
@@ -216,34 +202,28 @@ func TestGetGoroutineID_StabilityExtended(t *testing.T) {
 
 // TestGetGoroutineID_AfterBlocking tests GID after blocking operations.
 func TestGetGoroutineID_AfterBlocking(t *testing.T) {
-	// Get GID before blocking.
 	gidBefore := getGoroutineID()
 
-	// Block on channel.
 	ch := make(chan int)
 	go func() {
 		ch <- 42
 	}()
 	<-ch
 
-	// GID should be unchanged after blocking.
 	gidAfter := getGoroutineID()
 	if gidBefore != gidAfter {
 		t.Errorf("GID changed after blocking! before=%d, after=%d", gidBefore, gidAfter)
 	}
 
-	// Block on mutex.
 	var mu sync.Mutex
 	mu.Lock()
 	go func() {
-		// Try to acquire lock (will block briefly).
 		mu.Lock()
 		defer mu.Unlock()
 	}()
-	runtime.Gosched() // Let other goroutine try to acquire.
+	runtime.Gosched()
 	mu.Unlock()
 
-	// GID should still be unchanged.
 	gidAfter2 := getGoroutineID()
 	if gidBefore != gidAfter2 {
 		t.Errorf("GID changed after mutex blocking! before=%d, after=%d", gidBefore, gidAfter2)
@@ -311,16 +291,13 @@ func TestParseGID(t *testing.T) {
 
 // TestGetGoroutineID_NoAllocations verifies fast path has zero allocations.
 //
-// This is critical for performance - the fast path must not allocate.
-// Uses outrigdev/goid library which provides assembly-optimized path
-// for Go 1.23+ on amd64/arm64.
+// The runtime bridge (getg().goid) must not allocate.
 func TestGetGoroutineID_NoAllocations(t *testing.T) {
 	// Warm up
 	for i := 0; i < 100; i++ {
 		_ = getGoroutineIDFast()
 	}
 
-	// Measure allocations
 	allocs := testing.AllocsPerRun(1000, func() {
 		_ = getGoroutineIDFast()
 	})
@@ -332,12 +309,10 @@ func TestGetGoroutineID_NoAllocations(t *testing.T) {
 
 // TestGetGoroutineIDSlow_HasAllocations verifies slow path allocates as expected.
 func TestGetGoroutineIDSlow_HasAllocations(t *testing.T) {
-	// Measure allocations.
 	allocs := testing.AllocsPerRun(100, func() {
 		_ = getGoroutineIDSlow()
 	})
 
-	// Should allocate exactly once per call (the 64-byte buffer).
 	if allocs < 0.9 || allocs > 1.1 {
 		t.Errorf("getGoroutineIDSlow() allocates %.2f times per call (expected ~1)", allocs)
 	}
