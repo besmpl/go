@@ -13,6 +13,7 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -178,7 +179,7 @@ const raceenabled = true
 // For composite objects (array, struct), it reads the entire object.
 // For non-composite objects, it reads just the first byte.
 func raceReadObjectPC(t *_type, addr unsafe.Pointer, callerpc, pc uintptr) {
-	kind := t.Kind_ & abi.KindMask
+	kind := t.Kind()
 	if kind == abi.Array || kind == abi.Struct {
 		// for composite objects we have to read every address
 		// because a write might happen to any subobject.
@@ -199,7 +200,7 @@ func race_ReadObjectPC(t *abi.Type, addr unsafe.Pointer, callerpc, pc uintptr) {
 // For composite objects (array, struct), it writes the entire object.
 // For non-composite objects, it writes just the first byte.
 func raceWriteObjectPC(t *_type, addr unsafe.Pointer, callerpc, pc uintptr) {
-	kind := t.Kind_ & abi.KindMask
+	kind := t.Kind()
 	if kind == abi.Array || kind == abi.Struct {
 		// for composite objects we have to write every address
 		// because a write might happen to any subobject.
@@ -217,16 +218,36 @@ func race_WriteObjectPC(t *abi.Type, addr unsafe.Pointer, callerpc, pc uintptr) 
 }
 
 // racereadpc records a read of the memory location addr with explicit PC values.
-// Implemented in assembly (race_kolkov_*.s).
 //
-//go:noescape
-func racereadpc(addr unsafe.Pointer, callpc, pc uintptr)
+//go:nosplit
+func racereadpc(addr unsafe.Pointer, callpc, pc uintptr) {
+	gp := getg()
+	if gp == nil || gp.m == nil || gp.m.curg == nil {
+		return
+	}
+	if gp.raceignore != 0 {
+		return
+	}
+	gp.raceignore++
+	kolkovOnRead(uintptr(addr), pc)
+	gp.raceignore--
+}
 
 // racewritepc records a write of the memory location addr with explicit PC values.
-// Implemented in assembly (race_kolkov_*.s).
 //
-//go:noescape
-func racewritepc(addr unsafe.Pointer, callpc, pc uintptr)
+//go:nosplit
+func racewritepc(addr unsafe.Pointer, callpc, pc uintptr) {
+	gp := getg()
+	if gp == nil || gp.m == nil || gp.m.curg == nil {
+		return
+	}
+	if gp.raceignore != 0 {
+		return
+	}
+	gp.raceignore++
+	kolkovOnWrite(uintptr(addr), pc)
+	gp.raceignore--
+}
 
 //go:linkname race_ReadPC internal/race.ReadPC
 func race_ReadPC(addr unsafe.Pointer, callerpc, pc uintptr) {
@@ -524,43 +545,137 @@ func racefingo() {
 	// TODO: Special handling for finalizer goroutines
 }
 
-// Assembly-implemented functions (in race_kolkov_*.s)
-
-// racefuncenter records function entry.
-// Implemented in assembly to extract the caller PC efficiently.
-func racefuncenter(callpc uintptr)
-
-// racefuncenterfp records function entry using frame pointer.
-func racefuncenterfp(fp uintptr)
-
-// racefuncexit records function exit.
-func racefuncexit()
+// Hot-path race detection functions.
+// These are called directly by compiler-generated instrumentation.
+// Previously implemented in assembly (race_kolkov_*.s), now pure Go
+// per @randall77 guidance: no assembly needed, use sys.GetCallerPC().
 
 // raceread records a read of the given address.
 // Called from compiler-generated instrumentation.
-// Implemented in assembly (race_kolkov_*.s).
-func raceread(addr uintptr)
+// sys.GetCallerPC() must be the first call to capture instrumented code's PC.
+//
+//go:nosplit
+func raceread(addr uintptr) {
+	pc := sys.GetCallerPC()
+	gp := getg()
+	if gp == nil || gp.m == nil || gp.m.curg == nil {
+		return
+	}
+	if gp.raceignore != 0 {
+		return
+	}
+	gp.raceignore++
+	kolkovOnRead(addr, pc)
+	gp.raceignore--
+}
 
 // racewrite records a write to the given address.
 // Called from compiler-generated instrumentation.
-// Implemented in assembly (race_kolkov_*.s).
-func racewrite(addr uintptr)
+//
+//go:nosplit
+func racewrite(addr uintptr) {
+	pc := sys.GetCallerPC()
+	gp := getg()
+	if gp == nil || gp.m == nil || gp.m.curg == nil {
+		return
+	}
+	if gp.raceignore != 0 {
+		return
+	}
+	gp.raceignore++
+	kolkovOnWrite(addr, pc)
+	gp.raceignore--
+}
 
 // racereadrange records a read of the given address range.
-// Implemented in assembly (race_kolkov_*.s).
-func racereadrange(addr, size uintptr)
+// Called from compiler-generated instrumentation.
+//
+//go:nosplit
+func racereadrange(addr, size uintptr) {
+	pc := sys.GetCallerPC()
+	gp := getg()
+	if gp == nil || gp.m == nil || gp.m.curg == nil {
+		return
+	}
+	if gp.raceignore != 0 {
+		return
+	}
+	gp.raceignore++
+	// Track base address for now. Full range tracking is T11.
+	kolkovOnRead(addr, pc)
+	gp.raceignore--
+}
 
 // racewriterange records a write to the given address range.
-// Implemented in assembly (race_kolkov_*.s).
-func racewriterange(addr, size uintptr)
+// Called from compiler-generated instrumentation.
+//
+//go:nosplit
+func racewriterange(addr, size uintptr) {
+	pc := sys.GetCallerPC()
+	gp := getg()
+	if gp == nil || gp.m == nil || gp.m.curg == nil {
+		return
+	}
+	if gp.raceignore != 0 {
+		return
+	}
+	gp.raceignore++
+	// Track base address for now. Full range tracking is T11.
+	kolkovOnWrite(addr, pc)
+	gp.raceignore--
+}
 
-// racereadrangepc1 is the internal implementation for range reads with PC.
-// Implemented in assembly (race_kolkov_*.s).
-func racereadrangepc1(addr, size, pc uintptr)
+// racereadrangepc1 is the internal implementation for range reads with explicit PC.
+//
+//go:nosplit
+func racereadrangepc1(addr, size, pc uintptr) {
+	gp := getg()
+	if gp == nil || gp.m == nil || gp.m.curg == nil {
+		return
+	}
+	if gp.raceignore != 0 {
+		return
+	}
+	gp.raceignore++
+	kolkovOnRead(addr, pc)
+	gp.raceignore--
+}
 
-// racewriterangepc1 is the internal implementation for range writes with PC.
-// Implemented in assembly (race_kolkov_*.s).
-func racewriterangepc1(addr, size, pc uintptr)
+// racewriterangepc1 is the internal implementation for range writes with explicit PC.
+//
+//go:nosplit
+func racewriterangepc1(addr, size, pc uintptr) {
+	gp := getg()
+	if gp == nil || gp.m == nil || gp.m.curg == nil {
+		return
+	}
+	if gp.raceignore != 0 {
+		return
+	}
+	gp.raceignore++
+	kolkovOnWrite(addr, pc)
+	gp.raceignore--
+}
+
+// racefuncenter records function entry.
+// Called by compiler at every function entry when race detection is enabled.
+// No-op for now — stack traces use sys.GetCallerPC() instead.
+//
+//go:nosplit
+func racefuncenter(callpc uintptr) {
+}
+
+// racefuncenterfp records function entry using frame pointer.
+//
+//go:nosplit
+func racefuncenterfp(fp uintptr) {
+}
+
+// racefuncexit records function exit.
+//
+//go:nosplit
+func racefuncexit() {
+}
 
 // Pure-Go detector implementation stubs
 // These will be implemented as the detector is ported to runtime.
@@ -577,44 +692,6 @@ func raceKolkovInit() {
 //go:nosplit
 func raceKolkovFini() {
 	kolkovDetectorFini()
-}
-
-// kolkovOnReadGo is called from assembly to handle read access.
-// Parameters are passed on stack by assembly.
-// Uses raceignore to prevent infinite recursion when Kolkov code is instrumented.
-//
-//go:nosplit
-func kolkovOnReadGo(addr, pc uintptr) {
-	gp := getg()
-	// Skip during early runtime init when goroutines aren't ready
-	if gp == nil || gp.m == nil || gp.m.curg == nil {
-		return
-	}
-	if gp.raceignore != 0 {
-		return
-	}
-	gp.raceignore++
-	kolkovOnRead(addr, pc)
-	gp.raceignore--
-}
-
-// kolkovOnWriteGo is called from assembly to handle write access.
-// Parameters are passed on stack by assembly.
-// Uses raceignore to prevent infinite recursion when Kolkov code is instrumented.
-//
-//go:nosplit
-func kolkovOnWriteGo(addr, pc uintptr) {
-	gp := getg()
-	// Skip during early runtime init when goroutines aren't ready
-	if gp == nil || gp.m == nil || gp.m.curg == nil {
-		return
-	}
-	if gp.raceignore != 0 {
-		return
-	}
-	gp.raceignore++
-	kolkovOnWrite(addr, pc)
-	gp.raceignore--
 }
 
 // The declarations below generate ABI wrappers for functions
