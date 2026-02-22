@@ -1144,23 +1144,25 @@ func getCurrentContext() *goroutine.RaceContext {
 // This is called once during Init() to set up the free TID stack.
 // All 256 TIDs are initially available for allocation.
 //
-// TIDs are stored in ascending order [0, 1, 2, ..., 255] so that when we pop
-// from the end, we allocate TIDs in ascending order (0, 1, 2, ...).
+// TIDs are stored in ascending order [1, 2, ..., 65535] so allocation
+// proceeds 1, 2, 3, ... via FIFO pop from front.
+//
+// CRITICAL: TID 0 is RESERVED as "no owner" sentinel in SmartTrack
+// ownership tracking (VarState.exclusiveWriter). Allocating TID 0 to a
+// goroutine would make CAS(0, 0) a no-op, preventing ownership claims
+// and causing missed race detections.
 //
 // Thread Safety: NOT thread-safe. Must be called during initialization only.
 func initTIDPool() {
 	tidPoolMu.lock()
 	defer tidPoolMu.unlock()
 
-	// Initialize free TID stack with all 256 TIDs.
-	// Stack order: [0, 1, 2, ..., 255]
-	// Popping from end gives: 255, 254, ..., 1, 0
-	// But after Init removes TID 0, we get: 255, 254, ..., 1
-	// We want ascending allocation, so we reverse the order.
-	freeTIDs = make([]uint16, 65536)
-	for i := 0; i < 65536; i++ {
-		//nolint:gosec // G115: Safe conversion, i is always < 256
-		freeTIDs[i] = uint16(i) // Stack order: [0, 1, 2, ..., 255]
+	// Initialize free TID pool with TIDs [1, 2, ..., 65535].
+	// TID 0 is excluded — it serves as "no exclusive writer" sentinel.
+	freeTIDs = make([]uint16, 65535)
+	for i := 0; i < 65535; i++ {
+		//nolint:gosec // G115: Safe conversion, i+1 is always <= 65535
+		freeTIDs[i] = uint16(i + 1)
 	}
 }
 
