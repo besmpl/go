@@ -228,10 +228,21 @@ func racereadpc(addr unsafe.Pointer, callpc, pc uintptr) {
 	if gp.raceignore != 0 {
 		return
 	}
+	racectx := gp.racectx
 	gp.raceignore++
-	systemstack(func() {
-		kolkovOnRead(uintptr(addr), pc)
-	})
+	if racectx > 1 {
+		systemstack(func() {
+			kolkovOnReadCtx(uintptr(addr), pc, racectx)
+		})
+	} else {
+		var newCtx uintptr
+		systemstack(func() {
+			newCtx = kolkovOnReadSlow(uintptr(addr), pc)
+		})
+		if newCtx > 1 {
+			gp.racectx = newCtx
+		}
+	}
 	gp.raceignore--
 }
 
@@ -246,10 +257,21 @@ func racewritepc(addr unsafe.Pointer, callpc, pc uintptr) {
 	if gp.raceignore != 0 {
 		return
 	}
+	racectx := gp.racectx
 	gp.raceignore++
-	systemstack(func() {
-		kolkovOnWrite(uintptr(addr), pc)
-	})
+	if racectx > 1 {
+		systemstack(func() {
+			kolkovOnWriteCtx(uintptr(addr), pc, racectx)
+		})
+	} else {
+		var newCtx uintptr
+		systemstack(func() {
+			newCtx = kolkovOnWriteSlow(uintptr(addr), pc)
+		})
+		if newCtx > 1 {
+			gp.racectx = newCtx
+		}
+	}
 	gp.raceignore--
 }
 
@@ -431,6 +453,8 @@ func racegoend() {
 		kolkovApiOnGoEnd(int64(gp.goid))
 	})
 	gp.raceignore--
+	// Clear cached context to prevent dangling pointer after cleanup
+	gp.racectx = 0
 }
 
 // racectxstart creates a new race context for a goroutine.
@@ -490,7 +514,26 @@ func racereadrangepc(addr unsafe.Pointer, sz, callpc, pc uintptr) {
 //
 //go:nosplit
 func raceacquire(addr unsafe.Pointer) {
-	raceacquireg(getg(), addr)
+	gp := getg()
+	if gp.raceignore != 0 {
+		return
+	}
+	racectx := gp.racectx
+	gp.raceignore++
+	if racectx > 1 {
+		systemstack(func() {
+			kolkovOnAcquireCtx(uintptr(addr), racectx)
+		})
+	} else {
+		var newCtx uintptr
+		systemstack(func() {
+			newCtx = kolkovOnAcquireSlow(uintptr(addr))
+		})
+		if newCtx > 1 {
+			gp.racectx = newCtx
+		}
+	}
+	gp.raceignore--
 }
 
 // raceacquireg records an acquire operation on the given address for a specific goroutine.
@@ -509,9 +552,18 @@ func raceacquireg(gp *g, addr unsafe.Pointer) {
 		curg = curg.m.curg
 	}
 	curg.raceignore++
-	systemstack(func() {
-		kolkovApiOnAcquireForGoroutine(uintptr(addr), int64(gp.goid))
-	})
+	racectx := gp.racectx
+	if racectx > 1 {
+		// Fast path: target goroutine has cached context
+		systemstack(func() {
+			kolkovOnAcquireCtx(uintptr(addr), racectx)
+		})
+	} else {
+		// Slow path: fall back to goid-based lookup
+		systemstack(func() {
+			kolkovApiOnAcquireForGoroutine(uintptr(addr), int64(gp.goid))
+		})
+	}
 	curg.raceignore--
 }
 
@@ -532,9 +584,17 @@ func raceacquirectx(racectx uintptr, addr unsafe.Pointer) {
 		return
 	}
 	gp.raceignore++
-	systemstack(func() {
-		kolkovOnAcquire(uintptr(addr))
-	})
+	if racectx > 1 {
+		// racectx is a real cached *RaceContext pointer
+		systemstack(func() {
+			kolkovOnAcquireCtx(uintptr(addr), racectx)
+		})
+	} else {
+		// racectx == 1 (sentinel), fall back to current goroutine context
+		systemstack(func() {
+			kolkovOnAcquire(uintptr(addr))
+		})
+	}
 	gp.raceignore--
 }
 
@@ -542,7 +602,22 @@ func raceacquirectx(racectx uintptr, addr unsafe.Pointer) {
 //
 //go:nosplit
 func racerelease(addr unsafe.Pointer) {
-	racereleaseg(getg(), addr)
+	gp := getg()
+	if gp.raceignore != 0 {
+		return
+	}
+	racectx := gp.racectx
+	gp.raceignore++
+	if racectx > 1 {
+		systemstack(func() {
+			kolkovOnReleaseCtx(uintptr(addr), racectx)
+		})
+	} else {
+		systemstack(func() {
+			kolkovOnRelease(uintptr(addr))
+		})
+	}
+	gp.raceignore--
 }
 
 // racereleaseg records a release operation on the given address for a specific goroutine.
@@ -559,9 +634,16 @@ func racereleaseg(gp *g, addr unsafe.Pointer) {
 		curg = curg.m.curg
 	}
 	curg.raceignore++
-	systemstack(func() {
-		kolkovApiOnReleaseForGoroutine(uintptr(addr), int64(gp.goid))
-	})
+	racectx := gp.racectx
+	if racectx > 1 {
+		systemstack(func() {
+			kolkovOnReleaseCtx(uintptr(addr), racectx)
+		})
+	} else {
+		systemstack(func() {
+			kolkovApiOnReleaseForGoroutine(uintptr(addr), int64(gp.goid))
+		})
+	}
 	curg.raceignore--
 }
 
@@ -585,10 +667,18 @@ func racereleaseacquireg(gp *g, addr unsafe.Pointer) {
 		curg = curg.m.curg
 	}
 	curg.raceignore++
-	systemstack(func() {
-		kolkovApiOnReleaseForGoroutine(uintptr(addr), int64(gp.goid))
-		kolkovApiOnAcquireForGoroutine(uintptr(addr), int64(gp.goid))
-	})
+	racectx := gp.racectx
+	if racectx > 1 {
+		systemstack(func() {
+			kolkovOnReleaseCtx(uintptr(addr), racectx)
+			kolkovOnAcquireCtx(uintptr(addr), racectx)
+		})
+	} else {
+		systemstack(func() {
+			kolkovApiOnReleaseForGoroutine(uintptr(addr), int64(gp.goid))
+			kolkovApiOnAcquireForGoroutine(uintptr(addr), int64(gp.goid))
+		})
+	}
 	curg.raceignore--
 }
 
@@ -596,7 +686,22 @@ func racereleaseacquireg(gp *g, addr unsafe.Pointer) {
 //
 //go:nosplit
 func racereleasemerge(addr unsafe.Pointer) {
-	racereleasemergeg(getg(), addr)
+	gp := getg()
+	if gp.raceignore != 0 {
+		return
+	}
+	racectx := gp.racectx
+	gp.raceignore++
+	if racectx > 1 {
+		systemstack(func() {
+			kolkovOnReleaseMergeCtx(uintptr(addr), racectx)
+		})
+	} else {
+		systemstack(func() {
+			kolkovOnReleaseMerge(uintptr(addr))
+		})
+	}
+	gp.raceignore--
 }
 
 // racereleasemergeg records a release-merge operation for a specific goroutine.
@@ -613,9 +718,16 @@ func racereleasemergeg(gp *g, addr unsafe.Pointer) {
 		curg = curg.m.curg
 	}
 	curg.raceignore++
-	systemstack(func() {
-		kolkovApiOnReleaseMergeForGoroutine(uintptr(addr), int64(gp.goid))
-	})
+	racectx := gp.racectx
+	if racectx > 1 {
+		systemstack(func() {
+			kolkovOnReleaseMergeCtx(uintptr(addr), racectx)
+		})
+	} else {
+		systemstack(func() {
+			kolkovApiOnReleaseMergeForGoroutine(uintptr(addr), int64(gp.goid))
+		})
+	}
 	curg.raceignore--
 }
 
@@ -645,10 +757,23 @@ func raceread(addr uintptr) {
 	if gp.raceignore != 0 {
 		return
 	}
+	racectx := gp.racectx
 	gp.raceignore++
-	systemstack(func() {
-		kolkovOnRead(addr, pc)
-	})
+	if racectx > 1 {
+		// Fast path: context cached in g.racectx
+		systemstack(func() {
+			kolkovOnReadCtx(addr, pc, racectx)
+		})
+	} else {
+		// Slow path: first access — create context, cache it
+		var newCtx uintptr
+		systemstack(func() {
+			newCtx = kolkovOnReadSlow(addr, pc)
+		})
+		if newCtx > 1 {
+			gp.racectx = newCtx
+		}
+	}
 	gp.raceignore--
 }
 
@@ -665,10 +790,21 @@ func racewrite(addr uintptr) {
 	if gp.raceignore != 0 {
 		return
 	}
+	racectx := gp.racectx
 	gp.raceignore++
-	systemstack(func() {
-		kolkovOnWrite(addr, pc)
-	})
+	if racectx > 1 {
+		systemstack(func() {
+			kolkovOnWriteCtx(addr, pc, racectx)
+		})
+	} else {
+		var newCtx uintptr
+		systemstack(func() {
+			newCtx = kolkovOnWriteSlow(addr, pc)
+		})
+		if newCtx > 1 {
+			gp.racectx = newCtx
+		}
+	}
 	gp.raceignore--
 }
 
@@ -685,11 +821,22 @@ func racereadrange(addr, size uintptr) {
 	if gp.raceignore != 0 {
 		return
 	}
+	racectx := gp.racectx
 	gp.raceignore++
-	systemstack(func() {
-		// Track base address for now. Full range tracking is T11.
-		kolkovOnRead(addr, pc)
-	})
+	if racectx > 1 {
+		systemstack(func() {
+			// Track base address for now. Full range tracking is T11.
+			kolkovOnReadCtx(addr, pc, racectx)
+		})
+	} else {
+		var newCtx uintptr
+		systemstack(func() {
+			newCtx = kolkovOnReadSlow(addr, pc)
+		})
+		if newCtx > 1 {
+			gp.racectx = newCtx
+		}
+	}
 	gp.raceignore--
 }
 
@@ -706,11 +853,22 @@ func racewriterange(addr, size uintptr) {
 	if gp.raceignore != 0 {
 		return
 	}
+	racectx := gp.racectx
 	gp.raceignore++
-	systemstack(func() {
-		// Track base address for now. Full range tracking is T11.
-		kolkovOnWrite(addr, pc)
-	})
+	if racectx > 1 {
+		systemstack(func() {
+			// Track base address for now. Full range tracking is T11.
+			kolkovOnWriteCtx(addr, pc, racectx)
+		})
+	} else {
+		var newCtx uintptr
+		systemstack(func() {
+			newCtx = kolkovOnWriteSlow(addr, pc)
+		})
+		if newCtx > 1 {
+			gp.racectx = newCtx
+		}
+	}
 	gp.raceignore--
 }
 
@@ -725,10 +883,21 @@ func racereadrangepc1(addr, size, pc uintptr) {
 	if gp.raceignore != 0 {
 		return
 	}
+	racectx := gp.racectx
 	gp.raceignore++
-	systemstack(func() {
-		kolkovOnRead(addr, pc)
-	})
+	if racectx > 1 {
+		systemstack(func() {
+			kolkovOnReadCtx(addr, pc, racectx)
+		})
+	} else {
+		var newCtx uintptr
+		systemstack(func() {
+			newCtx = kolkovOnReadSlow(addr, pc)
+		})
+		if newCtx > 1 {
+			gp.racectx = newCtx
+		}
+	}
 	gp.raceignore--
 }
 
@@ -743,10 +912,21 @@ func racewriterangepc1(addr, size, pc uintptr) {
 	if gp.raceignore != 0 {
 		return
 	}
+	racectx := gp.racectx
 	gp.raceignore++
-	systemstack(func() {
-		kolkovOnWrite(addr, pc)
-	})
+	if racectx > 1 {
+		systemstack(func() {
+			kolkovOnWriteCtx(addr, pc, racectx)
+		})
+	} else {
+		var newCtx uintptr
+		systemstack(func() {
+			newCtx = kolkovOnWriteSlow(addr, pc)
+		})
+		if newCtx > 1 {
+			gp.racectx = newCtx
+		}
+	}
 	gp.raceignore--
 }
 

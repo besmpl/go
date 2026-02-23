@@ -831,6 +831,87 @@ func racereleasemerge(addr uintptr) {
 	det.OnReleaseMerge(addr, ctx)
 }
 
+// === g.racectx Fast Path: context pointer passed directly (T9 optimization) ===
+// These skip contextsMap lookup entirely — ~5-30ns savings per call.
+
+//go:linkname racereadCtx
+//go:nosplit
+func racereadCtx(addr, pc, racectx uintptr) {
+	ctx := (*goroutine.RaceContext)(unsafe.Pointer(racectx))
+	det.OnRead(addr, ctx, pc)
+}
+
+//go:linkname racewriteCtx
+//go:nosplit
+func racewriteCtx(addr, pc, racectx uintptr) {
+	ctx := (*goroutine.RaceContext)(unsafe.Pointer(racectx))
+	det.OnWrite(addr, ctx, pc)
+}
+
+//go:linkname raceacquireCtx
+//go:nosplit
+func raceacquireCtx(addr, racectx uintptr) {
+	ctx := (*goroutine.RaceContext)(unsafe.Pointer(racectx))
+	det.OnAcquire(addr, ctx)
+}
+
+//go:linkname racereleaseCtx
+//go:nosplit
+func racereleaseCtx(addr, racectx uintptr) {
+	ctx := (*goroutine.RaceContext)(unsafe.Pointer(racectx))
+	det.OnRelease(addr, ctx)
+}
+
+//go:linkname racereleasemergeCtx
+//go:nosplit
+func racereleasemergeCtx(addr, racectx uintptr) {
+	ctx := (*goroutine.RaceContext)(unsafe.Pointer(racectx))
+	det.OnReleaseMerge(addr, ctx)
+}
+
+// === g.racectx Slow Path: creates context, returns pointer for caching ===
+// Called on first access per goroutine. Returns context pointer as uintptr
+// so runtime can cache it in g.racectx for subsequent fast-path calls.
+
+//go:linkname racereadSlow
+func racereadSlow(addr, pc uintptr) uintptr {
+	if apiInitCalled.Load() == 0 {
+		ensureInitialized()
+	}
+	if enabled.Load() == 0 {
+		return 0
+	}
+	ctx := getCurrentContext()
+	det.OnRead(addr, ctx, pc)
+	return uintptr(unsafe.Pointer(ctx))
+}
+
+//go:linkname racewriteSlow
+func racewriteSlow(addr, pc uintptr) uintptr {
+	if apiInitCalled.Load() == 0 {
+		ensureInitialized()
+	}
+	if enabled.Load() == 0 {
+		return 0
+	}
+	ctx := getCurrentContext()
+	det.OnWrite(addr, ctx, pc)
+	return uintptr(unsafe.Pointer(ctx))
+}
+
+//go:linkname raceacquireSlow
+func raceacquireSlow(addr uintptr) uintptr {
+	if apiInitCalled.Load() == 0 {
+		ensureInitialized()
+	}
+	if enabled.Load() == 0 {
+		return 0
+	}
+	ctx := getCurrentContext()
+	det.OnAcquire(addr, ctx)
+	return uintptr(unsafe.Pointer(ctx))
+}
+
 // === Cross-Goroutine Acquire/Release (for channel sync) ===
 
 // raceAcquireForGoroutine performs an acquire operation on addr on behalf of

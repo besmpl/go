@@ -152,3 +152,32 @@ func kolkovApiOnGoStart(pc uintptr, parentGoid int64)
 
 //go:linkname kolkovApiOnGoEnd runtime/race/kolkov/api.raceGoEndFromRuntime
 func kolkovApiOnGoEnd(goid int64)
+
+// === g.racectx Fast/Slow Path Bridges (T9 optimization) ===
+// Fast path: context pointer passed directly as uintptr (skips contextsMap lookup).
+
+//go:linkname kolkovOnReadCtx runtime/race/kolkov/api.racereadCtx
+func kolkovOnReadCtx(addr, pc, racectx uintptr)
+
+//go:linkname kolkovOnWriteCtx runtime/race/kolkov/api.racewriteCtx
+func kolkovOnWriteCtx(addr, pc, racectx uintptr)
+
+//go:linkname kolkovOnAcquireCtx runtime/race/kolkov/api.raceacquireCtx
+func kolkovOnAcquireCtx(addr, racectx uintptr)
+
+//go:linkname kolkovOnReleaseCtx runtime/race/kolkov/api.racereleaseCtx
+func kolkovOnReleaseCtx(addr, racectx uintptr)
+
+//go:linkname kolkovOnReleaseMergeCtx runtime/race/kolkov/api.racereleasemergeCtx
+func kolkovOnReleaseMergeCtx(addr, racectx uintptr)
+
+// Slow path: creates context, performs operation, returns pointer for caching in g.racectx.
+
+//go:linkname kolkovOnReadSlow runtime/race/kolkov/api.racereadSlow
+func kolkovOnReadSlow(addr, pc uintptr) uintptr
+
+//go:linkname kolkovOnWriteSlow runtime/race/kolkov/api.racewriteSlow
+func kolkovOnWriteSlow(addr, pc uintptr) uintptr
+
+//go:linkname kolkovOnAcquireSlow runtime/race/kolkov/api.raceacquireSlow
+func kolkovOnAcquireSlow(addr uintptr) uintptr
