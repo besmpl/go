@@ -80,7 +80,12 @@ var (
 // Overflow detection (v0.2.0 Task 5):
 // - If TID > MaxTID: Sets tidOverflowDetected flag and clamps to MaxTID.
 // - If clock > MaxClock: Sets clockOverflowDetected flag and clamps to MaxClock.
-// - At 90% thresholds: Sets warning flags for early detection.
+// - At 90% clock threshold: Sets clock warning flag for early detection.
+//
+// Note: TID-value-based warning is intentionally NOT done here. With FIFO TID
+// recycling, TIDs cycle through all 65535 values sequentially before reuse.
+// A high TID value (e.g., 60000) is NORMAL and does not indicate exhaustion.
+// Pool depletion is detected in allocTID() instead.
 //
 // Clamping prevents wrap-around which causes false negatives (worse than false positives).
 //
@@ -95,7 +100,6 @@ func NewEpoch(tid uint16, clock uint64) Epoch {
 	if tid32 > MaxTID {
 		tidOverflowDetected.Store(1)
 		tid = uint16(MaxTID) // Clamp to max (prevents wrap-around).
-		tid32 = MaxTID
 	}
 
 	// Check for clock overflow.
@@ -104,10 +108,8 @@ func NewEpoch(tid uint16, clock uint64) Epoch {
 		clock = MaxClock // Clamp to max.
 	}
 
-	// Warn at 90% threshold (early warning).
-	if tid32 > MaxTIDWarning {
-		tidNearOverflow.Store(1)
-	}
+	// Warn at 90% clock threshold (early warning).
+	// Note: No TID-value warning here — use allocTID() pool depletion warning instead.
 	if clock > MaxClockWarning {
 		clockNearOverflow.Store(1)
 	}

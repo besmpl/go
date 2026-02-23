@@ -124,18 +124,30 @@ var (
 	// All race detection flows through this single instance.
 	det *detector.Detector
 
-	// === TID Pool Management (Phase 2 Task 2.2) ===
-	// TID reuse pool supporting unlimited goroutines (1000+).
+	// === TID Pool Management with Clock Bumping (Phase 2 Task 2.2) ===
+	// TID reuse pool supporting unlimited goroutines with safe recycling.
+	// When a TID is freed, we record the max clock it reached.
+	// When reused, the new goroutine starts its clock ABOVE the previous max,
+	// ensuring stale shadow entries are detected as "concurrent" (conservative).
 
-	// freeTIDs is a stack of available TIDs (0-65535).
-	// Protected by tidPoolMu. TIDs are popped on allocation and pushed on free.
+	// freeTIDs is a FIFO queue of recyclable TIDs.
+	// FIFO maximizes temporal separation between reuse.
 	freeTIDs []uint16
 
 	apiInitCalled atomic.Uint32 // 1 if init() was called
 
-	// tidPoolMu protects freeTIDs stack.
+	// tidPoolMu protects freeTIDs and maxClockAtFree.
 	// Lock contention is minimal as allocations are rare relative to raceread/racewrite.
 	tidPoolMu spinlockAPI
+
+	// tidPoolWarningShown ensures the "nearly exhausted" warning fires only once.
+	// Without this, the warning would print on every allocTID() call when < 100 TIDs remain.
+	tidPoolWarningShown atomic.Uint32
+
+	// maxClockAtFree records the maximum clock value each TID reached before being freed.
+	// The next goroutine assigned this TID must start its clock above this value.
+	// Size: 65536 * 4 bytes = 256KB.
+	maxClockAtFree [65536]uint32
 
 	// tidToGIDMap maps TID back to GID for cleanup verification.
 	// Key: uint16 (TID), Value: int64 (GID).
@@ -543,14 +555,16 @@ func raceGoEndFromRuntime(goid int64) {
 
 	// Load and delete context atomically.
 	if ctx, ok := contextsMap.LoadAndDelete(goid); ok {
-		// Return VectorClock to pool for reuse.
+		// Get current clock before releasing VectorClock (for TID recycling safety).
+		var currentClock uint32
 		if ctx.C != nil {
+			currentClock = ctx.C.Get(ctx.TID)
 			ctx.C.Release()
 			ctx.C = nil
 		}
 
-		// Return TID to pool for reuse.
-		freeTID(ctx.TID)
+		// Return TID to pool with clock for safe recycling.
+		freeTID(ctx.TID, currentClock)
 
 		// Clean up TID→GID mapping.
 		tidToGIDMap.Delete(ctx.TID)
@@ -604,15 +618,16 @@ func racegoend() {
 
 	// Load and delete context atomically.
 	if ctx, ok := contextsMap.LoadAndDelete(gid); ok {
-
-		// Return VectorClock to pool for reuse.
+		// Get current clock before releasing VectorClock (for TID recycling safety).
+		var currentClock uint32
 		if ctx.C != nil {
+			currentClock = ctx.C.Get(ctx.TID)
 			ctx.C.Release()
 			ctx.C = nil
 		}
 
-		// Return TID to pool for reuse.
-		freeTID(ctx.TID)
+		// Return TID to pool with clock for safe recycling.
+		freeTID(ctx.TID, currentClock)
 
 		// Clean up TID→GID mapping.
 		tidToGIDMap.Delete(ctx.TID)
@@ -1361,19 +1376,17 @@ func getCurrentContext() *goroutine.RaceContext {
 	// If parent called racegostart() before spawning us, we inherit their clock.
 	parentClock := findAndConsumeSpawnContext()
 
-	// Allocate TID from reuse pool.
-	// This supports unlimited goroutines by recycling TIDs from dead goroutines.
-	tid := allocTID()
+	// Allocate TID from reuse pool with clock bumping for safe recycling.
+	tid, startClock := allocTID()
 
 	// Create new RaceContext for this goroutine.
 	var ctx *goroutine.RaceContext
 	if parentClock != nil {
-		// GoStart path: inherit parent's clock.
-		// This establishes happens-before from parent's operations before fork.
-		ctx = goroutine.AllocWithParentClock(tid, parentClock)
+		// GoStart path: inherit parent's clock with recycling-safe startClock.
+		ctx = goroutine.AllocWithParentClock(tid, parentClock, startClock)
 	} else {
-		// Legacy path: fresh clock (main goroutine or untracked spawns).
-		ctx = goroutine.Alloc(tid)
+		// Legacy path: fresh clock with recycling-safe startClock.
+		ctx = goroutine.AllocWithStartClock(tid, startClock)
 	}
 
 	// Store in cache for future accesses.
@@ -1418,37 +1431,42 @@ func initTIDPool() {
 	}
 }
 
-// allocTID allocates a TID from the free pool.
+// allocTID allocates a TID from the free pool with clock bumping for safe recycling.
+//
+// Returns (tid, startClock) where startClock is the initial clock value the
+// new goroutine must use. For fresh TIDs, startClock=1. For recycled TIDs,
+// startClock = maxClockAtFree[tid] + 1, ensuring stale shadow entries are
+// always detected as "concurrent" (no false negatives).
 //
 // Algorithm:
 //  1. Lock the pool
-//  2. If pool is empty, trigger cleanup and retry
-//  3. Pop TID from the queue (FIFO - allocate in ascending order)
+//  2. Try FIFO pop from recycled TIDs (with clock bumping)
+//  3. If empty, trigger cleanup and retry
+//  4. Graceful degradation if all TIDs exhausted
 //
-// If cleanup doesn't free any TIDs (pool still exhausted), this reuses TID 0.
-// This is graceful degradation - TID conflicts may occur, but program doesn't crash.
+// Pool depletion warning: When fewer than 100 TIDs remain (~0.15% of 65535),
+// a warning is printed. This is a meaningful indicator of ACTUAL exhaustion,
+// as opposed to TID-value-based warnings which fire falsely with FIFO recycling.
 //
-// Performance: ~50ns (mutex lock + queue pop).
-// Lock contention is minimal as allocations are rare relative to memory accesses.
-//
-// We use FIFO (pop from beginning) instead of LIFO (pop from end) to allocate
-// TIDs in ascending order (1, 2, 3, ...) which makes debugging easier.
+// Performance: ~50ns (mutex lock + queue pop + array read).
 //
 // Thread Safety: Safe for concurrent calls (protected by tidPoolMu).
-//
-// Returns:
-//   - uint8: Allocated TID (0-255)
-func allocTID() uint16 {
+func allocTID() (uint16, uint32) {
 	tidPoolMu.lock()
 
 	// Fast path: TID available in pool.
 	if len(freeTIDs) > 0 {
-		// Pop TID from the front (FIFO - ascending order).
-		// freeTIDs is [1, 2, 3, ..., 255] after Init removes TID 0.
+		// Warn once when pool is nearly depleted (< 100 TIDs remaining, ~0.15% of 65535).
+		// This indicates real TID exhaustion, not just high TID values from FIFO cycling.
+		// The warning fires only once to avoid spamming on every allocTID() call.
+		if len(freeTIDs) < 100 && tidPoolWarningShown.CompareAndSwap(0, 1) {
+			printstring("WARNING: race detector TID pool nearly exhausted (< 100 TIDs remaining)\n")
+		}
 		tid := freeTIDs[0]
 		freeTIDs = freeTIDs[1:]
+		startClock := maxClockAtFree[tid] + 1
 		tidPoolMu.unlock()
-		return tid
+		return tid, startClock
 	}
 
 	// Slow path: Pool exhausted - trigger cleanup.
@@ -1465,34 +1483,36 @@ func allocTID() uint16 {
 	defer tidPoolMu.unlock()
 
 	if len(freeTIDs) > 0 {
-		// Cleanup freed some TIDs - allocate one.
 		tid := freeTIDs[0]
 		freeTIDs = freeTIDs[1:]
-		return tid
+		startClock := maxClockAtFree[tid] + 1
+		return tid, startClock
 	}
 
 	// Pool still exhausted after cleanup - graceful degradation.
-	// Reuse TID 0 to avoid crashing the program.
-	// This may cause TID conflicts in race detection, but better than panic.
-	// In practice, this should never happen if cleanup works correctly.
-	return 0
+	printstring("WARNING: race detector TID pool exhausted, reusing TID 0 (detection may be incomplete)\n")
+	return 0, 1
 }
 
-// freeTID returns a TID to the free pool.
+// freeTID returns a TID to the free pool with clock recording for safe recycling.
 //
-// This makes the TID available for reuse by future goroutines.
+// The currentClock is the maximum clock value this TID reached. When the TID
+// is later recycled, the new goroutine will start its clock above this value,
+// ensuring stale shadow entries are correctly identified as "concurrent".
 //
-// Performance: ~30ns (mutex lock + stack append).
+// Performance: ~35ns (mutex lock + array write + slice append).
 //
 // Thread Safety: Safe for concurrent calls (protected by tidPoolMu).
-//
-// Parameters:
-//   - tid: TID to return to the pool (0-255)
-func freeTID(tid uint16) {
+func freeTID(tid uint16, currentClock uint32) {
 	tidPoolMu.lock()
 	defer tidPoolMu.unlock()
 
-	// Push TID back onto the stack.
+	// Record max clock for safe recycling (clock bumping).
+	if currentClock > maxClockAtFree[tid] {
+		maxClockAtFree[tid] = currentClock
+	}
+
+	// Push TID to FIFO queue for temporal separation.
 	//nolint:makezero // Intentional append to initialized slice (TID pool)
 	freeTIDs = append(freeTIDs, tid)
 }
@@ -1550,8 +1570,14 @@ func cleanupDeadGoroutines() {
 	contextsMap.Range(func(gid int64, ctx *goroutine.RaceContext) bool {
 		// Check if goroutine is still alive.
 		if !liveSet[gid] {
-			// Goroutine is dead - reclaim its TID.
-			freeTID(ctx.TID)
+			// Get current clock before freeing (for TID recycling safety).
+			var currentClock uint32
+			if ctx.C != nil {
+				currentClock = ctx.C.Get(ctx.TID)
+			}
+
+			// Goroutine is dead - reclaim its TID with clock.
+			freeTID(ctx.TID, currentClock)
 
 			// Remove from contexts map.
 			contextsMap.Delete(gid)
@@ -1882,6 +1908,8 @@ func Reset() {
 	spawnContextsSlice = nil
 	spawnContextsMu.unlock()
 	nextSpawnID.Store(0)
+	// Reset maxClockAtFree for clean state.
+	maxClockAtFree = [65536]uint32{}
 	// Reinitialize TID pool for tests.
 	// Tests call Reset() but expect to be able to allocate TIDs afterwards.
 	initTIDPool()
@@ -1960,25 +1988,28 @@ func Init() {
 	// This sets up the free TID stack with all 256 TIDs available.
 	initTIDPool()
 
+	// Reset maxClockAtFree for clean state.
+	maxClockAtFree = [65536]uint32{}
+
 	// Allocate RaceContext for the main goroutine.
 	// CRITICAL: Main goroutine gets TID=1, NOT TID=0.
 	// TID=0 is reserved as sentinel value meaning "no exclusive writer" in SmartTrack.
 	// Using TID=0 for main would cause SmartTrack to incorrectly treat main's writes
 	// as "no writer present", missing races when child goroutines write.
 	gid := getGoroutineID()
-	mainCtx := goroutine.Alloc(1) // TID=1 for main goroutine
+	mainCtx := goroutine.AllocWithStartClock(1, 1) // TID=1, startClock=1
 	contextsMap.Store(gid, mainCtx)
 
 	// Track main goroutine in TID → GID mapping.
 	tidToGIDMap.Store(1, gid)
 
-	// Remove TIDs 0 and 1 from the free pool.
-	// TID 0: Reserved as sentinel (never allocate)
-	// TID 1: Already allocated to main goroutine
+	// Remove TID 1 from the free pool (already allocated to main goroutine).
+	// TID 0: Already excluded by initTIDPool() (reserved as sentinel)
+	// TID 1: Already allocated to main goroutine above
 	tidPoolMu.lock()
-	// Stack is [0, 1, 2, ..., 255]. Remove first two elements.
-	if len(freeTIDs) >= 2 && freeTIDs[0] == 0 && freeTIDs[1] == 1 {
-		freeTIDs = freeTIDs[2:] // Now: [2, 3, 4, ..., 255]
+	// Pool is [1, 2, 3, ..., 65535]. Remove first element (TID 1).
+	if len(freeTIDs) >= 1 && freeTIDs[0] == 1 {
+		freeTIDs = freeTIDs[1:] // Now: [2, 3, 4, ..., 65535]
 	}
 	tidPoolMu.unlock()
 

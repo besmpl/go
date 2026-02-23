@@ -501,23 +501,36 @@ func TestClockOverflow(t *testing.T) {
 	}
 }
 
-// TestTIDWarning tests TID warning threshold (90% of max) (v0.2.0 Task 5).
+// TestTIDWarning verifies that NewEpoch does NOT set tidNearOverflow for high TID values.
+//
+// With FIFO TID recycling, high TID values (e.g., 60000) are NORMAL — TIDs cycle
+// sequentially through all 65535 values before reuse. A TID value above MaxTIDWarning
+// means nothing about pool exhaustion.
+//
+// Pool depletion warning is now handled in allocTID() when len(freeTIDs) < 100.
 func TestTIDWarning(t *testing.T) {
 	// Reset flags before test.
 	ResetOverflowFlags()
 
-	// Trigger warning threshold (90% of MaxTID).
+	// Create epoch with TID above the old 90% threshold.
+	// With FIFO recycling, this is a NORMAL TID value — should NOT set tidNearOverflow.
 	_ = NewEpoch(uint16(MaxTIDWarning+1), 1000)
 
-	// Check warning flag is set.
-	tidOverflow, _, tidWarning, _ := CheckOverflows()
-	if !tidWarning {
-		t.Errorf("TID warning should trigger at 90%% threshold (%d)", MaxTIDWarning)
+	// tidNearOverflow must NOT be set by NewEpoch — that was the false-warning bug.
+	_, _, tidWarning, _ := CheckOverflows()
+	if tidWarning {
+		t.Errorf("NewEpoch must NOT set tidNearOverflow for high TID values (FIFO recycling makes high TIDs normal)")
 	}
 
-	// Should NOT have triggered overflow yet.
-	if tidOverflow {
-		t.Errorf("TID overflow should NOT trigger at warning threshold")
+	// Confirm epoch was created correctly with the high TID value.
+	e := NewEpoch(uint16(MaxTIDWarning+1), 1000)
+	tid, clock := e.Decode()
+	//nolint:gosec // G115: Safe conversion for test comparison.
+	if uint32(tid) != MaxTIDWarning+1 {
+		t.Errorf("Epoch TID = %d, want %d", tid, MaxTIDWarning+1)
+	}
+	if clock != 1000 {
+		t.Errorf("Epoch clock = %d, want 1000", clock)
 	}
 }
 
@@ -543,20 +556,25 @@ func TestClockWarning(t *testing.T) {
 
 // TestResetOverflowFlags tests that overflow flags can be reset (v0.2.0 Task 5).
 func TestResetOverflowFlags(t *testing.T) {
-	// Set all flags by triggering overflows.
-	_ = NewEpoch(1, MaxClock+1)                 // Clock overflow
-	_ = NewEpoch(uint16(MaxTIDWarning+1), 1000) // TID warning
+	// Set flags by triggering clock overflows (clock warning and clock overflow).
+	_ = NewEpoch(1, MaxClock+1)      // Clock overflow
+	_ = NewEpoch(1, MaxClockWarning+1) // Clock warning
 
-	// Verify flags are set.
-	_, clockOverflow, tidWarning, clockWarning := CheckOverflows()
+	// Verify clock flags are set.
+	_, clockOverflow, _, clockWarning := CheckOverflows()
 	if !clockOverflow {
 		t.Errorf("Clock overflow should be set before reset")
 	}
-	if !tidWarning {
-		t.Errorf("TID warning should be set before reset")
-	}
 	if !clockWarning {
 		t.Errorf("Clock warning should be set before reset")
+	}
+
+	// Set tidNearOverflow manually (simulating pool depletion warning from allocTID).
+	tidNearOverflow.Store(1)
+
+	_, _, tidWarning, _ := CheckOverflows()
+	if !tidWarning {
+		t.Errorf("TID warning should be set after manual store")
 	}
 
 	// Reset flags.

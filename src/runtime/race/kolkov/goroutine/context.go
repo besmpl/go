@@ -133,12 +133,39 @@ func (rc *RaceContext) GetEpoch() epoch.Epoch {
 	return rc.Epoch
 }
 
+// AllocWithStartClock creates a RaceContext with a specific start clock.
+//
+// This is used for TID recycling: when a TID is reused, the new goroutine
+// must start its clock ABOVE the previous incarnation's maximum clock.
+// This ensures stale VarState entries are always seen as "concurrent"
+// (conservative), preventing false negatives from TID reuse.
+//
+// Parameters:
+//   - tid: Thread ID for this goroutine
+//   - startClock: Initial clock value (must be > 0; typically 1 for fresh, >1 for recycled)
+func AllocWithStartClock(tid uint16, startClock uint32) *RaceContext {
+	ctx := &RaceContext{
+		TID: tid,
+		C:   vectorclock.NewFromPool(),
+	}
+	if startClock == 0 {
+		startClock = 1
+	}
+	ctx.C.Set(tid, startClock)
+	ctx.Epoch = epoch.NewEpoch(tid, uint64(startClock))
+	return ctx
+}
+
 // AllocWithParentClock creates a RaceContext that inherits parent's clock.
 //
 // This is the key function for happens-before at goroutine creation (fork):
 //  1. child.C := parent.C (Copy parent's clock - inherit HB relations)
-//  2. child.C[child.TID] = 1 (Initialize child's own component)
-//  3. child.Epoch = NewEpoch(tid, 1)
+//  2. child.C[child.TID] = startClock (Initialize child's own component)
+//  3. child.Epoch = NewEpoch(tid, startClock)
+//
+// The startClock parameter supports TID recycling: when a recycled TID is
+// assigned, startClock is set above the previous incarnation's maximum clock
+// to prevent false negatives from stale shadow memory entries.
 //
 // After this, any operation in child "sees" all operations that happened
 // in parent before the fork (go func() statement).
@@ -149,6 +176,7 @@ func (rc *RaceContext) GetEpoch() epoch.Epoch {
 // Parameters:
 //   - tid: Thread ID allocated for this child goroutine
 //   - parentClock: Snapshot of parent's VectorClock at fork time
+//   - startClock: Initial clock value for this TID (1 for fresh, >1 for recycled)
 //
 // Returns:
 //   - *RaceContext: Context ready for race detection with inherited HB
@@ -156,12 +184,12 @@ func (rc *RaceContext) GetEpoch() epoch.Epoch {
 // Example:
 //
 //	Parent at fork: clock={1:5, 3:2}
-//	Child after AllocWithParentClock(2, parentClock):
+//	Child after AllocWithParentClock(2, parentClock, 1):
 //	  clock={1:5, 2:1, 3:2}
-//	        ↑ inherited from parent
-//	             ↑ child's own component initialized to 1
-//	                  ↑ inherited from parent
-func AllocWithParentClock(tid uint16, parentClock *vectorclock.VectorClock) *RaceContext {
+//	        ^ inherited from parent
+//	             ^ child's own component initialized to startClock
+//	                  ^ inherited from parent
+func AllocWithParentClock(tid uint16, parentClock *vectorclock.VectorClock, startClock uint32) *RaceContext {
 	ctx := &RaceContext{
 		TID: tid,
 		C:   vectorclock.NewFromPool(),
@@ -174,12 +202,14 @@ func AllocWithParentClock(tid uint16, parentClock *vectorclock.VectorClock) *Rac
 	}
 
 	// Step 2: Initialize child's own clock component.
-	// CRITICAL: Must start at 1, not 0, to detect unsynchronized races.
-	// Clock 0 means "never happened" in HappensBefore check (0 <= 0 is TRUE).
-	ctx.C.Set(tid, 1)
+	// Use startClock (>= 1) to support TID recycling safety.
+	if startClock == 0 {
+		startClock = 1
+	}
+	ctx.C.Set(tid, startClock)
 
 	// Step 3: Initialize cached epoch.
-	ctx.Epoch = epoch.NewEpoch(tid, 1)
+	ctx.Epoch = epoch.NewEpoch(tid, uint64(startClock))
 
 	return ctx
 }

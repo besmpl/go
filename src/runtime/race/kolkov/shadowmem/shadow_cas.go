@@ -380,6 +380,22 @@ func (s *CASBasedShadow) GetOrCreate(addr uintptr) *VarState {
 	return vs
 }
 
+// Get returns the VarState for the given address, or nil if not found.
+//
+// This is an alias for Load that provides API compatibility with the
+// Shadow interface. It does NOT create new entries.
+//
+// Parameters:
+//   - addr: Memory address to look up
+//
+// Returns:
+//   - *VarState: Pointer to VarState if it exists, nil otherwise
+//
+//go:nosplit
+func (s *CASBasedShadow) Get(addr uintptr) *VarState {
+	return s.Load(addr)
+}
+
 // Reset clears all shadow memory cells.
 //
 // This is used for testing and reinitialization. After Reset(), all
