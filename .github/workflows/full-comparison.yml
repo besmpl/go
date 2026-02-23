@@ -114,10 +114,11 @@ jobs:
           -timeout=30m \
           > ../kolkov_raw.txt 2>&1 || true
 
-        # Clean race detector noise (TID warnings, race reports)
-        grep "^Benchmark\|^goos:\|^goarch:\|^pkg:\|^cpu:\|^ok\|^PASS\|^FAIL" \
+        # Clean race detector noise (TID warnings, race reports, ==================)
+        # Use "ns/op" to match only valid result lines, not WARNING/race prefixed lines
+        grep "ns/op\|^goos:\|^goarch:\|^pkg:\|^cpu:\|^ok \|^PASS\|^FAIL" \
           ../kolkov_raw.txt > ../kolkov.txt || true
-        echo "  $(grep -c '^Benchmark' ../kolkov.txt) results"
+        echo "  $(grep -c 'ns/op' ../kolkov.txt) results"
 
     - name: Run benchstat comparisons
       run: |

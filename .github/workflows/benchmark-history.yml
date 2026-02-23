@@ -43,8 +43,8 @@ jobs:
             -bench=. -benchmem -count=6 -benchtime=1s -timeout=15m \
             > raw_output.txt 2>&1 || true
 
-          # Clean noise from race detector output (TID warnings, race reports)
-          grep "^Benchmark\|^goos:\|^goarch:\|^pkg:\|^cpu:\|^ok\|^PASS" raw_output.txt > output.txt
+          # Clean noise from race detector output (TID warnings, race reports, ==================)
+          grep "ns/op\|^goos:\|^goarch:\|^pkg:\|^cpu:\|^ok \|^PASS" raw_output.txt > output.txt
 
       - name: Store benchmark result
         uses: benchmark-action/github-action-benchmark@v1

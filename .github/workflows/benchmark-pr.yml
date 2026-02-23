@@ -59,9 +59,9 @@ jobs:
         CGO_ENABLED=0 ../bin/go test -race \
           -bench=. -benchmem -count=6 -benchtime=1s -timeout=15m \
           > ../../base_raw.txt 2>&1 || true
-        grep "^Benchmark\|^goos:\|^goarch:\|^pkg:\|^cpu:\|^ok\|^PASS" \
+        grep "ns/op\|^goos:\|^goarch:\|^pkg:\|^cpu:\|^ok \|^PASS" \
           ../../base_raw.txt > ../../base-kolkov.txt || true
-        echo "Base: $(grep -c '^Benchmark' ../../base-kolkov.txt) results"
+        echo "Base: $(grep -c 'ns/op' ../../base-kolkov.txt) results"
 
     - name: Run PR benchmarks (Kolkov only)
       working-directory: pr/benchmarks
@@ -69,9 +69,9 @@ jobs:
         CGO_ENABLED=0 ../bin/go test -race \
           -bench=. -benchmem -count=6 -benchtime=1s -timeout=15m \
           > ../../pr_raw.txt 2>&1 || true
-        grep "^Benchmark\|^goos:\|^goarch:\|^pkg:\|^cpu:\|^ok\|^PASS" \
+        grep "ns/op\|^goos:\|^goarch:\|^pkg:\|^cpu:\|^ok \|^PASS" \
           ../../pr_raw.txt > ../../pr-kolkov.txt || true
-        echo "PR: $(grep -c '^Benchmark' ../../pr-kolkov.txt) results"
+        echo "PR: $(grep -c 'ns/op' ../../pr-kolkov.txt) results"
 
     - name: Compare with benchstat
       id: compare
