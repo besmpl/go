@@ -5,6 +5,7 @@ on:
     branches: [pure-go-race]
     paths:
       - '.github/workflows/full-comparison.yml'
+      - 'benchmarks/scripts/**'
   workflow_dispatch:
     inputs:
       count:
