@@ -20,10 +20,14 @@ func runtimeCallersFramesReport(callers []uintptr) *runtimeFramesReport
 type runtimeFramesReport struct{}
 
 type runtimeFrameReport struct {
-	PC       uintptr
-	Function string
-	File     string
-	Line     int
+	PC        uintptr
+	Func      uintptr // *runtime.Func — opaque, for struct layout alignment
+	Function  string
+	File      string
+	Line      int
+	startLine int
+	Entry     uintptr
+	funcInfo  [2]uintptr // runtime.funcInfo — two pointers (*_func, *moduledata)
 }
 
 //go:linkname runtimeFramesNextReport runtime.framesNext
