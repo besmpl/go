@@ -187,33 +187,27 @@ jobs:
         if [ -f benchmarks/scripts/generate-summary.sh ]; then
           bash benchmarks/scripts/generate-summary.sh \
             baseline.txt tsan.txt kolkov.txt >> $GITHUB_STEP_SUMMARY
+        else
+          # Fallback: raw benchstat + RSS if script not available
+          {
+            echo "### benchstat: TSAN vs Kolkov"
+            echo ""
+            echo '```'
+            grep -v "parsing iteration count" benchstat_tsan_vs_kolkov.txt || cat benchstat_tsan_vs_kolkov.txt
+            echo '```'
+            echo ""
+            echo "### Peak RSS (Memory)"
+            echo ""
+            echo "| Config | Peak RSS |"
+            echo "|--------|----------|"
+            while IFS= read -r line; do
+              config=$(echo "$line" | cut -d: -f1)
+              value=$(echo "$line" | cut -d: -f2 | xargs)
+              echo "| ${config} | ${value} |"
+            done < memory_rss.txt
+            echo ""
+          } >> $GITHUB_STEP_SUMMARY
         fi
-
-        # benchstat section
-        {
-          echo ""
-          echo "### benchstat: TSAN vs Kolkov"
-          echo ""
-          echo '```'
-          # Filter out "parsing iteration count" warnings
-          grep -v "parsing iteration count" benchstat_tsan_vs_kolkov.txt || cat benchstat_tsan_vs_kolkov.txt
-          echo '```'
-          echo ""
-        } >> $GITHUB_STEP_SUMMARY
-
-        # Peak RSS
-        {
-          echo "### Peak RSS (Memory)"
-          echo ""
-          echo "| Config | Peak RSS |"
-          echo "|--------|----------|"
-          while IFS= read -r line; do
-            config=$(echo "$line" | cut -d: -f1)
-            value=$(echo "$line" | cut -d: -f2 | xargs)
-            echo "| ${config} | ${value} |"
-          done < memory_rss.txt
-          echo ""
-        } >> $GITHUB_STEP_SUMMARY
 
         # Raw output in collapsible sections
         {
