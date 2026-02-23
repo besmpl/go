@@ -229,7 +229,9 @@ func racereadpc(addr unsafe.Pointer, callpc, pc uintptr) {
 		return
 	}
 	gp.raceignore++
-	kolkovOnRead(uintptr(addr), pc)
+	systemstack(func() {
+		kolkovOnRead(uintptr(addr), pc)
+	})
 	gp.raceignore--
 }
 
@@ -245,7 +247,9 @@ func racewritepc(addr unsafe.Pointer, callpc, pc uintptr) {
 		return
 	}
 	gp.raceignore++
-	kolkovOnWrite(uintptr(addr), pc)
+	systemstack(func() {
+		kolkovOnWrite(uintptr(addr), pc)
+	})
 	gp.raceignore--
 }
 
@@ -326,7 +330,9 @@ func racemalloc(p unsafe.Pointer, sz uintptr) {
 		return
 	}
 	gp.raceignore++
-	kolkovApiClearShadow(uintptr(p), sz)
+	systemstack(func() {
+		kolkovApiClearShadow(uintptr(p), sz)
+	})
 	gp.raceignore--
 }
 
@@ -344,7 +350,9 @@ func racefree(p unsafe.Pointer, sz uintptr) {
 		return
 	}
 	gp.raceignore++
-	kolkovApiClearShadow(uintptr(p), sz)
+	systemstack(func() {
+		kolkovApiClearShadow(uintptr(p), sz)
+	})
 	gp.raceignore--
 }
 
@@ -375,7 +383,9 @@ func racegostart(pc uintptr) uintptr {
 		return 0
 	}
 	spawng.raceignore++
-	kolkovApiOnGoStart(pc, int64(spawng.goid))
+	systemstack(func() {
+		kolkovApiOnGoStart(pc, int64(spawng.goid))
+	})
 	spawng.raceignore--
 
 	// Return non-zero so proc.go stores it in newg.racectx.
@@ -396,7 +406,9 @@ func racegosetchildid(childGoid uint64) {
 		return
 	}
 	gp.raceignore++
-	kolkovApiGoSetChildID(int64(childGoid))
+	systemstack(func() {
+		kolkovApiGoSetChildID(int64(childGoid))
+	})
 	gp.raceignore--
 }
 
@@ -415,7 +427,9 @@ func racegoend() {
 		return
 	}
 	gp.raceignore++
-	kolkovApiOnGoEnd(int64(gp.goid))
+	systemstack(func() {
+		kolkovApiOnGoEnd(int64(gp.goid))
+	})
 	gp.raceignore--
 }
 
@@ -495,7 +509,9 @@ func raceacquireg(gp *g, addr unsafe.Pointer) {
 		curg = curg.m.curg
 	}
 	curg.raceignore++
-	kolkovApiOnAcquireForGoroutine(uintptr(addr), int64(gp.goid))
+	systemstack(func() {
+		kolkovApiOnAcquireForGoroutine(uintptr(addr), int64(gp.goid))
+	})
 	curg.raceignore--
 }
 
@@ -516,7 +532,9 @@ func raceacquirectx(racectx uintptr, addr unsafe.Pointer) {
 		return
 	}
 	gp.raceignore++
-	kolkovOnAcquire(uintptr(addr))
+	systemstack(func() {
+		kolkovOnAcquire(uintptr(addr))
+	})
 	gp.raceignore--
 }
 
@@ -541,7 +559,9 @@ func racereleaseg(gp *g, addr unsafe.Pointer) {
 		curg = curg.m.curg
 	}
 	curg.raceignore++
-	kolkovApiOnReleaseForGoroutine(uintptr(addr), int64(gp.goid))
+	systemstack(func() {
+		kolkovApiOnReleaseForGoroutine(uintptr(addr), int64(gp.goid))
+	})
 	curg.raceignore--
 }
 
@@ -565,8 +585,10 @@ func racereleaseacquireg(gp *g, addr unsafe.Pointer) {
 		curg = curg.m.curg
 	}
 	curg.raceignore++
-	kolkovApiOnReleaseForGoroutine(uintptr(addr), int64(gp.goid))
-	kolkovApiOnAcquireForGoroutine(uintptr(addr), int64(gp.goid))
+	systemstack(func() {
+		kolkovApiOnReleaseForGoroutine(uintptr(addr), int64(gp.goid))
+		kolkovApiOnAcquireForGoroutine(uintptr(addr), int64(gp.goid))
+	})
 	curg.raceignore--
 }
 
@@ -591,7 +613,9 @@ func racereleasemergeg(gp *g, addr unsafe.Pointer) {
 		curg = curg.m.curg
 	}
 	curg.raceignore++
-	kolkovApiOnReleaseMergeForGoroutine(uintptr(addr), int64(gp.goid))
+	systemstack(func() {
+		kolkovApiOnReleaseMergeForGoroutine(uintptr(addr), int64(gp.goid))
+	})
 	curg.raceignore--
 }
 
@@ -622,7 +646,9 @@ func raceread(addr uintptr) {
 		return
 	}
 	gp.raceignore++
-	kolkovOnRead(addr, pc)
+	systemstack(func() {
+		kolkovOnRead(addr, pc)
+	})
 	gp.raceignore--
 }
 
@@ -640,7 +666,9 @@ func racewrite(addr uintptr) {
 		return
 	}
 	gp.raceignore++
-	kolkovOnWrite(addr, pc)
+	systemstack(func() {
+		kolkovOnWrite(addr, pc)
+	})
 	gp.raceignore--
 }
 
@@ -658,8 +686,10 @@ func racereadrange(addr, size uintptr) {
 		return
 	}
 	gp.raceignore++
-	// Track base address for now. Full range tracking is T11.
-	kolkovOnRead(addr, pc)
+	systemstack(func() {
+		// Track base address for now. Full range tracking is T11.
+		kolkovOnRead(addr, pc)
+	})
 	gp.raceignore--
 }
 
@@ -677,8 +707,10 @@ func racewriterange(addr, size uintptr) {
 		return
 	}
 	gp.raceignore++
-	// Track base address for now. Full range tracking is T11.
-	kolkovOnWrite(addr, pc)
+	systemstack(func() {
+		// Track base address for now. Full range tracking is T11.
+		kolkovOnWrite(addr, pc)
+	})
 	gp.raceignore--
 }
 
@@ -694,7 +726,9 @@ func racereadrangepc1(addr, size, pc uintptr) {
 		return
 	}
 	gp.raceignore++
-	kolkovOnRead(addr, pc)
+	systemstack(func() {
+		kolkovOnRead(addr, pc)
+	})
 	gp.raceignore--
 }
 
@@ -710,7 +744,9 @@ func racewriterangepc1(addr, size, pc uintptr) {
 		return
 	}
 	gp.raceignore++
-	kolkovOnWrite(addr, pc)
+	systemstack(func() {
+		kolkovOnWrite(addr, pc)
+	})
 	gp.raceignore--
 }
 
