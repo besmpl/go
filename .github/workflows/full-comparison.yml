@@ -4,8 +4,10 @@ on:
   push:
     branches: [pure-go-race]
     paths:
+      - 'src/runtime/race/**'
+      - 'src/runtime/race_kolkov*.go'
+      - 'benchmarks/**'
       - '.github/workflows/full-comparison.yml'
-      - 'benchmarks/scripts/**'
   workflow_dispatch:
     inputs:
       count:
