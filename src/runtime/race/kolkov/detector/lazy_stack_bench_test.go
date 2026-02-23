@@ -91,7 +91,7 @@ func BenchmarkOnWrite_WithLazyStackCapture(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		d.OnWrite(addr, ctx)
+		d.OnWrite(addr, ctx, 0)
 		addr += 8 // Different address each time to avoid same-epoch fast path
 	}
 }
@@ -103,13 +103,13 @@ func BenchmarkOnRead_WithLazyStackCapture(b *testing.B) {
 	addr := uintptr(0x1000)
 
 	// Do one write first
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		d.OnRead(addr, ctx)
+		d.OnRead(addr, ctx, 0)
 		addr += 8 // Different address
 	}
 }
@@ -133,6 +133,6 @@ func BenchmarkHotPath_WriteSequence(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		addr := addrs[i%len(addrs)]
-		d.OnWrite(addr, ctx)
+		d.OnWrite(addr, ctx, 0)
 	}
 }

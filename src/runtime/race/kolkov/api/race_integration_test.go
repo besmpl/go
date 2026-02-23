@@ -73,7 +73,7 @@ func TestIntegration_SimpleRace(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 5; i++ {
-			racewrite(uintptr(unsafe.Pointer(&shared)))
+			racewrite(uintptr(unsafe.Pointer(&shared)), 0)
 			shared = 1
 			time.Sleep(100 * time.Microsecond)
 		}
@@ -84,7 +84,7 @@ func TestIntegration_SimpleRace(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 5; i++ {
-			racewrite(uintptr(unsafe.Pointer(&shared)))
+			racewrite(uintptr(unsafe.Pointer(&shared)), 0)
 			shared = 2
 			time.Sleep(100 * time.Microsecond)
 		}
@@ -125,10 +125,10 @@ func TestIntegration_NoRace_Sequential(t *testing.T) {
 
 	// Sequential access - no concurrency, no races
 	for i := 0; i < 10; i++ {
-		racewrite(uintptr(unsafe.Pointer(&data)))
+		racewrite(uintptr(unsafe.Pointer(&data)), 0)
 		data = i
 
-		raceread(uintptr(unsafe.Pointer(&data)))
+		raceread(uintptr(unsafe.Pointer(&data)), 0)
 		_ = data
 	}
 
@@ -172,11 +172,11 @@ func TestIntegration_MultipleGoroutines(t *testing.T) {
 			defer wg.Done()
 
 			// Write to shared variable
-			racewrite(uintptr(unsafe.Pointer(&shared)))
+			racewrite(uintptr(unsafe.Pointer(&shared)), 0)
 			shared = id
 
 			// Read from shared variable
-			raceread(uintptr(unsafe.Pointer(&shared)))
+			raceread(uintptr(unsafe.Pointer(&shared)), 0)
 			_ = shared
 
 			time.Sleep(1 * time.Millisecond)
@@ -221,7 +221,7 @@ func TestIntegration_RaceAndNoRace_Mixed(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 3; i++ {
-			racewrite(uintptr(unsafe.Pointer(&racyVar)))
+			racewrite(uintptr(unsafe.Pointer(&racyVar)), 0)
 			racyVar = 1
 			time.Sleep(100 * time.Microsecond)
 		}
@@ -229,7 +229,7 @@ func TestIntegration_RaceAndNoRace_Mixed(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 3; i++ {
-			racewrite(uintptr(unsafe.Pointer(&racyVar)))
+			racewrite(uintptr(unsafe.Pointer(&racyVar)), 0)
 			racyVar = 2
 			time.Sleep(100 * time.Microsecond)
 		}
@@ -239,7 +239,7 @@ func TestIntegration_RaceAndNoRace_Mixed(t *testing.T) {
 
 	// Sequential writes to safeVar (no race)
 	for i := 0; i < 5; i++ {
-		racewrite(uintptr(unsafe.Pointer(&safeVar)))
+		racewrite(uintptr(unsafe.Pointer(&safeVar)), 0)
 		safeVar = i
 	}
 
@@ -288,7 +288,7 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 10; i++ {
-			racewrite(uintptr(unsafe.Pointer(&counter)))
+			racewrite(uintptr(unsafe.Pointer(&counter)), 0)
 			counter++
 			time.Sleep(100 * time.Microsecond)
 		}
@@ -297,7 +297,7 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 10; i++ {
-			racewrite(uintptr(unsafe.Pointer(&counter)))
+			racewrite(uintptr(unsafe.Pointer(&counter)), 0)
 			counter++
 			time.Sleep(100 * time.Microsecond)
 		}
@@ -355,7 +355,7 @@ func TestIntegration_ConcurrentReads(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 5; i++ {
-			racewrite(uintptr(unsafe.Pointer(&data)))
+			racewrite(uintptr(unsafe.Pointer(&data)), 0)
 			data = i
 			time.Sleep(1 * time.Millisecond)
 		}
@@ -367,7 +367,7 @@ func TestIntegration_ConcurrentReads(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 5; j++ {
-				raceread(uintptr(unsafe.Pointer(&data)))
+				raceread(uintptr(unsafe.Pointer(&data)), 0)
 				_ = data
 				time.Sleep(1 * time.Millisecond)
 			}
@@ -415,11 +415,11 @@ func TestIntegration_ManyAddresses(t *testing.T) {
 			addr := uintptr(unsafe.Pointer(&vars[idx]))
 
 			// Write
-			racewrite(addr)
+			racewrite(addr, 0)
 			vars[idx] = idx
 
 			// Read
-			raceread(addr)
+			raceread(addr, 0)
 			_ = vars[idx]
 		}(i)
 	}
@@ -466,10 +466,10 @@ func TestIntegration_RepeatedInitFini(t *testing.T) {
 
 		// Do some operations
 		var data int
-		racewrite(uintptr(unsafe.Pointer(&data)))
+		racewrite(uintptr(unsafe.Pointer(&data)), 0)
 		data = cycle
 
-		raceread(uintptr(unsafe.Pointer(&data)))
+		raceread(uintptr(unsafe.Pointer(&data)), 0)
 		_ = data
 
 		Fini()
@@ -510,7 +510,7 @@ func TestIntegration_DisableDuringExecution(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 3; i++ {
-			racewrite(uintptr(unsafe.Pointer(&shared)))
+			racewrite(uintptr(unsafe.Pointer(&shared)), 0)
 			shared = 1
 			time.Sleep(100 * time.Microsecond)
 		}
@@ -518,7 +518,7 @@ func TestIntegration_DisableDuringExecution(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 3; i++ {
-			racewrite(uintptr(unsafe.Pointer(&shared)))
+			racewrite(uintptr(unsafe.Pointer(&shared)), 0)
 			shared = 2
 			time.Sleep(100 * time.Microsecond)
 		}
@@ -537,7 +537,7 @@ func TestIntegration_DisableDuringExecution(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 3; i++ {
-			racewrite(uintptr(unsafe.Pointer(&shared)))
+			racewrite(uintptr(unsafe.Pointer(&shared)), 0)
 			shared = 3
 			time.Sleep(100 * time.Microsecond)
 		}
@@ -545,7 +545,7 @@ func TestIntegration_DisableDuringExecution(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 3; i++ {
-			racewrite(uintptr(unsafe.Pointer(&shared)))
+			racewrite(uintptr(unsafe.Pointer(&shared)), 0)
 			shared = 4
 			time.Sleep(100 * time.Microsecond)
 		}
@@ -594,7 +594,7 @@ func TestIntegration_LargeDataStructure(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 3; i++ {
-			racewrite(uintptr(unsafe.Pointer(&data.Field1)))
+			racewrite(uintptr(unsafe.Pointer(&data.Field1)), 0)
 			data.Field1 = 1
 			time.Sleep(100 * time.Microsecond)
 		}
@@ -605,7 +605,7 @@ func TestIntegration_LargeDataStructure(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 3; i++ {
-			racewrite(uintptr(unsafe.Pointer(&data.Field1)))
+			racewrite(uintptr(unsafe.Pointer(&data.Field1)), 0)
 			data.Field1 = 2
 			time.Sleep(100 * time.Microsecond)
 		}
@@ -614,7 +614,7 @@ func TestIntegration_LargeDataStructure(t *testing.T) {
 	wg.Wait()
 
 	// Goroutine 3: Write to Field2 (no race - different field, sequential)
-	racewrite(uintptr(unsafe.Pointer(&data.Field2)))
+	racewrite(uintptr(unsafe.Pointer(&data.Field2)), 0)
 	data.Field2 = 3
 
 	Fini()
@@ -652,7 +652,7 @@ func TestIntegration_HighContentionVariable(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < 3; j++ {
-				racewrite(uintptr(unsafe.Pointer(&hotspot)))
+				racewrite(uintptr(unsafe.Pointer(&hotspot)), 0)
 				hotspot = id
 				time.Sleep(100 * time.Microsecond)
 			}
@@ -698,7 +698,7 @@ func TestIntegration_SafeSynchronization(t *testing.T) {
 			defer wg.Done()
 
 			mu.Lock()
-			racewrite(uintptr(unsafe.Pointer(&data)))
+			racewrite(uintptr(unsafe.Pointer(&data)), 0)
 			data = id
 			mu.Unlock()
 

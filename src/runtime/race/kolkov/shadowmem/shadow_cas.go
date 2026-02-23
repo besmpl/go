@@ -403,6 +403,57 @@ func (s *CASBasedShadow) Reset() {
 	}
 }
 
+// ClearRange clears all shadow cells in [addr, addr+size).
+// This is called on memory allocation/free to prevent stale shadow state
+// from causing false positives when addresses are reused.
+//
+// Algorithm:
+//   - Iterate through the range with 8-byte steps (matching address compression)
+//   - For each address, find and clear the corresponding hash entry
+//   - Uses the same linear probing as Load()
+//
+// Performance: O(size/8) hash lookups, each with up to 8 probes.
+// For typical Go allocations (< 32KB): < 50us.
+func (s *CASBasedShadow) ClearRange(addr, size uintptr) {
+	if size == 0 {
+		return
+	}
+
+	// Apply address compression (same as Load/Store).
+	step := uintptr(1)
+	start := addr
+	end := addr + size
+	if s.compressAddresses {
+		start = alignAddr(start)
+		// Round up end to next 8-byte boundary.
+		end = alignAddr(end + 7)
+		step = 8
+	}
+
+	// Clear each address in the range.
+	for a := start; a < end; a += step {
+		s.clearAddr(a)
+	}
+}
+
+// clearAddr removes the shadow cell for a single (already-aligned) address.
+//
+//go:nosplit
+func (s *CASBasedShadow) clearAddr(addr uintptr) {
+	hash := fastHash(addr)
+	for i := uint64(0); i < 8; i++ {
+		idx := (hash + i) & 0xFFFF
+		cell := s.cells[idx].Load()
+		if cell == nil {
+			return // Empty slot - address not tracked.
+		}
+		if cell.addr == addr {
+			s.cells[idx].Store(nil)
+			return
+		}
+	}
+}
+
 // GetCollisionStats returns statistics about hash collision rate.
 //
 // This is used for monitoring and debugging to ensure the hash function

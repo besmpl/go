@@ -36,7 +36,7 @@ func TestOnWrite_FirstAccess(t *testing.T) {
 	addr := uintptr(0x1000)
 
 	// First write should not report a race.
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 
 	if d.RacesDetected() != 0 {
 		t.Errorf("First write reported race, want 0 races")
@@ -62,7 +62,7 @@ func TestOnWrite_SameEpochFastPath(t *testing.T) {
 	addr := uintptr(0x2000)
 
 	// First write.
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 	initialEpoch := ctx.GetEpoch()
 
 	// Get initial write epoch from shadow memory.
@@ -77,7 +77,7 @@ func TestOnWrite_SameEpochFastPath(t *testing.T) {
 	vs.SetW(initialEpoch)
 
 	// Second write should hit fast path (same epoch).
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 
 	// No race should be reported.
 	if d.RacesDetected() != 0 {
@@ -102,7 +102,7 @@ func TestOnWrite_WriteWriteRace(t *testing.T) {
 	// First write at epoch (1, 10).
 	ctx.C.Set(1, 10)
 	ctx.Epoch = epoch.NewEpoch(1, 10)
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 
 	// Simulate a happens-before violation by setting a conflicting epoch.
 	// We'll manually set vs.W to a future epoch that doesn't happen-before current.
@@ -124,7 +124,7 @@ func TestOnWrite_WriteWriteRace(t *testing.T) {
 	os.Stderr = w
 
 	// Second write should detect write-write race.
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 
 	// Restore stderr.
 	w.Close()
@@ -183,7 +183,7 @@ func TestOnWrite_ReadWriteRace(t *testing.T) {
 	os.Stderr = w
 
 	// Write should detect read-write race.
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 
 	// Restore stderr.
 	w.Close()
@@ -218,14 +218,14 @@ func TestOnWrite_NoRaceWithHappensBefore(t *testing.T) {
 	// First write at epoch (1, 10).
 	ctx.C.Set(1, 10)
 	ctx.Epoch = epoch.NewEpoch(1, 10)
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 
 	// Advance clock to establish happens-before.
 	ctx.C.Set(1, 20)
 	ctx.Epoch = epoch.NewEpoch(1, 20)
 
 	// Second write at epoch (1, 20) happens-after first write.
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 
 	// No race should be detected (proper ordering).
 	if d.RacesDetected() != 0 {
@@ -243,9 +243,9 @@ func TestOnWrite_MultipleAddresses(t *testing.T) {
 	addr3 := uintptr(0x8000)
 
 	// Write to three different addresses.
-	d.OnWrite(addr1, ctx)
-	d.OnWrite(addr2, ctx)
-	d.OnWrite(addr3, ctx)
+	d.OnWrite(addr1, ctx, 0)
+	d.OnWrite(addr2, ctx, 0)
+	d.OnWrite(addr3, ctx, 0)
 
 	// No races should be detected.
 	if d.RacesDetected() != 0 {
@@ -278,7 +278,7 @@ func TestOnWrite_UpdatesShadowMemory(t *testing.T) {
 	initialEpoch := ctx.GetEpoch()
 
 	// Write to address.
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 
 	// Get shadow cell.
 	vs := d.shadowMemory.Get(addr)
@@ -312,7 +312,7 @@ func TestOnWrite_IncrementsLogicalClock(t *testing.T) {
 	initialClock := ctx.C.Get(1)
 
 	// Perform write.
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 
 	// Get new clock value.
 	newClock := ctx.C.Get(1)
@@ -344,7 +344,7 @@ func TestRacesDetected(t *testing.T) {
 	oldStderr := os.Stderr
 	os.Stderr, _ = os.Open(os.DevNull)
 
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 
 	os.Stderr = oldStderr
 
@@ -361,7 +361,7 @@ func TestReset(t *testing.T) {
 	addr := uintptr(0xC000)
 
 	// Perform some operations.
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 
 	// Trigger a race to increment counter.
 	vs := d.shadowMemory.GetOrCreate(addr)
@@ -372,7 +372,7 @@ func TestReset(t *testing.T) {
 
 	oldStderr := os.Stderr
 	os.Stderr, _ = os.Open(os.DevNull)
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 	os.Stderr = oldStderr
 
 	// Verify state before reset.
@@ -549,7 +549,7 @@ func TestConcurrentWrites(_ *testing.T) {
 			baseAddr := uintptr(0x10000 + id*0x1000)
 			for j := 0; j < writesPerGoroutine; j++ {
 				addr := baseAddr + uintptr(j)
-				d.OnWrite(addr, ctx)
+				d.OnWrite(addr, ctx, 0)
 			}
 			done <- true
 		}(i)
@@ -572,7 +572,7 @@ func TestOnRead_FirstAccess(t *testing.T) {
 	addr := uintptr(0x1000)
 
 	// First read should not report a race.
-	d.OnRead(addr, ctx)
+	d.OnRead(addr, ctx, 0)
 
 	if d.RacesDetected() != 0 {
 		t.Errorf("First read reported race, want 0 races")
@@ -598,7 +598,7 @@ func TestOnRead_SameEpochFastPath(t *testing.T) {
 	addr := uintptr(0x2000)
 
 	// First read.
-	d.OnRead(addr, ctx)
+	d.OnRead(addr, ctx, 0)
 	initialEpoch := ctx.GetEpoch()
 
 	// Get initial read epoch from shadow memory.
@@ -611,7 +611,7 @@ func TestOnRead_SameEpochFastPath(t *testing.T) {
 	vs.SetReadEpoch(initialEpoch)
 
 	// Second read should hit fast path (same epoch).
-	d.OnRead(addr, ctx)
+	d.OnRead(addr, ctx, 0)
 
 	// No race should be reported.
 	if d.RacesDetected() != 0 {
@@ -643,7 +643,7 @@ func TestOnRead_WriteReadRace(t *testing.T) {
 	os.Stderr = w
 
 	// Read should detect write-read race.
-	d.OnRead(addr, ctx)
+	d.OnRead(addr, ctx, 0)
 
 	// Restore stderr.
 	w.Close()
@@ -684,7 +684,7 @@ func TestOnRead_NoRaceWithHappensBefore(t *testing.T) {
 	ctx.Epoch = epoch.NewEpoch(1, 20)
 
 	// Read should NOT detect a race (proper ordering).
-	d.OnRead(addr, ctx)
+	d.OnRead(addr, ctx, 0)
 
 	// No race should be detected.
 	if d.RacesDetected() != 0 {
@@ -699,7 +699,7 @@ func TestOnRead_NoWriteBefore(t *testing.T) {
 	addr := uintptr(0x5000)
 
 	// Read from address that has never been written to.
-	d.OnRead(addr, ctx)
+	d.OnRead(addr, ctx, 0)
 
 	// No race should be reported (no previous write).
 	if d.RacesDetected() != 0 {
@@ -730,7 +730,7 @@ func TestOnRead_MultipleReads(t *testing.T) {
 	addr := uintptr(0x6000)
 
 	// First read.
-	d.OnRead(addr, ctx)
+	d.OnRead(addr, ctx, 0)
 	vs := d.shadowMemory.Get(addr)
 	if vs == nil {
 		t.Fatal("Shadow cell not created")
@@ -742,7 +742,7 @@ func TestOnRead_MultipleReads(t *testing.T) {
 	ctx.Epoch = ctx.GetEpoch()
 
 	// Second read.
-	d.OnRead(addr, ctx)
+	d.OnRead(addr, ctx, 0)
 
 	// Read epoch should have been updated.
 	secondReadEpoch := vs.GetReadEpoch()
@@ -766,9 +766,9 @@ func TestOnRead_MultipleAddresses(t *testing.T) {
 	addr3 := uintptr(0x9000)
 
 	// Read from three different addresses.
-	d.OnRead(addr1, ctx)
-	d.OnRead(addr2, ctx)
-	d.OnRead(addr3, ctx)
+	d.OnRead(addr1, ctx, 0)
+	d.OnRead(addr2, ctx, 0)
+	d.OnRead(addr3, ctx, 0)
 
 	// No races should be detected.
 	if d.RacesDetected() != 0 {
@@ -803,7 +803,7 @@ func TestOnRead_UpdatesShadowMemory(t *testing.T) {
 	addr := uintptr(0xA000)
 
 	// Read from address.
-	d.OnRead(addr, ctx)
+	d.OnRead(addr, ctx, 0)
 
 	// Get shadow cell.
 	vs := d.shadowMemory.Get(addr)
@@ -834,7 +834,7 @@ func TestOnRead_IncrementsLogicalClock(t *testing.T) {
 	initialClock := ctx.C.Get(1)
 
 	// Perform read.
-	d.OnRead(addr, ctx)
+	d.OnRead(addr, ctx, 0)
 
 	// Get new clock value.
 	newClock := ctx.C.Get(1)
@@ -869,11 +869,11 @@ func TestOnRead_Integration_WithWrite(t *testing.T) {
 				return ctx
 			},
 			operation: func(ctx *goroutine.RaceContext) {
-				d.OnWrite(addr, ctx)
+				d.OnWrite(addr, ctx, 0)
 				// Advance time to establish happens-before.
 				ctx.C.Set(1, 20)
 				ctx.Epoch = epoch.NewEpoch(1, 20)
-				d.OnRead(addr, ctx)
+				d.OnRead(addr, ctx, 0)
 			},
 			wantRaces:   0,
 			description: "Read after write with proper ordering should not race",
@@ -888,11 +888,11 @@ func TestOnRead_Integration_WithWrite(t *testing.T) {
 				return ctx
 			},
 			operation: func(ctx *goroutine.RaceContext) {
-				d.OnRead(addr, ctx)
+				d.OnRead(addr, ctx, 0)
 				// Advance time.
 				ctx.C.Set(1, 20)
 				ctx.Epoch = epoch.NewEpoch(1, 20)
-				d.OnWrite(addr, ctx)
+				d.OnWrite(addr, ctx, 0)
 			},
 			wantRaces:   0,
 			description: "Write after read with proper ordering should not race",
@@ -907,13 +907,13 @@ func TestOnRead_Integration_WithWrite(t *testing.T) {
 				return ctx
 			},
 			operation: func(ctx *goroutine.RaceContext) {
-				d.OnRead(addr, ctx)
+				d.OnRead(addr, ctx, 0)
 				ctx.IncrementClock()
 				ctx.Epoch = ctx.GetEpoch()
-				d.OnRead(addr, ctx)
+				d.OnRead(addr, ctx, 0)
 				ctx.IncrementClock()
 				ctx.Epoch = ctx.GetEpoch()
-				d.OnRead(addr, ctx)
+				d.OnRead(addr, ctx, 0)
 			},
 			wantRaces:   0,
 			description: "Multiple reads should not race with each other",
@@ -957,7 +957,7 @@ func TestConcurrentReads(_ *testing.T) {
 			baseAddr := uintptr(0x20000 + id*0x1000)
 			for j := 0; j < readsPerGoroutine; j++ {
 				addr := baseAddr + uintptr(j)
-				d.OnRead(addr, ctx)
+				d.OnRead(addr, ctx, 0)
 			}
 			done <- true
 		}(i)
@@ -988,7 +988,7 @@ func TestConcurrentReadsAndWrites(_ *testing.T) {
 			baseAddr := uintptr(0x30000 + id*0x1000)
 			for j := 0; j < opsPerGoroutine; j++ {
 				addr := baseAddr + uintptr(j)
-				d.OnRead(addr, ctx)
+				d.OnRead(addr, ctx, 0)
 			}
 			done <- true
 		}(i)
@@ -1002,7 +1002,7 @@ func TestConcurrentReadsAndWrites(_ *testing.T) {
 			baseAddr := uintptr(0x40000 + id*0x1000)
 			for j := 0; j < opsPerGoroutine; j++ {
 				addr := baseAddr + uintptr(j)
-				d.OnWrite(addr, ctx)
+				d.OnWrite(addr, ctx, 0)
 			}
 			done <- true
 		}(i)

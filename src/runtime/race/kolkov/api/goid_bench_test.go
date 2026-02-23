@@ -133,7 +133,7 @@ func BenchmarkRaceRead_WithFastGID(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		raceread(addr)
+		raceread(addr, 0)
 	}
 }
 
@@ -150,7 +150,7 @@ func BenchmarkRaceWrite_WithFastGID(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		racewrite(addr)
+		racewrite(addr, 0)
 	}
 }
 

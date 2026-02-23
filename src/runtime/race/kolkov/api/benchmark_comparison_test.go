@@ -113,7 +113,7 @@ func BenchmarkComparison_EndToEnd(b *testing.B) {
 			_ = getGoroutineIDSlow()
 
 			// Then do race read (same as Phase 2)
-			raceread(addr)
+			raceread(addr, 0)
 		}
 	})
 
@@ -133,7 +133,7 @@ func BenchmarkComparison_EndToEnd(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			// Phase 2: fast GID is integrated into getCurrentContext()
-			raceread(addr)
+			raceread(addr, 0)
 		}
 	})
 }
@@ -198,7 +198,7 @@ func BenchmarkComparison_RaceRead(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			// Simulate Phase 1: slow GID on each access
 			_ = getGoroutineIDSlow()
-			raceread(addr)
+			raceread(addr, 0)
 		}
 	})
 
@@ -215,7 +215,7 @@ func BenchmarkComparison_RaceRead(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			// Phase 2: fast GID (integrated)
-			raceread(addr)
+			raceread(addr, 0)
 		}
 	})
 }
@@ -235,7 +235,7 @@ func BenchmarkComparison_RaceWrite(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			_ = getGoroutineIDSlow()
-			racewrite(addr)
+			racewrite(addr, 0)
 		}
 	})
 
@@ -251,7 +251,7 @@ func BenchmarkComparison_RaceWrite(b *testing.B) {
 		b.ReportAllocs()
 
 		for i := 0; i < b.N; i++ {
-			racewrite(addr)
+			racewrite(addr, 0)
 		}
 	})
 }
@@ -298,8 +298,8 @@ func benchmarkScalability(b *testing.B, numGoroutines int, _ bool) {
 				case <-done:
 					return
 				default:
-					raceread(addr)
-					racewrite(uintptr(0x8000 + id*8))
+					raceread(addr, 0)
+					racewrite(uintptr(0x8000+id*8), 0)
 				}
 			}
 		}(g)
@@ -307,7 +307,7 @@ func benchmarkScalability(b *testing.B, numGoroutines int, _ bool) {
 
 	// Let them run for benchmark duration
 	for i := 0; i < b.N; i++ {
-		raceread(addr)
+		raceread(addr, 0)
 	}
 
 	close(done)
@@ -449,7 +449,7 @@ func BenchmarkComparison_ParallelWorkload(b *testing.B) {
 			for pb.Next() {
 				// Simulate Phase 1
 				_ = getGoroutineIDSlow()
-				raceread(addr)
+				raceread(addr, 0)
 			}
 		})
 	})
@@ -465,7 +465,7 @@ func BenchmarkComparison_ParallelWorkload(b *testing.B) {
 		b.RunParallel(func(pb *testing.PB) {
 			for pb.Next() {
 				// Phase 2: integrated fast GID
-				raceread(addr)
+				raceread(addr, 0)
 			}
 		})
 	})
@@ -496,9 +496,9 @@ func BenchmarkComparison_Summary(b *testing.B) {
 			_ = getGoroutineIDSlow()
 
 			if i%2 == 0 {
-				raceread(addr)
+				raceread(addr, 0)
 			} else {
-				racewrite(addr)
+				racewrite(addr, 0)
 			}
 		}
 	})
@@ -521,9 +521,9 @@ func BenchmarkComparison_Summary(b *testing.B) {
 			addr := addrs[i%len(addrs)]
 
 			if i%2 == 0 {
-				raceread(addr)
+				raceread(addr, 0)
 			} else {
-				racewrite(addr)
+				racewrite(addr, 0)
 			}
 		}
 	})

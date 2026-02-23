@@ -16,11 +16,9 @@ import (
 // is in runtime/race/kolkov/api/ and connected via linkname.
 
 var (
-	kolkovEnabled    atomic.Uint32
-	kolkovInited     atomic.Uint32
-	kolkovErrors     atomic.Uint64
-	kolkovReadCount  atomic.Uint64 // Debug counter
-	kolkovWriteCount atomic.Uint64 // Debug counter
+	kolkovEnabled atomic.Uint32
+	kolkovInited  atomic.Uint32
+	kolkovErrors  atomic.Uint64
 )
 
 // kolkovDetectorInit initializes the Kolkov race detector.
@@ -36,8 +34,6 @@ func kolkovDetectorInit() {
 // kolkovDetectorFini finalizes the Kolkov race detector.
 func kolkovDetectorFini() {
 	kolkovEnabled.Store(0)
-	// Debug: Print counters
-	print("[Kolkov] Reads: ", kolkovReadCount.Load(), " Writes: ", kolkovWriteCount.Load(), "\n")
 	// Call API Fini to print full report
 	kolkovApiFini()
 }
@@ -51,29 +47,28 @@ func kolkovRaceErrors() int {
 
 // kolkovIncrementErrors is called by Kolkov API when a race is detected.
 //
+//go:linkname kolkovIncrementErrors
 //go:nosplit
 func kolkovIncrementErrors() {
 	kolkovErrors.Add(1)
 }
 
 // kolkovOnRead handles a memory read access.
-// Delegates to the Kolkov API implementation.
+// Delegates to the Kolkov API implementation, passing through the PC
+// captured by sys.GetCallerPC() at the runtime entry point.
 //
 //go:nosplit
 func kolkovOnRead(addr, pc uintptr) {
-	kolkovReadCount.Add(1)
-	// Debug: Check if linkname works by printing before call
-	// print("[DEBUG] kolkovOnRead calling API\n")  // Uncomment for verbose debug
-	kolkovApiOnRead(addr)
+	kolkovApiOnRead(addr, pc)
 }
 
 // kolkovOnWrite handles a memory write access.
-// Delegates to the Kolkov API implementation.
+// Delegates to the Kolkov API implementation, passing through the PC
+// captured by sys.GetCallerPC() at the runtime entry point.
 //
 //go:nosplit
 func kolkovOnWrite(addr, pc uintptr) {
-	kolkovWriteCount.Add(1)
-	kolkovApiOnWrite(addr)
+	kolkovApiOnWrite(addr, pc)
 }
 
 // kolkovOnAcquire handles a synchronization acquire operation.
@@ -120,10 +115,10 @@ func kolkovGetGoid() int64 {
 // These functions are implemented in the Kolkov API and exported to runtime.
 
 //go:linkname kolkovApiOnRead runtime/race/kolkov/api.raceread
-func kolkovApiOnRead(addr uintptr)
+func kolkovApiOnRead(addr, pc uintptr)
 
 //go:linkname kolkovApiOnWrite runtime/race/kolkov/api.racewrite
-func kolkovApiOnWrite(addr uintptr)
+func kolkovApiOnWrite(addr, pc uintptr)
 
 //go:linkname kolkovApiOnAcquire runtime/race/kolkov/api.raceacquire
 func kolkovApiOnAcquire(addr uintptr)
@@ -140,8 +135,14 @@ func kolkovApiOnAcquireForGoroutine(addr uintptr, goid int64)
 //go:linkname kolkovApiOnReleaseForGoroutine runtime/race/kolkov/api.raceReleaseForGoroutine
 func kolkovApiOnReleaseForGoroutine(addr uintptr, goid int64)
 
+//go:linkname kolkovApiOnReleaseMergeForGoroutine runtime/race/kolkov/api.raceReleaseMergeForGoroutine
+func kolkovApiOnReleaseMergeForGoroutine(addr uintptr, goid int64)
+
 //go:linkname kolkovApiGoSetChildID runtime/race/kolkov/api.raceGoSetChildID
 func kolkovApiGoSetChildID(childGoid int64)
+
+//go:linkname kolkovApiClearShadow runtime/race/kolkov/api.raceClearShadow
+func kolkovApiClearShadow(addr, size uintptr)
 
 //go:linkname kolkovApiFini runtime/race/kolkov/api.Fini
 func kolkovApiFini()

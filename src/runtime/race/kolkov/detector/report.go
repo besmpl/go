@@ -29,6 +29,12 @@ type runtimeFrameReport struct {
 //go:linkname runtimeFramesNextReport runtime.framesNext
 func runtimeFramesNextReport(f *runtimeFramesReport) (frame runtimeFrameReport, more bool)
 
+// kolkovIncrementErrors increments the runtime's race error counter.
+// The runtime uses this counter in RaceErrors() to determine exit code 66.
+//
+//go:linkname kolkovIncrementErrors runtime.kolkovIncrementErrors
+func kolkovIncrementErrors()
+
 // Note: printstring and printuint are declared in detector.go via linkname.
 
 // Simple string utilities (avoiding strings package).
@@ -804,6 +810,10 @@ func (d *Detector) reportRaceV2(raceType string, addr uintptr, vs interface{}, p
 	// Increment race counter for statistics.
 	// Only count unique races (deduplication is applied).
 	d.racesDetected++
+
+	// Notify the runtime so RaceErrors() returns the correct count.
+	// The runtime uses this to set exit code 66 when races are found.
+	kolkovIncrementErrors()
 
 	// Print to stderr using runtime print functions.
 	report.Print()

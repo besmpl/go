@@ -21,7 +21,7 @@ func BenchmarkRaceRead(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		raceread(addr)
+		raceread(addr, 0)
 	}
 }
 
@@ -41,7 +41,7 @@ func BenchmarkRaceWrite(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		racewrite(addr)
+		racewrite(addr, 0)
 	}
 }
 
@@ -59,9 +59,9 @@ func BenchmarkRaceReadWrite_Interleaved(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		if i%2 == 0 {
-			racewrite(addr)
+			racewrite(addr, 0)
 		} else {
-			raceread(addr)
+			raceread(addr, 0)
 		}
 	}
 }
@@ -168,7 +168,7 @@ func BenchmarkRaceRead_Disabled(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		raceread(addr)
+		raceread(addr, 0)
 	}
 }
 
@@ -183,7 +183,7 @@ func BenchmarkRaceWrite_Disabled(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		racewrite(addr)
+		racewrite(addr, 0)
 	}
 }
 
@@ -206,7 +206,7 @@ func BenchmarkRaceRead_MultipleAddresses(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		addr := addresses[i%numAddresses]
-		raceread(addr)
+		raceread(addr, 0)
 	}
 }
 
@@ -228,7 +228,7 @@ func BenchmarkRaceWrite_MultipleAddresses(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		addr := addresses[i%numAddresses]
-		racewrite(addr)
+		racewrite(addr, 0)
 	}
 }
 
@@ -244,7 +244,7 @@ func BenchmarkConcurrentRaceRead(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			raceread(addr)
+			raceread(addr, 0)
 		}
 	})
 }
@@ -261,7 +261,7 @@ func BenchmarkConcurrentRaceWrite(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			racewrite(addr)
+			racewrite(addr, 0)
 		}
 	})
 }
@@ -296,14 +296,14 @@ func BenchmarkRaceRead_SameEpoch(b *testing.B) {
 	addr := uintptr(0x8000)
 
 	// Do first read to establish epoch in shadow memory.
-	raceread(addr)
+	raceread(addr, 0)
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	// All subsequent reads should hit same-epoch fast path.
 	for i := 0; i < b.N; i++ {
-		raceread(addr)
+		raceread(addr, 0)
 	}
 }
 
@@ -317,14 +317,14 @@ func BenchmarkRaceWrite_SameEpoch(b *testing.B) {
 	addr := uintptr(0x9000)
 
 	// Do first write to establish epoch.
-	racewrite(addr)
+	racewrite(addr, 0)
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	// All subsequent writes should hit same-epoch fast path.
 	for i := 0; i < b.N; i++ {
-		racewrite(addr)
+		racewrite(addr, 0)
 	}
 }
 
@@ -359,7 +359,7 @@ func BenchmarkGetCurrentContext_MultipleGoroutines(b *testing.B) {
 func BenchmarkReset(b *testing.B) {
 	// Pre-create some state.
 	for i := 0; i < 100; i++ {
-		racewrite(uintptr(0x10000 + i*8))
+		racewrite(uintptr(0x10000+i*8), 0)
 	}
 
 	b.ResetTimer()
@@ -385,7 +385,7 @@ func BenchmarkRaceRead_DifferentAddresses(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// Each iteration uses different address.
 		addr := uintptr(0x100000 + i*8)
-		raceread(addr)
+		raceread(addr, 0)
 	}
 }
 
@@ -401,7 +401,7 @@ func BenchmarkRaceWrite_DifferentAddresses(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		addr := uintptr(0x200000 + i*8)
-		racewrite(addr)
+		racewrite(addr, 0)
 	}
 }
 
@@ -446,9 +446,9 @@ func BenchmarkRaceReadWrite_TypicalWorkload(b *testing.B) {
 
 		// 70% reads, 30% writes.
 		if i%10 < 7 {
-			raceread(addr)
+			raceread(addr, 0)
 		} else {
-			racewrite(addr)
+			racewrite(addr, 0)
 		}
 	}
 }
@@ -470,7 +470,7 @@ func BenchmarkFullStack_RaceReadWithPC(b *testing.B) {
 		if enabled.Load() {
 			ctx := getCurrentContext()
 			_ = getcallerpc()
-			det.OnRead(addr, ctx)
+			det.OnRead(addr, ctx, 0)
 		}
 	}
 }
@@ -491,7 +491,7 @@ func BenchmarkFullStack_RaceWriteWithPC(b *testing.B) {
 		if enabled.Load() {
 			ctx := getCurrentContext()
 			_ = getcallerpc()
-			det.OnWrite(addr, ctx)
+			det.OnWrite(addr, ctx, 0)
 		}
 	}
 }

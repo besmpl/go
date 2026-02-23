@@ -19,13 +19,13 @@ func BenchmarkOnWrite_NoRace(b *testing.B) {
 	addr := uintptr(0x1000)
 
 	// Setup: First write to initialize shadow cell.
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		d.OnWrite(addr, ctx)
+		d.OnWrite(addr, ctx, 0)
 	}
 }
 
@@ -44,7 +44,7 @@ func BenchmarkOnWrite_NoRace_NewAddress(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// Each iteration writes to a new address (cold path).
 		addr := baseAddr + uintptr(i*8)
-		d.OnWrite(addr, ctx)
+		d.OnWrite(addr, ctx, 0)
 	}
 }
 
@@ -60,7 +60,7 @@ func BenchmarkOnWrite_SameEpoch(b *testing.B) {
 	addr := uintptr(0x2000)
 
 	// Setup: Write once to create shadow cell.
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 
 	// Get shadow cell and manually set it to current epoch.
 	vs := d.shadowMemory.Get(addr)
@@ -75,7 +75,7 @@ func BenchmarkOnWrite_SameEpoch(b *testing.B) {
 		// because IncrementClock advances the epoch.
 		currentEpoch := ctx.GetEpoch()
 		vs.SetW(currentEpoch)
-		d.OnWrite(addr, ctx)
+		d.OnWrite(addr, ctx, 0)
 	}
 }
 
@@ -100,7 +100,7 @@ func BenchmarkOnWrite_WithRace(b *testing.B) {
 		ctx.C.Set(1, uint32(i))
 		ctx.Epoch = epoch.NewEpoch(1, uint64(i))
 
-		d.OnWrite(addr, ctx)
+		d.OnWrite(addr, ctx, 0)
 	}
 }
 
@@ -116,7 +116,7 @@ func BenchmarkOnWrite_MultipleAddresses(b *testing.B) {
 	// Pre-populate shadow memory.
 	for i := 0; i < numAddresses; i++ {
 		addr := baseAddr + uintptr(i*8)
-		d.OnWrite(addr, ctx)
+		d.OnWrite(addr, ctx, 0)
 	}
 
 	b.ResetTimer()
@@ -125,7 +125,7 @@ func BenchmarkOnWrite_MultipleAddresses(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// Round-robin through addresses.
 		addr := baseAddr + uintptr((i%numAddresses)*8)
-		d.OnWrite(addr, ctx)
+		d.OnWrite(addr, ctx, 0)
 	}
 }
 
@@ -203,7 +203,7 @@ func BenchmarkParallelOnWrite(b *testing.B) {
 		for pb.Next() {
 			// Each goroutine writes to its own address space.
 			addr := baseAddr + uintptr(i*8)
-			d.OnWrite(addr, ctx)
+			d.OnWrite(addr, ctx, 0)
 			i++
 		}
 	})
@@ -237,7 +237,7 @@ func BenchmarkReset(b *testing.B) {
 	// Populate with some data.
 	for i := 0; i < 100; i++ {
 		addr := uintptr(0x10000 + i*8)
-		d.OnWrite(addr, ctx)
+		d.OnWrite(addr, ctx, 0)
 	}
 
 	b.ResetTimer()
@@ -249,7 +249,7 @@ func BenchmarkReset(b *testing.B) {
 		// Re-populate after reset to keep benchmark consistent.
 		for j := 0; j < 100; j++ {
 			addr := uintptr(0x10000 + j*8)
-			d.OnWrite(addr, ctx)
+			d.OnWrite(addr, ctx, 0)
 		}
 	}
 }
@@ -266,13 +266,13 @@ func BenchmarkOnRead_NoRace(b *testing.B) {
 	addr := uintptr(0x1000)
 
 	// Setup: First read to initialize shadow cell.
-	d.OnRead(addr, ctx)
+	d.OnRead(addr, ctx, 0)
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		d.OnRead(addr, ctx)
+		d.OnRead(addr, ctx, 0)
 	}
 }
 
@@ -291,7 +291,7 @@ func BenchmarkOnRead_NoRace_NewAddress(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// Each iteration reads from a new address (cold path).
 		addr := baseAddr + uintptr(i*8)
-		d.OnRead(addr, ctx)
+		d.OnRead(addr, ctx, 0)
 	}
 }
 
@@ -307,7 +307,7 @@ func BenchmarkOnRead_SameEpoch(b *testing.B) {
 	addr := uintptr(0x2000)
 
 	// Setup: Read once to create shadow cell.
-	d.OnRead(addr, ctx)
+	d.OnRead(addr, ctx, 0)
 
 	// Get shadow cell and manually set it to current epoch.
 	vs := d.shadowMemory.Get(addr)
@@ -322,7 +322,7 @@ func BenchmarkOnRead_SameEpoch(b *testing.B) {
 		// because IncrementClock advances the epoch.
 		currentEpoch := ctx.GetEpoch()
 		vs.SetReadEpoch(currentEpoch)
-		d.OnRead(addr, ctx)
+		d.OnRead(addr, ctx, 0)
 	}
 }
 
@@ -347,7 +347,7 @@ func BenchmarkOnRead_WithRace(b *testing.B) {
 		ctx.C.Set(1, uint32(i))
 		ctx.Epoch = epoch.NewEpoch(1, uint64(i))
 
-		d.OnRead(addr, ctx)
+		d.OnRead(addr, ctx, 0)
 	}
 }
 
@@ -363,7 +363,7 @@ func BenchmarkOnRead_MultipleAddresses(b *testing.B) {
 	// Pre-populate shadow memory.
 	for i := 0; i < numAddresses; i++ {
 		addr := baseAddr + uintptr(i*8)
-		d.OnRead(addr, ctx)
+		d.OnRead(addr, ctx, 0)
 	}
 
 	b.ResetTimer()
@@ -372,7 +372,7 @@ func BenchmarkOnRead_MultipleAddresses(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// Round-robin through addresses.
 		addr := baseAddr + uintptr((i%numAddresses)*8)
-		d.OnRead(addr, ctx)
+		d.OnRead(addr, ctx, 0)
 	}
 }
 
@@ -385,13 +385,13 @@ func BenchmarkOnRead_AfterWrite(b *testing.B) {
 	addr := uintptr(0x4000)
 
 	// Initial write to set up shadow memory.
-	d.OnWrite(addr, ctx)
+	d.OnWrite(addr, ctx, 0)
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		d.OnRead(addr, ctx)
+		d.OnRead(addr, ctx, 0)
 	}
 }
 
@@ -412,7 +412,7 @@ func BenchmarkParallelOnRead(b *testing.B) {
 		for pb.Next() {
 			// Each goroutine reads from its own address space.
 			addr := baseAddr + uintptr(i*8)
-			d.OnRead(addr, ctx)
+			d.OnRead(addr, ctx, 0)
 			i++
 		}
 	})
@@ -436,9 +436,9 @@ func BenchmarkParallelReadWrite(b *testing.B) {
 			addr := baseAddr + uintptr(i*8)
 			// Alternate between reads and writes.
 			if i%2 == 0 {
-				d.OnRead(addr, ctx)
+				d.OnRead(addr, ctx, 0)
 			} else {
-				d.OnWrite(addr, ctx)
+				d.OnWrite(addr, ctx, 0)
 			}
 			i++
 		}
@@ -453,13 +453,13 @@ func BenchmarkOnReadOnWrite_Comparison(b *testing.B) {
 		d := NewDetector()
 		ctx := goroutine.Alloc(1)
 		addr := uintptr(0x5000)
-		d.OnRead(addr, ctx) // Setup
+		d.OnRead(addr, ctx, 0) // Setup
 
 		b.ResetTimer()
 		b.ReportAllocs()
 
 		for i := 0; i < b.N; i++ {
-			d.OnRead(addr, ctx)
+			d.OnRead(addr, ctx, 0)
 		}
 	})
 
@@ -467,13 +467,13 @@ func BenchmarkOnReadOnWrite_Comparison(b *testing.B) {
 		d := NewDetector()
 		ctx := goroutine.Alloc(1)
 		addr := uintptr(0x6000)
-		d.OnWrite(addr, ctx) // Setup
+		d.OnWrite(addr, ctx, 0) // Setup
 
 		b.ResetTimer()
 		b.ReportAllocs()
 
 		for i := 0; i < b.N; i++ {
-			d.OnWrite(addr, ctx)
+			d.OnWrite(addr, ctx, 0)
 		}
 	})
 }

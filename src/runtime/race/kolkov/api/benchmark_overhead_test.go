@@ -37,7 +37,7 @@ func BenchmarkOverhead_Read(b *testing.B) {
 		b.ReportAllocs()
 
 		for i := 0; i < b.N; i++ {
-			raceread(addr)
+			raceread(addr, 0)
 		}
 	})
 
@@ -50,7 +50,7 @@ func BenchmarkOverhead_Read(b *testing.B) {
 		b.ReportAllocs()
 
 		for i := 0; i < b.N; i++ {
-			raceread(addr) // No-op when disabled
+			raceread(addr, 0) // No-op when disabled
 		}
 	})
 }
@@ -69,7 +69,7 @@ func BenchmarkOverhead_Write(b *testing.B) {
 		b.ReportAllocs()
 
 		for i := 0; i < b.N; i++ {
-			racewrite(addr)
+			racewrite(addr, 0)
 		}
 	})
 
@@ -82,7 +82,7 @@ func BenchmarkOverhead_Write(b *testing.B) {
 		b.ReportAllocs()
 
 		for i := 0; i < b.N; i++ {
-			racewrite(addr) // No-op when disabled
+			racewrite(addr, 0) // No-op when disabled
 		}
 	})
 }
@@ -102,9 +102,9 @@ func BenchmarkOverhead_MixedReadWrite(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			if i%2 == 0 {
-				racewrite(addr)
+				racewrite(addr, 0)
 			} else {
-				raceread(addr)
+				raceread(addr, 0)
 			}
 		}
 	})
@@ -119,9 +119,9 @@ func BenchmarkOverhead_MixedReadWrite(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			if i%2 == 0 {
-				racewrite(addr)
+				racewrite(addr, 0)
 			} else {
-				raceread(addr)
+				raceread(addr, 0)
 			}
 		}
 	})

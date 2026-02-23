@@ -299,8 +299,8 @@ func TestNewDetector_BackwardCompatible(t *testing.T) {
 
 	// Verify detection still works
 	ctx := createTestContext(1)
-	d.OnWrite(0x1234, ctx)
-	d.OnRead(0x1234, ctx)
+	d.OnWrite(0x1234, ctx, 0)
+	d.OnRead(0x1234, ctx, 0)
 
 	// No race with same goroutine
 	if d.RacesDetected() != 0 {
@@ -374,7 +374,7 @@ func BenchmarkDetector_OnWrite_NoSampling(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		d.OnWrite(addr+uintptr(i%1000), ctx)
+		d.OnWrite(addr+uintptr(i%1000), ctx, 0)
 	}
 }
 
@@ -389,7 +389,7 @@ func BenchmarkDetector_OnWrite_WithSampling_Rate10(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		d.OnWrite(addr+uintptr(i%1000), ctx)
+		d.OnWrite(addr+uintptr(i%1000), ctx, 0)
 	}
 }
 
@@ -404,7 +404,7 @@ func BenchmarkDetector_OnWrite_WithSampling_Rate100(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		d.OnWrite(addr+uintptr(i%1000), ctx)
+		d.OnWrite(addr+uintptr(i%1000), ctx, 0)
 	}
 }
 
@@ -416,12 +416,12 @@ func BenchmarkDetector_OnRead_NoSampling(b *testing.B) {
 
 	// Pre-populate shadow memory
 	for i := 0; i < 1000; i++ {
-		d.OnWrite(addr+uintptr(i), ctx)
+		d.OnWrite(addr+uintptr(i), ctx, 0)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		d.OnRead(addr+uintptr(i%1000), ctx)
+		d.OnRead(addr+uintptr(i%1000), ctx, 0)
 	}
 }
 
@@ -436,11 +436,11 @@ func BenchmarkDetector_OnRead_WithSampling_Rate10(b *testing.B) {
 
 	// Pre-populate shadow memory
 	for i := 0; i < 1000; i++ {
-		d.OnWrite(addr+uintptr(i), ctx)
+		d.OnWrite(addr+uintptr(i), ctx, 0)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		d.OnRead(addr+uintptr(i%1000), ctx)
+		d.OnRead(addr+uintptr(i%1000), ctx, 0)
 	}
 }

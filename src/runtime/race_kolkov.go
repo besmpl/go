@@ -266,16 +266,14 @@ func race_WritePC(addr unsafe.Pointer, callerpc, pc uintptr) {
 func raceinit() (gctx, pctx uintptr) {
 	lockInit(&raceFiniLock, lockRankRaceFini)
 
-	// TODO: Initialize the pure-Go race detector
-	// Unlike TSAN, we don't require CGO
-
 	// Initialize global detector state
 	raceKolkovInit()
 
-	// Return dummy contexts for now
-	// TODO: Return actual global and proc contexts
-	gctx = 0
-	pctx = 0
+	// Return non-zero sentinel values so that runtime stores them in
+	// g.racectx and p.racectx. raceacquirectx checks "if racectx == 0 { return }"
+	// so returning 0 would cause the main goroutine to be silently skipped.
+	gctx = 1
+	pctx = 1
 
 	return
 }
@@ -315,19 +313,39 @@ func racemapshadow(addr unsafe.Pointer, size uintptr) {
 }
 
 // racemalloc notifies the race detector of a memory allocation.
+// Clears shadow memory for the allocated range to prevent false positives
+// from stale access history when the allocator reuses addresses.
 //
 //go:nosplit
 func racemalloc(p unsafe.Pointer, sz uintptr) {
-	// TODO: Track memory allocation
-	// This helps establish happens-before between allocation and first access
+	gp := getg()
+	if gp.m != nil && gp.m.curg != nil {
+		gp = gp.m.curg
+	}
+	if gp.raceignore != 0 {
+		return
+	}
+	gp.raceignore++
+	kolkovApiClearShadow(uintptr(p), sz)
+	gp.raceignore--
 }
 
 // racefree notifies the race detector of a memory free.
+// Clears shadow memory for the freed range to prevent false positives
+// when the allocator reuses the same addresses for new objects.
 //
 //go:nosplit
 func racefree(p unsafe.Pointer, sz uintptr) {
-	// TODO: Track memory deallocation
-	// This helps avoid false positives on reused memory
+	gp := getg()
+	if gp.m != nil && gp.m.curg != nil {
+		gp = gp.m.curg
+	}
+	if gp.raceignore != 0 {
+		return
+	}
+	gp.raceignore++
+	kolkovApiClearShadow(uintptr(p), sz)
+	gp.raceignore--
 }
 
 // racegostart notifies the race detector that a new goroutine is starting.
@@ -560,15 +578,21 @@ func racereleasemerge(addr unsafe.Pointer) {
 }
 
 // racereleasemergeg records a release-merge operation for a specific goroutine.
+// The target goroutine gp may differ from the current goroutine (e.g., in channel
+// operations where one goroutine releases on behalf of its blocked partner).
 //
 //go:nosplit
 func racereleasemergeg(gp *g, addr unsafe.Pointer) {
 	if gp.raceignore != 0 {
 		return
 	}
-	gp.raceignore++
-	kolkovOnReleaseMerge(uintptr(addr))
-	gp.raceignore--
+	curg := getg()
+	if curg.m != nil && curg.m.curg != nil {
+		curg = curg.m.curg
+	}
+	curg.raceignore++
+	kolkovApiOnReleaseMergeForGoroutine(uintptr(addr), int64(gp.goid))
+	curg.raceignore--
 }
 
 // racefingo notifies the race detector that the current goroutine is a finalizer.

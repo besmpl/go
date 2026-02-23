@@ -261,7 +261,7 @@ func TestRaceRead_Enabled(t *testing.T) {
 
 	// Perform read access.
 	addr := uintptr(0x1000)
-	raceread(addr)
+	raceread(addr, 0)
 
 	// Detector should have been called (no race detected for single access).
 	// We can verify by checking that no races were detected.
@@ -277,7 +277,7 @@ func TestRaceWrite_Enabled(t *testing.T) {
 
 	// Perform write access.
 	addr := uintptr(0x2000)
-	racewrite(addr)
+	racewrite(addr, 0)
 
 	// Detector should have been called (no race for single write).
 	if got := RacesDetected(); got != 0 {
@@ -298,7 +298,7 @@ func TestRaceRead_Disabled(t *testing.T) {
 	racesBefore := RacesDetected()
 
 	// Perform read - should be no-op.
-	raceread(addr)
+	raceread(addr, 0)
 
 	// Races count should be unchanged.
 	racesAfter := RacesDetected()
@@ -319,7 +319,7 @@ func TestRaceWrite_Disabled(t *testing.T) {
 	racesBefore := RacesDetected()
 
 	// Perform write - should be no-op.
-	racewrite(addr)
+	racewrite(addr, 0)
 
 	racesAfter := RacesDetected()
 	if racesAfter != racesBefore {
@@ -373,8 +373,8 @@ func TestRacesDetected(t *testing.T) {
 	// Since we can't easily trigger race via API alone (need concurrent access),
 	// we'll test that RacesDetected() returns 0 for safe accesses.
 	addr := uintptr(0x5000)
-	racewrite(addr)
-	raceread(addr)
+	racewrite(addr, 0)
+	raceread(addr, 0)
 
 	// No race should be detected (sequential access).
 	if got := RacesDetected(); got != 0 {
@@ -385,7 +385,7 @@ func TestRacesDetected(t *testing.T) {
 // TestReset verifies Reset clears all state.
 func TestReset(t *testing.T) {
 	// Do some operations to create state.
-	racewrite(uintptr(0x6000))
+	racewrite(uintptr(0x6000), 0)
 	getCurrentContext() // Allocate context
 
 	// Reset.
@@ -426,7 +426,7 @@ func TestGetCallerPC(t *testing.T) {
 		}
 	}()
 
-	raceread(uintptr(0x7000))
+	raceread(uintptr(0x7000), 0)
 }
 
 // TestGetCallerPC_Direct tests getcallerpc directly.
@@ -460,9 +460,9 @@ func TestConcurrentRaceAccess(t *testing.T) {
 			for j := 0; j < numAccesses; j++ {
 				addr := baseAddr + uintptr(j)
 				if j%2 == 0 {
-					racewrite(addr)
+					racewrite(addr, 0)
 				} else {
-					raceread(addr)
+					raceread(addr, 0)
 				}
 			}
 		}(i)
@@ -489,7 +489,7 @@ func TestRaceDetection_SimpleWriteWrite(_ *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		racewrite(addr)
+		racewrite(addr, 0)
 	}()
 	wg.Wait()
 
@@ -504,11 +504,11 @@ func TestRaceDetection_SimpleWriteWrite(_ *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		racewrite(addr)
+		racewrite(addr, 0)
 	}()
 	go func() {
 		defer wg.Done()
-		racewrite(addr)
+		racewrite(addr, 0)
 	}()
 	wg.Wait()
 
@@ -563,8 +563,8 @@ func TestRaceReadWrite_ZeroAddress(t *testing.T) {
 		}
 	}()
 
-	racewrite(0)
-	raceread(0)
+	racewrite(0, 0)
+	raceread(0, 0)
 }
 
 // TestRaceReadWrite_HighAddress tests handling of high memory addresses.
@@ -581,8 +581,8 @@ func TestRaceReadWrite_HighAddress(t *testing.T) {
 		}
 	}()
 
-	racewrite(addr)
-	raceread(addr)
+	racewrite(addr, 0)
+	raceread(addr, 0)
 }
 
 // TestMainGoroutineContext verifies main goroutine gets context.
@@ -686,8 +686,8 @@ func TestInitIdempotent(t *testing.T) {
 
 	// Do some operations to create state.
 	addr := uintptr(0x9000)
-	racewrite(addr)
-	raceread(addr)
+	racewrite(addr, 0)
+	raceread(addr, 0)
 
 	// Call Init again - should reset everything.
 	Init()
@@ -812,8 +812,8 @@ func TestInitFiniCycle(t *testing.T) {
 	Init()
 
 	addr := uintptr(0xa000)
-	racewrite(addr)
-	raceread(addr)
+	racewrite(addr, 0)
+	raceread(addr, 0)
 
 	Fini()
 
@@ -831,7 +831,7 @@ func TestInitFiniCycle(t *testing.T) {
 	}
 
 	addr2 := uintptr(0xb000)
-	racewrite(addr2)
+	racewrite(addr2, 0)
 
 	Fini()
 
@@ -860,7 +860,7 @@ func TestInitResetsState(t *testing.T) {
 	// Do some accesses.
 	for i := 0; i < 100; i++ {
 		addr := uintptr(0xc000 + i)
-		racewrite(addr)
+		racewrite(addr, 0)
 	}
 
 	// Now Init again - should reset everything.
@@ -914,7 +914,7 @@ func TestInitAfterAutoInit(t *testing.T) {
 
 	// Before Init(), detector should be in some state.
 	// Let's do an operation.
-	racewrite(uintptr(0xd000))
+	racewrite(uintptr(0xd000), 0)
 
 	// Now call Init().
 	Init()

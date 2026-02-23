@@ -131,9 +131,6 @@ var (
 	// Protected by tidPoolMu. TIDs are popped on allocation and pushed on free.
 	freeTIDs []uint16
 
-	// Debug counters
-	apiReadCount  atomic.Uint64
-	apiWriteCount atomic.Uint64
 	apiInitCalled atomic.Uint32 // 1 if init() was called
 
 	// tidPoolMu protects freeTIDs stack.
@@ -352,10 +349,7 @@ func ensureInitialized() {
 //
 //go:linkname raceread
 //go:nosplit
-func raceread(addr uintptr) {
-	// Debug: count API calls
-	apiReadCount.Add(1)
-
+func raceread(addr, pc uintptr) {
 	// Lazy initialization: If init() hasn't run yet, initialize now.
 	// This handles the case where race functions are called before package init().
 	if apiInitCalled.Load() == 0 {
@@ -372,14 +366,10 @@ func raceread(addr uintptr) {
 	// This allocates on first call per goroutine (~100ns), then cached (~5ns).
 	ctx := getCurrentContext()
 
-	// Extract program counter for the access.
-	// Currently collected but not used in reports (planned for v0.4.0).
-	_ = getcallerpc() // TODO: Pass to OnRead for enhanced stack trace reporting
-
 	// Perform race detection check.
-	// This calls the FastTrack algorithm to detect read-write races.
-	// Pass the RaceContext for this goroutine to enable proper per-goroutine tracking.
-	det.OnRead(addr, ctx)
+	// PC is passed through from runtime's sys.GetCallerPC() (~0ns overhead).
+	// When pc==0, detector falls back to captureCallerPC() internally.
+	det.OnRead(addr, ctx, pc)
 }
 
 // racewrite is called by compiler instrumentation on every write access.
@@ -408,10 +398,7 @@ func raceread(addr uintptr) {
 //
 //go:linkname racewrite
 //go:nosplit
-func racewrite(addr uintptr) {
-	// Debug: count API calls
-	apiWriteCount.Add(1)
-
+func racewrite(addr, pc uintptr) {
 	// Lazy initialization: If init() hasn't run yet, initialize now.
 	if apiInitCalled.Load() == 0 {
 		ensureInitialized()
@@ -425,13 +412,10 @@ func racewrite(addr uintptr) {
 	// Get RaceContext for current goroutine.
 	ctx := getCurrentContext()
 
-	// Extract program counter for the access.
-	_ = getcallerpc() // TODO: Pass to OnWrite for enhanced stack trace reporting
-
 	// Perform race detection check.
-	// This calls the FastTrack algorithm to detect write-write and read-write races.
-	// Pass the RaceContext for this goroutine to enable proper per-goroutine tracking.
-	det.OnWrite(addr, ctx)
+	// PC is passed through from runtime's sys.GetCallerPC() (~0ns overhead).
+	// When pc==0, detector falls back to captureCallerPC() internally.
+	det.OnWrite(addr, ctx, pc)
 }
 
 // === Goroutine Lifecycle (GoStart/GoEnd) ===
@@ -884,6 +868,24 @@ func raceReleaseForGoroutine(addr uintptr, goid int64) {
 		return
 	}
 	det.OnRelease(addr, ctx)
+}
+
+// raceReleaseMergeForGoroutine performs a release-merge operation on addr on
+// behalf of the goroutine identified by goid. This is the release-merge
+// counterpart of raceReleaseForGoroutine -- used in racereleasemergeg where
+// the current goroutine releases on behalf of a different goroutine.
+//
+//go:linkname raceReleaseMergeForGoroutine
+//go:nosplit
+func raceReleaseMergeForGoroutine(addr uintptr, goid int64) {
+	if enabled.Load() == 0 {
+		return
+	}
+	ctx, ok := contextsMap.Load(goid)
+	if !ok {
+		return
+	}
+	det.OnReleaseMerge(addr, ctx)
 }
 
 // === Channel Synchronization API (Phase 4 Task 4.2) ===
@@ -1586,6 +1588,19 @@ func getcallerpc() uintptr {
 	return uintptr(pc)
 }
 
+// raceClearShadow clears shadow memory for the given address range.
+// Called by runtime's racemalloc/racefree to prevent false positives
+// from stale shadow state when addresses are reused by the allocator.
+//
+//go:linkname raceClearShadow
+//go:nosplit
+func raceClearShadow(addr, size uintptr) {
+	if enabled.Load() == 0 {
+		return
+	}
+	det.ClearShadowRange(addr, size)
+}
+
 // Enable turns on race detection.
 //
 // This is currently a no-op for MVP (always enabled), but provides the
@@ -1633,7 +1648,7 @@ func RacesDetected() int {
 // Parameters:
 //   - addr: Memory address being read from
 func RaceRead(addr uintptr) {
-	raceread(addr)
+	raceread(addr, 0) // 0 = use fallback PC capture in detector
 }
 
 // RaceWrite is an exported wrapper for racewrite, for demonstration purposes.
@@ -1645,7 +1660,7 @@ func RaceRead(addr uintptr) {
 // Parameters:
 //   - addr: Memory address being written to
 func RaceWrite(addr uintptr) {
-	racewrite(addr)
+	racewrite(addr, 0) // 0 = use fallback PC capture in detector
 }
 
 // RaceAcquire is an exported wrapper for raceacquire, for demonstration purposes (Phase 4 Task 4.1).
@@ -1908,13 +1923,6 @@ func Init() {
 //
 //go:linkname Fini
 func Fini() {
-	// Debug: Print API counters
-	printstring("[Kolkov API] Reads: ")
-	printstring(uitoaAPI(apiReadCount.Load()))
-	printstring(" Writes: ")
-	printstring(uitoaAPI(apiWriteCount.Load()))
-	printstring("\n")
-
 	// Disable race detection first.
 	// This ensures no more race checks happen while we're printing the report.
 	enabled.Store(0)

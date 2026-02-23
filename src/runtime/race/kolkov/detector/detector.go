@@ -416,7 +416,7 @@ func captureCallerPC() uintptr {
 //
 //go:nosplit
 //nolint:gocognit,nestif,gocyclo,cyclop // Complex race detection logic requires nested conditionals
-func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext) {
+func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) {
 	// Step 0: Sampling check (v0.3.0 P0).
 	// If sampling is enabled and this access is not sampled, skip detection.
 	// This provides 50-90% overhead reduction with 70-90%+ detection rate.
@@ -444,8 +444,11 @@ func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext) {
 		// Lazy stack capture optimization (v0.3.0 Performance):
 		// Store only caller PC (~5ns), not full stack (~500ns).
 		// Full stack is captured lazily when race is detected.
-		pc := captureCallerPC()
-		vs.SetWritePC(pc)
+		if pc != 0 {
+			vs.SetWritePC(pc)
+		} else {
+			vs.SetWritePC(captureCallerPC()) // fallback for tests
+		}
 		return
 	}
 
@@ -470,8 +473,11 @@ func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext) {
 				vs.SetW(currentEpoch)
 				vs.IncrementWriteCount()
 				// Lazy stack capture (v0.3.0 Performance).
-				pc := captureCallerPC()
-				vs.SetWritePC(pc)
+				if pc != 0 {
+					vs.SetWritePC(pc)
+				} else {
+					vs.SetWritePC(captureCallerPC()) // fallback for tests
+				}
 				ctx.IncrementClock()
 				return
 			}
@@ -484,8 +490,11 @@ func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext) {
 			vs.SetW(currentEpoch)
 			vs.IncrementWriteCount()
 			// Lazy stack capture (v0.3.0 Performance).
-			pc := captureCallerPC()
-			vs.SetWritePC(pc)
+			if pc != 0 {
+				vs.SetWritePC(pc)
+			} else {
+				vs.SetWritePC(captureCallerPC()) // fallback for tests
+			}
 			ctx.IncrementClock()
 			return
 		}
@@ -505,8 +514,11 @@ func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext) {
 				vs.SetW(currentEpoch)
 				vs.IncrementWriteCount()
 				// Lazy stack capture (v0.3.0 Performance).
-				pc := captureCallerPC()
-				vs.SetWritePC(pc)
+				if pc != 0 {
+					vs.SetWritePC(pc)
+				} else {
+					vs.SetWritePC(captureCallerPC()) // fallback for tests
+				}
 				ctx.IncrementClock()
 				return
 			}
@@ -569,8 +581,11 @@ func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext) {
 	// Store only caller PC (~5ns) instead of full stack (~500ns).
 	// Full stack is captured lazily when race is detected.
 	// This is a 50x performance improvement on the hot path!
-	pc := captureCallerPC()
-	vs.SetWritePC(pc)
+	if pc != 0 {
+		vs.SetWritePC(pc)
+	} else {
+		vs.SetWritePC(captureCallerPC()) // fallback for tests
+	}
 
 	// Step 8: Clear read tracking and DEMOTE back to fast path.
 	// Write dominates all previous reads, so we reset read state.
@@ -639,7 +654,7 @@ func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext) {
 // Zero Allocations: Fast path allocates nothing. Slow path may allocate VectorClock on promotion.
 //
 //go:nosplit
-func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext) {
+func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) {
 	// Step 0: Sampling check (v0.3.0 P0).
 	// If sampling is enabled and this access is not sampled, skip detection.
 	// This provides 50-90% overhead reduction with 70-90%+ detection rate.
@@ -745,8 +760,11 @@ func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext) {
 	// Lazy stack capture for read-shared variables (v0.3.0 Performance).
 	// Store only caller PC (~5ns) instead of full stack (~500ns).
 	// Full stack is captured lazily when race is detected.
-	pc := captureCallerPC()
-	vs.SetReadPC(pc)
+	if pc != 0 {
+		vs.SetReadPC(pc)
+	} else {
+		vs.SetReadPC(captureCallerPC()) // fallback for tests
+	}
 
 	ctx.IncrementClock()
 }
@@ -839,6 +857,9 @@ func (d *Detector) reportRace(raceType string, addr uintptr, prevEpoch, currEpoc
 
 	// Increment race counter for statistics.
 	d.racesDetected++
+
+	// Notify the runtime so RaceErrors() returns the correct count.
+	kolkovIncrementErrors()
 
 	// Print race report to stderr.
 	printRaceLine("==================")
@@ -1351,6 +1372,15 @@ func (d *Detector) OnWaitGroupWaitAfter(wg uintptr, ctx *goroutine.RaceContext) 
 	// Step 4: Increment logical clock to advance time.
 	// This must be done AFTER merging the doneClock to maintain happens-before.
 	ctx.IncrementClock()
+}
+
+// ClearShadowRange clears shadow memory for the given address range.
+// Called during memory allocation/free to prevent false positives from
+// stale shadow state when the allocator reuses addresses.
+//
+//go:nosplit
+func (d *Detector) ClearShadowRange(addr, size uintptr) {
+	d.shadowMemory.ClearRange(addr, size)
 }
 
 // Reset resets the detector state for testing.

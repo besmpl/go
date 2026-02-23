@@ -138,13 +138,13 @@ func TestMutexProtectedNoRace(t *testing.T) {
 	// Thread 0: Lock, write, Unlock.
 	ctx0 := goroutine.Alloc(0)
 	d.OnAcquire(mutexAddr, ctx0) // Lock
-	d.OnWrite(varAddr, ctx0)     // Write x = 42
+	d.OnWrite(varAddr, ctx0, 0)     // Write x = 42
 	d.OnRelease(mutexAddr, ctx0) // Unlock
 
 	// Thread 1: Lock, read, Unlock.
 	ctx1 := goroutine.Alloc(1)
 	d.OnAcquire(mutexAddr, ctx1) // Lock (sees Thread 0's clock!)
-	d.OnRead(varAddr, ctx1)      // Read x (should NOT race)
+	d.OnRead(varAddr, ctx1, 0)      // Read x (should NOT race)
 	d.OnRelease(mutexAddr, ctx1) // Unlock
 
 	// Verify no races detected.
@@ -161,14 +161,14 @@ func TestUnprotectedRaceStillDetected(t *testing.T) {
 	// Thread 0: Write (no lock).
 	ctx0 := goroutine.Alloc(0)
 	ctx0.IncrementClock() // Initialize clock
-	d.OnWrite(varAddr, ctx0)
+	d.OnWrite(varAddr, ctx0, 0)
 
 	// Thread 1: Read (no lock) - SHOULD RACE because no mutex established happens-before.
 	// However, if Thread 0's write happens-before Thread 1's read naturally (same thread order),
 	// we need to make them truly concurrent.
 	ctx1 := goroutine.Alloc(1)
 	ctx1.IncrementClock() // Initialize clock (concurrent with Thread 0)
-	d.OnRead(varAddr, ctx1)
+	d.OnRead(varAddr, ctx1, 0)
 
 	// For this test, we actually expect 0 races because we're detecting based on happens-before,
 	// and without explicit synchronization primitives, the threads have no happens-before relationship.
@@ -188,13 +188,13 @@ func TestUnprotectedRaceStillDetected(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		ctx0.IncrementClock() // Advance Thread 0's clock to 5
 	}
-	d.OnWrite(varAddr, ctx0) // Write at clock 5 (will increment to 6)
+	d.OnWrite(varAddr, ctx0, 0) // Write at clock 5 (will increment to 6)
 
 	// Thread 1: Read without seeing Thread 0's write (no mutex sync).
 	// Thread 1's vector clock for Thread 0 should be 0 (hasn't seen Thread 0's work).
 	// ctx1.C[0] = 0, but write was at clock 6.
 	// Since ctx1.C[0] (0) < write.clock (6), happens-before check fails → RACE!
-	d.OnRead(varAddr, ctx1)
+	d.OnRead(varAddr, ctx1, 0)
 
 	// Verify race was detected.
 	if d.RacesDetected() != 1 {
@@ -215,22 +215,22 @@ func TestMultipleMutexes(t *testing.T) {
 
 	// Thread 0: Lock mutex1, write var1, unlock mutex1.
 	d.OnAcquire(mutex1Addr, ctx0)
-	d.OnWrite(var1Addr, ctx0)
+	d.OnWrite(var1Addr, ctx0, 0)
 	d.OnRelease(mutex1Addr, ctx0)
 
 	// Thread 1: Lock mutex2, write var2, unlock mutex2.
 	d.OnAcquire(mutex2Addr, ctx1)
-	d.OnWrite(var2Addr, ctx1)
+	d.OnWrite(var2Addr, ctx1, 0)
 	d.OnRelease(mutex2Addr, ctx1)
 
 	// Thread 1: Lock mutex1 (different mutex), read var1 - should NOT race.
 	d.OnAcquire(mutex1Addr, ctx1)
-	d.OnRead(var1Addr, ctx1)
+	d.OnRead(var1Addr, ctx1, 0)
 	d.OnRelease(mutex1Addr, ctx1)
 
 	// Thread 0: Lock mutex2, read var2 - should NOT race.
 	d.OnAcquire(mutex2Addr, ctx0)
-	d.OnRead(var2Addr, ctx0)
+	d.OnRead(var2Addr, ctx0, 0)
 	d.OnRelease(mutex2Addr, ctx0)
 
 	// Verify no races (both variables properly protected by their mutexes).
@@ -248,17 +248,17 @@ func TestLockReentry(t *testing.T) {
 
 	// First lock/unlock cycle.
 	d.OnAcquire(mutexAddr, ctx)
-	d.OnWrite(varAddr, ctx)
+	d.OnWrite(varAddr, ctx, 0)
 	d.OnRelease(mutexAddr, ctx)
 
 	// Second lock/unlock cycle (same thread).
 	d.OnAcquire(mutexAddr, ctx)
-	d.OnRead(varAddr, ctx)
+	d.OnRead(varAddr, ctx, 0)
 	d.OnRelease(mutexAddr, ctx)
 
 	// Third lock/unlock cycle.
 	d.OnAcquire(mutexAddr, ctx)
-	d.OnWrite(varAddr, ctx)
+	d.OnWrite(varAddr, ctx, 0)
 	d.OnRelease(mutexAddr, ctx)
 
 	// Verify no races (same thread, sequential access).
@@ -276,19 +276,19 @@ func TestConcurrentLocksEstablishHappensBefore(t *testing.T) {
 	// Thread 0: Lock, write, unlock.
 	ctx0 := goroutine.Alloc(0)
 	d.OnAcquire(mutexAddr, ctx0)
-	d.OnWrite(varAddr, ctx0)
+	d.OnWrite(varAddr, ctx0, 0)
 	d.OnRelease(mutexAddr, ctx0)
 
 	// Thread 1: Lock, write, unlock (happens-after Thread 0).
 	ctx1 := goroutine.Alloc(1)
 	d.OnAcquire(mutexAddr, ctx1)
-	d.OnWrite(varAddr, ctx1) // Overwrites Thread 0's write - NO RACE
+	d.OnWrite(varAddr, ctx1, 0) // Overwrites Thread 0's write - NO RACE
 	d.OnRelease(mutexAddr, ctx1)
 
 	// Thread 2: Lock, read, unlock (happens-after Thread 1).
 	ctx2 := goroutine.Alloc(2)
 	d.OnAcquire(mutexAddr, ctx2)
-	d.OnRead(varAddr, ctx2) // Reads Thread 1's write - NO RACE
+	d.OnRead(varAddr, ctx2, 0) // Reads Thread 1's write - NO RACE
 	d.OnRelease(mutexAddr, ctx2)
 
 	// Verify no races (all accesses happen-before each other via mutex).
@@ -378,7 +378,7 @@ func BenchmarkMutexProtectedAccess(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		d.OnAcquire(mutexAddr, ctx)
-		d.OnWrite(varAddr, ctx)
+		d.OnWrite(varAddr, ctx, 0)
 		d.OnRelease(mutexAddr, ctx)
 	}
 }
@@ -458,13 +458,13 @@ func TestChannelSynchronizedNoRace(t *testing.T) {
 
 	// Thread 0 (sender): Write, then send.
 	sender := goroutine.Alloc(0)
-	d.OnWrite(varAddr, sender)           // Write x = 42
+	d.OnWrite(varAddr, sender, 0)           // Write x = 42
 	d.OnChannelSendAfter(chAddr, sender) // Send on ch
 
 	// Thread 1 (receiver): Receive, then read.
 	receiver := goroutine.Alloc(1)
 	d.OnChannelRecvAfter(chAddr, receiver) // Receive from ch (sees sender's clock!)
-	d.OnRead(varAddr, receiver)            // Read x (should NOT race)
+	d.OnRead(varAddr, receiver, 0)            // Read x (should NOT race)
 
 	// Verify no races detected.
 	if d.RacesDetected() != 0 {
@@ -482,14 +482,14 @@ func TestUnprotectedChannelRaceStillDetected(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		sender.IncrementClock() // Advance sender's clock to 5
 	}
-	d.OnWrite(varAddr, sender) // Write at clock 5 (will increment to 6)
+	d.OnWrite(varAddr, sender, 0) // Write at clock 5 (will increment to 6)
 
 	// Thread 1: Read WITHOUT seeing Thread 0's write (no channel sync).
 	// Thread 1's vector clock for Thread 0 should be 0 (hasn't seen Thread 0's work).
 	// ctx1.C[0] = 0, but write was at clock 6.
 	// Since ctx1.C[0] (0) < write.clock (6), happens-before check fails → RACE!
 	receiver := goroutine.Alloc(1)
-	d.OnRead(varAddr, receiver)
+	d.OnRead(varAddr, receiver, 0)
 
 	// Verify race was detected.
 	if d.RacesDetected() != 1 {
@@ -505,13 +505,13 @@ func TestChannelClose_RecvAfterClose(t *testing.T) {
 
 	// Thread 0 (closer): Write, then close channel.
 	closer := goroutine.Alloc(0)
-	d.OnWrite(varAddr, closer)       // Write x = 42
+	d.OnWrite(varAddr, closer, 0)       // Write x = 42
 	d.OnChannelClose(chAddr, closer) // Close ch (captures clock)
 
 	// Thread 1 (receiver): Receive from closed channel, then read.
 	receiver := goroutine.Alloc(1)
 	d.OnChannelRecvAfter(chAddr, receiver) // Receive from closed ch (sees closer's clock!)
-	d.OnRead(varAddr, receiver)            // Read x (should NOT race)
+	d.OnRead(varAddr, receiver, 0)            // Read x (should NOT race)
 
 	// Verify no races detected.
 	if d.RacesDetected() != 0 {
@@ -531,20 +531,20 @@ func TestMultipleChannels(t *testing.T) {
 	ctx1 := goroutine.Alloc(1)
 
 	// Thread 0: Write var1, send on ch1.
-	d.OnWrite(var1Addr, ctx0)
+	d.OnWrite(var1Addr, ctx0, 0)
 	d.OnChannelSendAfter(ch1Addr, ctx0)
 
 	// Thread 1: Write var2, send on ch2.
-	d.OnWrite(var2Addr, ctx1)
+	d.OnWrite(var2Addr, ctx1, 0)
 	d.OnChannelSendAfter(ch2Addr, ctx1)
 
 	// Thread 1: Receive from ch1 (different channel), read var1 - should NOT race.
 	d.OnChannelRecvAfter(ch1Addr, ctx1)
-	d.OnRead(var1Addr, ctx1)
+	d.OnRead(var1Addr, ctx1, 0)
 
 	// Thread 0: Receive from ch2, read var2 - should NOT race.
 	d.OnChannelRecvAfter(ch2Addr, ctx0)
-	d.OnRead(var2Addr, ctx0)
+	d.OnRead(var2Addr, ctx0, 0)
 
 	// Verify no races (both variables properly synchronized by their channels).
 	if d.RacesDetected() != 0 {
@@ -560,22 +560,22 @@ func TestChannelSequentialSends(t *testing.T) {
 	ctx := goroutine.Alloc(0)
 
 	// First send/recv cycle (same thread for simplicity).
-	d.OnWrite(varAddr, ctx)
+	d.OnWrite(varAddr, ctx, 0)
 	d.OnChannelSendAfter(chAddr, ctx)
 	d.OnChannelRecvAfter(chAddr, ctx)
-	d.OnRead(varAddr, ctx)
+	d.OnRead(varAddr, ctx, 0)
 
 	// Second send/recv cycle.
-	d.OnWrite(varAddr, ctx)
+	d.OnWrite(varAddr, ctx, 0)
 	d.OnChannelSendAfter(chAddr, ctx)
 	d.OnChannelRecvAfter(chAddr, ctx)
-	d.OnRead(varAddr, ctx)
+	d.OnRead(varAddr, ctx, 0)
 
 	// Third send/recv cycle.
-	d.OnWrite(varAddr, ctx)
+	d.OnWrite(varAddr, ctx, 0)
 	d.OnChannelSendAfter(chAddr, ctx)
 	d.OnChannelRecvAfter(chAddr, ctx)
-	d.OnRead(varAddr, ctx)
+	d.OnRead(varAddr, ctx, 0)
 
 	// Verify no races (sequential access, same thread).
 	if d.RacesDetected() != 0 {
@@ -596,20 +596,20 @@ func TestChannelAndMutexTogether(t *testing.T) {
 
 	// Thread 0: Lock mutex, write var1, unlock.
 	d.OnAcquire(mutexAddr, ctx0)
-	d.OnWrite(var1Addr, ctx0)
+	d.OnWrite(var1Addr, ctx0, 0)
 	d.OnRelease(mutexAddr, ctx0)
 
 	// Thread 0: Write var2, send on channel.
-	d.OnWrite(var2Addr, ctx0)
+	d.OnWrite(var2Addr, ctx0, 0)
 	d.OnChannelSendAfter(chAddr, ctx0)
 
 	// Thread 1: Receive from channel, read var2 - should NOT race.
 	d.OnChannelRecvAfter(chAddr, ctx1)
-	d.OnRead(var2Addr, ctx1)
+	d.OnRead(var2Addr, ctx1, 0)
 
 	// Thread 1: Lock mutex, read var1 - should NOT race.
 	d.OnAcquire(mutexAddr, ctx1)
-	d.OnRead(var1Addr, ctx1)
+	d.OnRead(var1Addr, ctx1, 0)
 	d.OnRelease(mutexAddr, ctx1)
 
 	// Verify no races (both mutex and channel work correctly together).
@@ -725,10 +725,10 @@ func BenchmarkChannelSynchronizedAccess(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		d.OnWrite(varAddr, ctx)
+		d.OnWrite(varAddr, ctx, 0)
 		d.OnChannelSendAfter(chAddr, ctx)
 		d.OnChannelRecvAfter(chAddr, ctx)
-		d.OnRead(varAddr, ctx)
+		d.OnRead(varAddr, ctx, 0)
 	}
 }
 
@@ -843,14 +843,14 @@ func TestWaitGroupProtectedNoRace(t *testing.T) {
 	// Child goroutine: write, then Done().
 	childCtx := goroutine.Alloc(1)
 	d.OnWaitGroupAdd(wgAddr, 1, childCtx)
-	d.OnWrite(varAddr, childCtx) // Child writes
+	d.OnWrite(varAddr, childCtx, 0) // Child writes
 	d.OnWaitGroupDone(wgAddr, childCtx)
 
 	// Parent goroutine: Wait(), then read.
 	parentCtx := goroutine.Alloc(0)
 	d.OnWaitGroupWaitBefore(wgAddr, parentCtx)
 	d.OnWaitGroupWaitAfter(wgAddr, parentCtx) // Parent sees child's clock
-	d.OnRead(varAddr, parentCtx)              // Parent reads (should NOT race)
+	d.OnRead(varAddr, parentCtx, 0)              // Parent reads (should NOT race)
 
 	// Verify no races detected.
 	if d.RacesDetected() != 0 {
@@ -872,25 +872,25 @@ func TestWaitGroupMultipleChildren(t *testing.T) {
 
 	// Child 1: Write var1, Done().
 	child1Ctx := goroutine.Alloc(1)
-	d.OnWrite(var1Addr, child1Ctx)
+	d.OnWrite(var1Addr, child1Ctx, 0)
 	d.OnWaitGroupDone(wgAddr, child1Ctx)
 
 	// Child 2: Write var2, Done().
 	child2Ctx := goroutine.Alloc(2)
-	d.OnWrite(var2Addr, child2Ctx)
+	d.OnWrite(var2Addr, child2Ctx, 0)
 	d.OnWaitGroupDone(wgAddr, child2Ctx)
 
 	// Child 3: Write var3, Done().
 	child3Ctx := goroutine.Alloc(3)
-	d.OnWrite(var3Addr, child3Ctx)
+	d.OnWrite(var3Addr, child3Ctx, 0)
 	d.OnWaitGroupDone(wgAddr, child3Ctx)
 
 	// Parent: Wait(), then read all variables.
 	d.OnWaitGroupWaitBefore(wgAddr, parentCtx)
 	d.OnWaitGroupWaitAfter(wgAddr, parentCtx)
-	d.OnRead(var1Addr, parentCtx) // Should NOT race
-	d.OnRead(var2Addr, parentCtx) // Should NOT race
-	d.OnRead(var3Addr, parentCtx) // Should NOT race
+	d.OnRead(var1Addr, parentCtx, 0) // Should NOT race
+	d.OnRead(var2Addr, parentCtx, 0) // Should NOT race
+	d.OnRead(var3Addr, parentCtx, 0) // Should NOT race
 
 	// Verify no races detected.
 	if d.RacesDetected() != 0 {
@@ -913,11 +913,11 @@ func TestWaitGroupUnprotectedStillDetectsRace(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		childCtx.IncrementClock()
 	}
-	d.OnWrite(varAddr, childCtx)
+	d.OnWrite(varAddr, childCtx, 0)
 
 	// Parent goroutine: Read (NO WaitGroup Wait).
 	parentCtx := goroutine.Alloc(0)
-	d.OnRead(varAddr, parentCtx)
+	d.OnRead(varAddr, parentCtx, 0)
 
 	// Verify race was detected (no happens-before established).
 	if d.RacesDetected() != 1 {
@@ -942,7 +942,7 @@ func TestWaitGroupNestedUsage(t *testing.T) {
 
 	// Grandchild: Write, Done(wg2).
 	grandchildCtx := goroutine.Alloc(2)
-	d.OnWrite(varAddr, grandchildCtx)
+	d.OnWrite(varAddr, grandchildCtx, 0)
 	d.OnWaitGroupDone(wg2Addr, grandchildCtx)
 
 	// Child: Wait(wg2), Done(wg1).
@@ -953,7 +953,7 @@ func TestWaitGroupNestedUsage(t *testing.T) {
 	// Parent: Wait(wg1), read.
 	d.OnWaitGroupWaitBefore(wg1Addr, parentCtx)
 	d.OnWaitGroupWaitAfter(wg1Addr, parentCtx)
-	d.OnRead(varAddr, parentCtx)
+	d.OnRead(varAddr, parentCtx, 0)
 
 	// Verify no races (transitivity of happens-before).
 	if d.RacesDetected() != 0 {
@@ -973,7 +973,7 @@ func TestWaitGroupReadAfterWaitNoRace(t *testing.T) {
 
 	// Child 1: Write, Done().
 	child1Ctx := goroutine.Alloc(1)
-	d.OnWrite(varAddr, child1Ctx)
+	d.OnWrite(varAddr, child1Ctx, 0)
 	d.OnWaitGroupDone(wgAddr, child1Ctx)
 
 	// Child 2: Done() (no write).
@@ -983,7 +983,7 @@ func TestWaitGroupReadAfterWaitNoRace(t *testing.T) {
 	// Parent: Wait(), read.
 	d.OnWaitGroupWaitBefore(wgAddr, parentCtx)
 	d.OnWaitGroupWaitAfter(wgAddr, parentCtx)
-	d.OnRead(varAddr, parentCtx)
+	d.OnRead(varAddr, parentCtx, 0)
 
 	// Verify no races.
 	if d.RacesDetected() != 0 {
@@ -1000,20 +1000,20 @@ func TestWaitGroupMultipleWaits(t *testing.T) {
 	// Child: Add(1), Write, Done().
 	childCtx := goroutine.Alloc(1)
 	d.OnWaitGroupAdd(wgAddr, 1, childCtx)
-	d.OnWrite(varAddr, childCtx)
+	d.OnWrite(varAddr, childCtx, 0)
 	d.OnWaitGroupDone(wgAddr, childCtx)
 
 	// Parent 1: Wait(), read.
 	parent1Ctx := goroutine.Alloc(0)
 	d.OnWaitGroupWaitBefore(wgAddr, parent1Ctx)
 	d.OnWaitGroupWaitAfter(wgAddr, parent1Ctx)
-	d.OnRead(varAddr, parent1Ctx)
+	d.OnRead(varAddr, parent1Ctx, 0)
 
 	// Parent 2: Wait(), read (should also be safe).
 	parent2Ctx := goroutine.Alloc(2)
 	d.OnWaitGroupWaitBefore(wgAddr, parent2Ctx)
 	d.OnWaitGroupWaitAfter(wgAddr, parent2Ctx)
-	d.OnRead(varAddr, parent2Ctx)
+	d.OnRead(varAddr, parent2Ctx, 0)
 
 	// Verify no races (both parents see child's write).
 	if d.RacesDetected() != 0 {
@@ -1094,11 +1094,11 @@ func BenchmarkWaitGroupSynchronizedAccess(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		d.OnWaitGroupAdd(wgAddr, 1, parentCtx)
-		d.OnWrite(varAddr, childCtx)
+		d.OnWrite(varAddr, childCtx, 0)
 		d.OnWaitGroupDone(wgAddr, childCtx)
 		d.OnWaitGroupWaitBefore(wgAddr, parentCtx)
 		d.OnWaitGroupWaitAfter(wgAddr, parentCtx)
-		d.OnRead(varAddr, parentCtx)
+		d.OnRead(varAddr, parentCtx, 0)
 		// Reset for next iteration.
 		d.Reset()
 	}
