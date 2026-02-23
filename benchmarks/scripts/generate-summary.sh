@@ -517,8 +517,3 @@ emit ""
 # ---------------------------------------------------------------------------
 
 printf '%s' "$OUTPUT"
-
-# Write to GITHUB_STEP_SUMMARY if available
-if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-    printf '%s' "$OUTPUT" >> "$GITHUB_STEP_SUMMARY"
-fi
