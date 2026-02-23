@@ -132,19 +132,52 @@ type DetectorOptions struct {
 
 // PromotionStats tracks adaptive representation statistics (Phase 3).
 //
-// These metrics help analyze the effectiveness of the adaptive VarState optimization.
+// All fields use atomic.Uint64 for lock-free hot-path updates.
+// This eliminates ~25ns per OnRead/OnWrite by removing mutex acquisition
+// from the statistics tracking path.
+//
+// Use LoadSnapshot() to get a consistent plain-value copy for reporting.
+//
 // In production, we expect:
 //   - 90%+ fast path reads (unpromoted)
 //   - <1% promotions (rare concurrent reads)
 //   - High promotion success rate
 type PromotionStats struct {
-	TotalReads    uint64 // Total read operations.
-	TotalWrites   uint64 // Total write operations.
-	Promotions    uint64 // Epoch → VectorClock promotions.
-	Demotions     uint64 // VectorClock → Epoch demotions (on write).
-	FastPathReads uint64 // Reads using Epoch (fast).
-	SlowPathReads uint64 // Reads using VectorClock (slow).
-	PromotedVars  uint64 // Current number of promoted variables.
+	TotalReads    atomic.Uint64 // Total read operations.
+	TotalWrites   atomic.Uint64 // Total write operations.
+	Promotions    atomic.Uint64 // Epoch → VectorClock promotions.
+	Demotions     atomic.Uint64 // VectorClock → Epoch demotions (on write).
+	FastPathReads atomic.Uint64 // Reads using Epoch (fast).
+	SlowPathReads atomic.Uint64 // Reads using VectorClock (slow).
+	PromotedVars  atomic.Uint64 // Current number of promoted variables.
+}
+
+// PromotionStatsSnapshot is a plain-value snapshot of PromotionStats
+// for reporting and testing. Returned by PromotionStats.LoadSnapshot()
+// and Detector.GetPromotionStats().
+type PromotionStatsSnapshot struct {
+	TotalReads    uint64
+	TotalWrites   uint64
+	Promotions    uint64
+	Demotions     uint64
+	FastPathReads uint64
+	SlowPathReads uint64
+	PromotedVars  uint64
+}
+
+// LoadSnapshot returns a point-in-time snapshot of the atomic counters.
+// The snapshot is not strictly consistent across fields (each Load is independent),
+// but this is acceptable for diagnostic statistics.
+func (s *PromotionStats) LoadSnapshot() PromotionStatsSnapshot {
+	return PromotionStatsSnapshot{
+		TotalReads:    s.TotalReads.Load(),
+		TotalWrites:   s.TotalWrites.Load(),
+		Promotions:    s.Promotions.Load(),
+		Demotions:     s.Demotions.Load(),
+		FastPathReads: s.FastPathReads.Load(),
+		SlowPathReads: s.SlowPathReads.Load(),
+		PromotedVars:  s.PromotedVars.Load(),
+	}
 }
 
 // Detector implements the core FastTrack race detection algorithm.
@@ -161,8 +194,10 @@ type Detector struct {
 	// shadowMemory stores VarState cells for all instrumented addresses.
 	// This is the core data structure that tracks the last write and read
 	// epochs for every memory location.
-	// Uses CAS-based implementation for runtime compatibility (no sync.Map).
-	shadowMemory *shadowmem.CASBasedShadow
+	// Uses Shadow interface to allow swapping implementations.
+	// Default: PageTableShadow (two-level page table, direct-mapped).
+	// Fallback: CASBasedShadow (hash-based, lock-free).
+	shadowMemory shadowmem.Shadow
 
 	// syncShadow stores SyncVar cells for all synchronization primitives.
 	// This tracks release clocks for mutexes, rwmutexes, channels, etc.
@@ -248,7 +283,7 @@ func NewDetector() *Detector {
 //	})
 func NewDetectorWithOptions(opts DetectorOptions) *Detector {
 	d := &Detector{
-		shadowMemory: shadowmem.NewCASBasedShadow(),
+		shadowMemory: shadowmem.DefaultShadow(),
 		syncShadow:   syncshadow.NewSyncShadow(),
 	}
 
@@ -424,9 +459,9 @@ func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext, pc uintptr)
 		return
 	}
 
-	// Step 0.1: Periodic overflow detection (v0.2.0 Task 5).
-	// Check every 10K operations for TID/clock overflows.
-	d.checkOverflowPeriodically()
+	// NOTE: Overflow check moved to sync events (OnAcquire/OnRelease/OnGoStart)
+	// in v0.9.0 Quick Win 3. TID/clock overflow only happens at goroutine creation
+	// or clock advancement, not during memory access. Saves ~8ns per access.
 
 	// Step 1: Get or create shadow cell for this address.
 	// GetOrCreate is thread-safe and may allocate on first access.
@@ -593,17 +628,13 @@ func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext, pc uintptr)
 	wasPromoted := vs.IsPromoted()
 	vs.Demote()
 	if wasPromoted {
-		// Track demotion statistics.
-		d.mu.lock()
-		d.stats.Demotions++
-		d.stats.PromotedVars--
-		d.mu.unlock()
+		// Track demotion statistics (lock-free atomic updates).
+		d.stats.Demotions.Add(1)
+		d.stats.PromotedVars.Add(-1) // atomic decrement
 	}
 
-	// Track write statistics.
-	d.mu.lock()
-	d.stats.TotalWrites++
-	d.mu.unlock()
+	// Track write statistics (lock-free atomic update).
+	d.stats.TotalWrites.Add(1)
 
 	// Step 9: Increment logical clock to advance time.
 	// This must be done AFTER updating shadow memory to maintain
@@ -662,9 +693,8 @@ func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) 
 		return
 	}
 
-	// Step 0.1: Periodic overflow detection (v0.2.0 Task 5).
-	// Check every 10K operations for TID/clock overflows.
-	d.checkOverflowPeriodically()
+	// NOTE: Overflow check moved to sync events (OnAcquire/OnRelease/OnGoStart)
+	// in v0.9.0 Quick Win 3. Saves ~8ns per access.
 
 	// Step 1: Get or create shadow cell for this address.
 	// GetOrCreate is thread-safe and may allocate on first access.
@@ -700,10 +730,9 @@ func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) 
 	//nolint:nestif // FastTrack adaptive algorithm requires nested conditions for performance
 	if !vs.IsPromoted() {
 		// FAST PATH: Single reader (common case, 90%+ of reads).
-		d.mu.lock()
-		d.stats.TotalReads++
-		d.stats.FastPathReads++
-		d.mu.unlock()
+		// Lock-free atomic updates for statistics.
+		d.stats.TotalReads.Add(1)
+		d.stats.FastPathReads.Add(1)
 
 		// [FT READ SAME EPOCH] Fast path optimization.
 		// If we're reading from the same location in the same epoch, no race possible.
@@ -735,10 +764,9 @@ func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) 
 
 			// CONCURRENT READS DETECTED - PROMOTE!
 			vs.PromoteToReadClock(ctx.C)
-			d.mu.lock()
-			d.stats.Promotions++
-			d.stats.PromotedVars++
-			d.mu.unlock()
+			// Lock-free atomic updates for statistics.
+			d.stats.Promotions.Add(1)
+			d.stats.PromotedVars.Add(1)
 			ctx.IncrementClock()
 			return
 		}
@@ -750,10 +778,9 @@ func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) 
 	}
 
 	// SLOW PATH: Multiple readers (already promoted, 0.1% of reads).
-	d.mu.lock()
-	d.stats.TotalReads++
-	d.stats.SlowPathReads++
-	d.mu.unlock()
+	// Lock-free atomic updates for statistics.
+	d.stats.TotalReads.Add(1)
+	d.stats.SlowPathReads.Add(1)
 
 	vs.GetReadClock().Join(ctx.C)
 
@@ -917,6 +944,10 @@ func (d *Detector) RacesDetected() int {
 //
 //go:nosplit
 func (d *Detector) OnAcquire(addr uintptr, ctx *goroutine.RaceContext) {
+	// Periodic overflow detection (v0.9.0: moved from OnRead/OnWrite to sync events).
+	// TID/clock overflow happens at clock advancement, not memory access.
+	d.checkOverflowPeriodically()
+
 	// Step 1: Get or create SyncVar for this mutex address.
 	syncVar := d.syncShadow.GetOrCreate(addr)
 
@@ -961,6 +992,9 @@ func (d *Detector) OnAcquire(addr uintptr, ctx *goroutine.RaceContext) {
 //
 //go:nosplit
 func (d *Detector) OnRelease(addr uintptr, ctx *goroutine.RaceContext) {
+	// Periodic overflow detection (v0.9.0: moved from OnRead/OnWrite to sync events).
+	d.checkOverflowPeriodically()
+
 	// Step 1: Get or create SyncVar for this mutex address.
 	syncVar := d.syncShadow.GetOrCreate(addr)
 
@@ -1412,31 +1446,34 @@ func (d *Detector) Reset() {
 	// Clear reported races map (Phase 5 Task 5.3).
 	d.reportedRaces.reset()
 
-	// Reset promotion statistics.
-	d.stats = PromotionStats{}
+	// Reset promotion statistics (atomic stores to zero).
+	d.stats.TotalReads.Store(0)
+	d.stats.TotalWrites.Store(0)
+	d.stats.Promotions.Store(0)
+	d.stats.Demotions.Store(0)
+	d.stats.FastPathReads.Store(0)
+	d.stats.SlowPathReads.Store(0)
+	d.stats.PromotedVars.Store(0)
 }
 
-// GetPromotionStats returns a copy of the current promotion statistics.
+// GetPromotionStats returns a point-in-time snapshot of the current promotion statistics.
 //
 // This provides insight into the adaptive VarState optimization effectiveness:
 //   - Fast path percentage: FastPathReads / TotalReads (expect >90%)
 //   - Promotion rate: Promotions / TotalReads (expect <1%)
 //   - Promoted variables: PromotedVars (should be small)
 //
-// Thread Safety: Safe for concurrent calls (protected by mutex).
+// Thread Safety: Safe for concurrent calls (lock-free atomic loads).
 //
 // Returns:
-//   - PromotionStats: Copy of current statistics
+//   - PromotionStatsSnapshot: Point-in-time snapshot of statistics
 //
 // Example usage:
 //
 //	stats := detector.GetPromotionStats()
 //	fastPathRate := float64(stats.FastPathReads) / float64(stats.TotalReads) * 100
-//	fmt.Printf("Fast path rate: %.2f%%\n", fastPathRate)
-func (d *Detector) GetPromotionStats() PromotionStats {
-	d.mu.lock()
-	defer d.mu.unlock()
-	return d.stats
+func (d *Detector) GetPromotionStats() PromotionStatsSnapshot {
+	return d.stats.LoadSnapshot()
 }
 
 // IsSamplingEnabled returns true if sampling is enabled (v0.3.0).

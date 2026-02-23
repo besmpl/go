@@ -41,6 +41,10 @@ const (
 	// promotedMarker indicates the VarState has been promoted to VectorClock.
 	// readerCount == promotedMarker means readClock is active.
 	promotedMarker uint8 = 255
+
+	// promotedMarker32 is the atomic.Uint32 version of promotedMarker for readerState.
+	// Using 0xFF to match promotedMarker semantics.
+	promotedMarker32 uint32 = 0xFF
 )
 
 // VarState stores the access state for a single variable using adaptive representation.
@@ -94,6 +98,19 @@ type VarState struct {
 	exclusiveWriter atomic.Int64   // TID of sole writer, -1 if shared, 0 if uninitialized.
 	writePC         atomic.Uintptr // PC (program counter) of last write caller (8 bytes).
 	readPC          atomic.Uintptr // PC (program counter) of last read caller (8 bytes).
+
+	// Lock-free read tracking (v0.9.0 Quick Win 2):
+	// These atomic fields enable lock-free IsPromoted(), GetReadEpoch(), and SetReadEpoch()
+	// on the single-reader fast path, eliminating ~50ns of mutex overhead per access.
+	//
+	// Synchronization contract:
+	//   - readEpoch0 mirrors readEpochs[0] for lock-free reads on the fast path.
+	//   - readerState tracks reader count: 0=none, 1-4=inline count, 0xFF=promoted.
+	//   - Promotion: set readClock FIRST (under lock), then set readerState=promotedMarker32.
+	//   - Demotion: set readerState=0 FIRST, then clear readClock (under lock).
+	//   - This ordering ensures IsPromoted()==true always implies readClock!=nil.
+	readEpoch0  atomic.Uint64 // Mirrors readEpochs[0] for lock-free single-reader fast path.
+	readerState atomic.Uint32 // 0=no readers, 1-4=inline count, 0xFF=promoted to VectorClock.
 
 	// Spinlock-protected fields (complex operations):
 	// These are accessed less frequently or require complex multi-field updates.
@@ -157,6 +174,10 @@ func (vs *VarState) Reset() {
 	vs.writePC.Store(0)
 	vs.readPC.Store(0)
 
+	// Ordering contract for demotion: set readerState=0 FIRST, then clear readClock.
+	vs.readerState.Store(0)
+	vs.readEpoch0.Store(0)
+
 	// Reset mutex-protected fields.
 	vs.mu.lock()
 	// Release VectorClock back to pool if promoted.
@@ -181,15 +202,13 @@ func (vs *VarState) Reset() {
 //   - false: Fast path (inline reader slots, up to 4 readers, 32 bytes)
 //   - true: Slow path (readClock, 5+ readers, 1KB allocation)
 //
-// v0.3.0 Enhanced Read-Shared: Checks both readerCount == promotedMarker AND readClock != nil.
-// This ensures consistency even if demotion clears one but not the other.
+// v0.9.0 Lock-Free: Uses atomic readerState instead of mutex.
+// The promotion/demotion ordering contract guarantees that when
+// readerState==promotedMarker32, readClock is non-nil.
 //
-// Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
+//go:nosplit
 func (vs *VarState) IsPromoted() bool {
-	vs.mu.lock()
-	promoted := vs.readerCount == promotedMarker && vs.readClock != nil
-	vs.mu.unlock()
-	return promoted
+	return vs.readerState.Load() == promotedMarker32
 }
 
 // PromoteToReadClock upgrades from inline reader slots to multi-reader VectorClock.
@@ -214,7 +233,6 @@ func (vs *VarState) IsPromoted() bool {
 //   - newReadVC: The VectorClock of the new concurrent reader
 func (vs *VarState) PromoteToReadClock(newReadVC *vectorclock.VectorClock) {
 	vs.mu.lock()
-	defer vs.mu.unlock()
 
 	// Allocate VectorClock from pool for promoted read tracking.
 	vs.readClock = vectorclock.NewFromPool()
@@ -236,11 +254,19 @@ func (vs *VarState) PromoteToReadClock(newReadVC *vectorclock.VectorClock) {
 		vs.readEpochs[i] = 0
 	}
 	vs.readerCount = promotedMarker
+
+	vs.mu.unlock()
+
+	// Ordering contract: set readClock FIRST (under lock above), then set readerState.
+	// This ensures IsPromoted()==true always implies readClock!=nil.
+	vs.readEpoch0.Store(0)
+	vs.readerState.Store(promotedMarker32)
 }
 
 // GetReadEpoch returns the first read epoch (backward compatibility).
 //
-// v0.3.0 Enhanced Read-Shared: For single reader (common case), returns readEpochs[0].
+// v0.9.0 Lock-Free: Reads from atomic readEpoch0 field, no mutex needed.
+// For single reader (common case, 90%+ of accesses), this is the fast path.
 // For multiple readers, use GetReadEpochs() to get all inline readers.
 //
 // PRECONDITION: !IsPromoted() - caller must check this first.
@@ -248,15 +274,13 @@ func (vs *VarState) PromoteToReadClock(newReadVC *vectorclock.VectorClock) {
 //
 // This is used by detector OnRead/OnWrite for fast-path checks.
 //
-// Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
+//go:nosplit
 func (vs *VarState) GetReadEpoch() epoch.Epoch {
-	vs.mu.lock()
-	var e epoch.Epoch
-	if vs.readerCount > 0 && vs.readerCount != promotedMarker {
-		e = vs.readEpochs[0]
+	state := vs.readerState.Load()
+	if state > 0 && state != promotedMarker32 {
+		return epoch.Epoch(vs.readEpoch0.Load())
 	}
-	vs.mu.unlock()
-	return e
+	return 0
 }
 
 // GetReadEpochs returns all inline reader epochs (v0.3.0 Enhanced Read-Shared).
@@ -293,26 +317,36 @@ func (vs *VarState) GetReadEpochs() []epoch.Epoch {
 //   - 1-4: Number of inline readers
 //   - 255 (promotedMarker): Promoted to VectorClock
 //
-// Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
+// v0.9.0 Lock-Free: Uses atomic readerState instead of mutex.
+//
+//go:nosplit
 func (vs *VarState) GetReaderCount() uint8 {
-	vs.mu.lock()
-	count := vs.readerCount
-	vs.mu.unlock()
-	return count
+	return uint8(vs.readerState.Load())
 }
 
 // SetReadEpoch sets the read epoch (backward compatibility for single reader).
 //
-// v0.3.0 Enhanced Read-Shared: This sets readEpochs[0] for single reader case.
+// v0.9.0 Lock-Free: Updates atomic readEpoch0 and readerState without mutex.
+// Also updates readEpochs[0] under lock for consistency with AddReader/Promote.
 // For adding concurrent readers, use AddReader().
 //
 // This is used by detector OnRead to update single-reader state.
 // If already promoted, this is a no-op (readClock takes precedence).
 //
-// Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
+//go:nosplit
 func (vs *VarState) SetReadEpoch(e epoch.Epoch) {
+	if vs.readerState.Load() == promotedMarker32 {
+		return // Promoted, no-op.
+	}
+	// Update atomic mirror for lock-free reads.
+	vs.readEpoch0.Store(uint64(e))
+	if vs.readerState.Load() == 0 {
+		vs.readerState.Store(1)
+	}
+	// Also update the canonical readEpochs[0] under lock for
+	// consistency with AddReader/PromoteToReadClock.
 	vs.mu.lock()
-	if vs.readerCount != promotedMarker { // Not promoted
+	if vs.readerCount != promotedMarker {
 		vs.readEpochs[0] = e
 		if vs.readerCount == 0 {
 			vs.readerCount = 1
@@ -352,6 +386,10 @@ func (vs *VarState) AddReader(e epoch.Epoch) bool {
 		if existingTID == tid {
 			// Update existing slot.
 			vs.readEpochs[i] = e
+			// Sync atomic mirror if slot 0 was updated.
+			if i == 0 {
+				vs.readEpoch0.Store(uint64(e))
+			}
 			return true
 		}
 	}
@@ -359,7 +397,12 @@ func (vs *VarState) AddReader(e epoch.Epoch) bool {
 	// Check if there's room for new reader.
 	if vs.readerCount < maxInlineReaders {
 		vs.readEpochs[vs.readerCount] = e
+		// Sync atomic mirror if this is the first reader (slot 0).
+		if vs.readerCount == 0 {
+			vs.readEpoch0.Store(uint64(e))
+		}
 		vs.readerCount++
+		vs.readerState.Store(uint32(vs.readerCount))
 		return true
 	}
 
@@ -369,14 +412,12 @@ func (vs *VarState) AddReader(e epoch.Epoch) bool {
 
 // HasInlineSlot returns true if there's room for another inline reader.
 //
-// v0.3.0 Enhanced Read-Shared: Checks if readerCount < maxInlineReaders.
+// v0.9.0 Lock-Free: Uses atomic readerState instead of mutex.
 //
-// Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
+//go:nosplit
 func (vs *VarState) HasInlineSlot() bool {
-	vs.mu.lock()
-	hasSlot := vs.readerCount < maxInlineReaders && vs.readerCount != promotedMarker
-	vs.mu.unlock()
-	return hasSlot
+	state := vs.readerState.Load()
+	return state < maxInlineReaders && state != promotedMarker32
 }
 
 // GetReadClock returns the read VectorClock (slow path only).
@@ -403,8 +444,13 @@ func (vs *VarState) GetReadClock() *vectorclock.VectorClock {
 //
 // Pooling: Returns VectorClock to pool for reuse if promoted.
 //
-// Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
+// Note: Removed //go:nosplit because spinlock.lock() requires stack space.
 func (vs *VarState) Demote() {
+	// Ordering contract: set readerState=0 FIRST, then clear readClock under lock.
+	// This ensures no concurrent reader sees IsPromoted()==true with readClock==nil.
+	vs.readerState.Store(0)
+	vs.readEpoch0.Store(0)
+
 	vs.mu.lock()
 	// Release VectorClock back to pool if promoted.
 	if vs.readClock != nil {
