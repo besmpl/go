@@ -234,6 +234,11 @@ func (vs *VarState) IsPromoted() bool {
 func (vs *VarState) PromoteToReadClock(newReadVC *vectorclock.VectorClock) {
 	vs.mu.lock()
 
+	// Sync slot 0 from atomic mirror before copying to VectorClock.
+	if vs.readerCount > 0 {
+		vs.readEpochs[0] = epoch.Epoch(vs.readEpoch0.Load())
+	}
+
 	// Allocate VectorClock from pool for promoted read tracking.
 	vs.readClock = vectorclock.NewFromPool()
 
@@ -324,13 +329,13 @@ func (vs *VarState) GetReaderCount() uint8 {
 	return uint8(vs.readerState.Load())
 }
 
-// SetReadEpoch sets the read epoch (backward compatibility for single reader).
+// SetReadEpoch sets the read epoch for single-reader fast path.
 //
-// v0.9.0 Lock-Free: Updates atomic readEpoch0 and readerState without mutex.
-// Also updates readEpochs[0] under lock for consistency with AddReader/Promote.
-// For adding concurrent readers, use AddReader().
+// v0.9.0 Lock-Free: Fully atomic, no spinlock. Updates readEpoch0 and
+// readerState atomically. The readEpochs[0] backing field is synced lazily
+// in AddReader when a second reader appears (rare path).
 //
-// This is used by detector OnRead to update single-reader state.
+// This is the HOT PATH for OnRead — called on every single-reader access.
 // If already promoted, this is a no-op (readClock takes precedence).
 //
 //go:nosplit
@@ -338,21 +343,11 @@ func (vs *VarState) SetReadEpoch(e epoch.Epoch) {
 	if vs.readerState.Load() == promotedMarker32 {
 		return // Promoted, no-op.
 	}
-	// Update atomic mirror for lock-free reads.
+	// Fully atomic update — no spinlock needed for single-reader case.
 	vs.readEpoch0.Store(uint64(e))
 	if vs.readerState.Load() == 0 {
 		vs.readerState.Store(1)
 	}
-	// Also update the canonical readEpochs[0] under lock for
-	// consistency with AddReader/PromoteToReadClock.
-	vs.mu.lock()
-	if vs.readerCount != promotedMarker {
-		vs.readEpochs[0] = e
-		if vs.readerCount == 0 {
-			vs.readerCount = 1
-		}
-	}
-	vs.mu.unlock()
 }
 
 // AddReader adds or updates a reader in the inline slots (v0.3.0 Enhanced Read-Shared).
@@ -376,6 +371,13 @@ func (vs *VarState) AddReader(e epoch.Epoch) bool {
 	// Already promoted - let VectorClock handle it.
 	if vs.readerCount == promotedMarker {
 		return true
+	}
+
+	// Sync slot 0 from atomic mirror: SetReadEpoch updates only the atomic
+	// readEpoch0 field (lock-free hot path). Sync it here before iterating
+	// slots, so that AddReader and PromoteToReadClock see the latest value.
+	if vs.readerCount > 0 {
+		vs.readEpochs[0] = epoch.Epoch(vs.readEpoch0.Load())
 	}
 
 	tid, _ := e.Decode()
