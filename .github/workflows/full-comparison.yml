@@ -20,7 +20,7 @@ permissions:
   contents: read
 
 env:
-  BENCH_COUNT: ${{ inputs.count || '10' }}
+  BENCH_COUNT: ${{ inputs.count || '3' }}
   BENCH_TIME: ${{ inputs.benchtime || '1s' }}
 
 jobs:
