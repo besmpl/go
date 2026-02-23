@@ -14,20 +14,21 @@ package vectorclock
 // No external imports - runtime-compatible.
 
 const (
-	// MaxThreads is the maximum number of concurrent threads supported.
+	// MaxThreads is the maximum number of concurrent threads (goroutines) supported.
 	// This is a fixed-size array for zero-allocation operation.
 	//
-	// 65,536 threads = 16-bit TID space (sufficient for 99%+ of real programs).
-	// Memory: 65,536 × 4 bytes = 262,144 bytes = 256KB per VectorClock.
+	// 1,024 threads = 10-bit TID space (sufficient for 99%+ of real programs).
+	// Memory: 1,024 × 4 bytes = 4,096 bytes = 4KB per VectorClock.
 	//
 	// Trade-off:
-	//   - Pro: Supports up to 65K concurrent goroutines (vs 256 in MVP).
-	//   - Con: 256KB per VectorClock (vs 1KB in MVP) - 256x memory increase.
-	//   - Mitigation: VectorClock only allocated for read-shared variables (rare).
-	//     FastTrack's adaptive algorithm keeps most variables in Epoch mode (8 bytes).
+	//   - Pro: 64x less memory than 65536 (4KB vs 256KB per VectorClock).
+	//   - Pro: Fits in L1 cache for fast Join/LessOrEqual.
+	//   - Con: Programs with >1023 concurrent goroutines hit TID pool exhaustion.
+	//   - Mitigation: TID recycling (FIFO) handles short-lived goroutines.
+	//     Most programs have <500 concurrent goroutines.
 	//
-	// v0.4 will add dynamic TID mapping for unlimited goroutines with compact storage.
-	MaxThreads = 65536
+	// Comparison: TSAN uses 256 thread slots. 1024 is 4x TSAN's capacity.
+	MaxThreads = 1024
 )
 
 // NOTE: sync.Pool is not available in runtime context.

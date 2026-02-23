@@ -146,8 +146,8 @@ var (
 
 	// maxClockAtFree records the maximum clock value each TID reached before being freed.
 	// The next goroutine assigned this TID must start its clock above this value.
-	// Size: 65536 * 4 bytes = 256KB.
-	maxClockAtFree [65536]uint32
+	// Size: MaxThreads * 4 bytes = 4KB.
+	maxClockAtFree [vectorclock.MaxThreads]uint32
 
 	// tidToGIDMap maps TID back to GID for cleanup verification.
 	// Key: uint16 (TID), Value: int64 (GID).
@@ -269,7 +269,7 @@ func (m *contextsMapType) Reset() {
 
 // tidToGIDMapType is a CAS-based map from uint16 (TID) to int64 (GID).
 type tidToGIDMapType struct {
-	cells [65536]atomic.Int64 // Direct indexed by TID
+	cells [vectorclock.MaxThreads]atomic.Int64 // Direct indexed by TID
 }
 
 func (m *tidToGIDMapType) Store(tid uint16, gid int64) {
@@ -1409,7 +1409,7 @@ func getCurrentContext() *goroutine.RaceContext {
 // This is called once during Init() to set up the free TID stack.
 // All 256 TIDs are initially available for allocation.
 //
-// TIDs are stored in ascending order [1, 2, ..., 65535] so allocation
+// TIDs are stored in ascending order [1, 2, ..., MaxThreads-1] so allocation
 // proceeds 1, 2, 3, ... via FIFO pop from front.
 //
 // CRITICAL: TID 0 is RESERVED as "no owner" sentinel in SmartTrack
@@ -1422,11 +1422,13 @@ func initTIDPool() {
 	tidPoolMu.lock()
 	defer tidPoolMu.unlock()
 
-	// Initialize free TID pool with TIDs [1, 2, ..., 65535].
+	// Initialize free TID pool with TIDs [1, 2, ..., MaxThreads-1].
 	// TID 0 is excluded — it serves as "no exclusive writer" sentinel.
-	freeTIDs = make([]uint16, 65535)
-	for i := 0; i < 65535; i++ {
-		//nolint:gosec // G115: Safe conversion, i+1 is always <= 65535
+	// TIDs must be < vectorclock.MaxThreads to fit in VectorClock array.
+	maxTID := vectorclock.MaxThreads - 1
+	freeTIDs = make([]uint16, maxTID)
+	for i := 0; i < maxTID; i++ {
+		//nolint:gosec // G115: Safe conversion, i+1 is always <= MaxThreads-1
 		freeTIDs[i] = uint16(i + 1)
 	}
 }
@@ -1444,7 +1446,7 @@ func initTIDPool() {
 //  3. If empty, trigger cleanup and retry
 //  4. Graceful degradation if all TIDs exhausted
 //
-// Pool depletion warning: When fewer than 100 TIDs remain (~0.15% of 65535),
+// Pool depletion warning: When fewer than 50 TIDs remain (~5% of MaxThreads),
 // a warning is printed. This is a meaningful indicator of ACTUAL exhaustion,
 // as opposed to TID-value-based warnings which fire falsely with FIFO recycling.
 //
@@ -1456,10 +1458,10 @@ func allocTID() (uint16, uint32) {
 
 	// Fast path: TID available in pool.
 	if len(freeTIDs) > 0 {
-		// Warn once when pool is nearly depleted (< 100 TIDs remaining, ~0.15% of 65535).
+		// Warn once when pool is nearly depleted (< 50 TIDs remaining, ~5% of MaxThreads).
 		// This indicates real TID exhaustion, not just high TID values from FIFO cycling.
 		// The warning fires only once to avoid spamming on every allocTID() call.
-		if len(freeTIDs) < 100 && tidPoolWarningShown.CompareAndSwap(0, 1) {
+		if len(freeTIDs) < 50 && tidPoolWarningShown.CompareAndSwap(0, 1) {
 			printstring("WARNING: race detector TID pool nearly exhausted (< 100 TIDs remaining)\n")
 		}
 		tid := freeTIDs[0]
@@ -1909,7 +1911,7 @@ func Reset() {
 	spawnContextsMu.unlock()
 	nextSpawnID.Store(0)
 	// Reset maxClockAtFree for clean state.
-	maxClockAtFree = [65536]uint32{}
+	maxClockAtFree = [vectorclock.MaxThreads]uint32{}
 	// Reinitialize TID pool for tests.
 	// Tests call Reset() but expect to be able to allocate TIDs afterwards.
 	initTIDPool()
@@ -1989,7 +1991,7 @@ func Init() {
 	initTIDPool()
 
 	// Reset maxClockAtFree for clean state.
-	maxClockAtFree = [65536]uint32{}
+	maxClockAtFree = [vectorclock.MaxThreads]uint32{}
 
 	// Allocate RaceContext for the main goroutine.
 	// CRITICAL: Main goroutine gets TID=1, NOT TID=0.
@@ -2007,9 +2009,9 @@ func Init() {
 	// TID 0: Already excluded by initTIDPool() (reserved as sentinel)
 	// TID 1: Already allocated to main goroutine above
 	tidPoolMu.lock()
-	// Pool is [1, 2, 3, ..., 65535]. Remove first element (TID 1).
+	// Pool is [1, 2, 3, ..., MaxThreads-1]. Remove first element (TID 1).
 	if len(freeTIDs) >= 1 && freeTIDs[0] == 1 {
-		freeTIDs = freeTIDs[1:] // Now: [2, 3, 4, ..., 65535]
+		freeTIDs = freeTIDs[1:] // Now: [2, 3, 4, ..., MaxThreads-1]
 	}
 	tidPoolMu.unlock()
 

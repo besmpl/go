@@ -30,27 +30,11 @@ jobs:
         with:
           go-version: '1.26'
 
-      - name: Cache go-race toolchain
-        id: cache-toolchain
-        uses: actions/cache@v4
-        with:
-          path: |
-            bin
-            pkg
-          key: go-race-toolchain-${{ runner.os }}-${{ hashFiles('src/cmd/**', 'src/internal/buildcfg/**', 'src/internal/goarch/**', 'src/internal/goos/**', 'src/VERSION') }}
-
-      - name: Build go-race toolchain (full — cache miss)
-        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+      - name: Build go-race toolchain
         env:
           CGO_ENABLED: 0
         run: |
           cd src && GOROOT_BOOTSTRAP=$(go env GOROOT) ./make.bash
-
-      - name: Rebuild runtime packages (fast — cache hit)
-        if: steps.cache-toolchain.outputs.cache-hit == 'true'
-        run: |
-          export GOROOT=$(pwd)
-          CGO_ENABLED=0 ./bin/go install std
 
       - name: Run Kolkov benchmarks
         run: |
