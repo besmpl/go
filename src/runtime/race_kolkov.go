@@ -225,6 +225,12 @@ func racereadpc(addr unsafe.Pointer, callpc, pc uintptr) {
 	if gp == nil || gp.m == nil || gp.m.curg == nil {
 		return
 	}
+	if gp != gp.m.curg {
+		// Running on g0/gsignal — suppress to prevent detector re-entrancy.
+		// Without this, detector allocations on g0 trigger racewrite which
+		// re-enters the detector, causing cascading false positives.
+		return
+	}
 	if gp.raceignore != 0 {
 		return
 	}
@@ -252,6 +258,12 @@ func racereadpc(addr unsafe.Pointer, callpc, pc uintptr) {
 func racewritepc(addr unsafe.Pointer, callpc, pc uintptr) {
 	gp := getg()
 	if gp == nil || gp.m == nil || gp.m.curg == nil {
+		return
+	}
+	if gp != gp.m.curg {
+		// Running on g0/gsignal — suppress to prevent detector re-entrancy.
+		// Without this, detector allocations on g0 trigger racewrite which
+		// re-enters the detector, causing cascading false positives.
 		return
 	}
 	if gp.raceignore != 0 {
@@ -515,6 +527,9 @@ func racereadrangepc(addr unsafe.Pointer, sz, callpc, pc uintptr) {
 //go:nosplit
 func raceacquire(addr unsafe.Pointer) {
 	gp := getg()
+	if gp != gp.m.curg {
+		return
+	}
 	if gp.raceignore != 0 {
 		return
 	}
@@ -603,6 +618,9 @@ func raceacquirectx(racectx uintptr, addr unsafe.Pointer) {
 //go:nosplit
 func racerelease(addr unsafe.Pointer) {
 	gp := getg()
+	if gp != gp.m.curg {
+		return
+	}
 	if gp.raceignore != 0 {
 		return
 	}
@@ -687,6 +705,9 @@ func racereleaseacquireg(gp *g, addr unsafe.Pointer) {
 //go:nosplit
 func racereleasemerge(addr unsafe.Pointer) {
 	gp := getg()
+	if gp != gp.m.curg {
+		return
+	}
 	if gp.raceignore != 0 {
 		return
 	}
@@ -754,6 +775,12 @@ func raceread(addr uintptr) {
 	if gp == nil || gp.m == nil || gp.m.curg == nil {
 		return
 	}
+	if gp != gp.m.curg {
+		// Running on g0/gsignal — suppress to prevent detector re-entrancy.
+		// Without this, detector allocations on g0 trigger racewrite which
+		// re-enters the detector, causing cascading false positives.
+		return
+	}
 	if gp.raceignore != 0 {
 		return
 	}
@@ -787,6 +814,12 @@ func racewrite(addr uintptr) {
 	if gp == nil || gp.m == nil || gp.m.curg == nil {
 		return
 	}
+	if gp != gp.m.curg {
+		// Running on g0/gsignal — suppress to prevent detector re-entrancy.
+		// Without this, detector allocations on g0 trigger racewrite which
+		// re-enters the detector, causing cascading false positives.
+		return
+	}
 	if gp.raceignore != 0 {
 		return
 	}
@@ -816,6 +849,12 @@ func racereadrange(addr, size uintptr) {
 	pc := sys.GetCallerPC()
 	gp := getg()
 	if gp == nil || gp.m == nil || gp.m.curg == nil {
+		return
+	}
+	if gp != gp.m.curg {
+		// Running on g0/gsignal — suppress to prevent detector re-entrancy.
+		// Without this, detector allocations on g0 trigger racewrite which
+		// re-enters the detector, causing cascading false positives.
 		return
 	}
 	if gp.raceignore != 0 {
@@ -850,6 +889,12 @@ func racewriterange(addr, size uintptr) {
 	if gp == nil || gp.m == nil || gp.m.curg == nil {
 		return
 	}
+	if gp != gp.m.curg {
+		// Running on g0/gsignal — suppress to prevent detector re-entrancy.
+		// Without this, detector allocations on g0 trigger racewrite which
+		// re-enters the detector, causing cascading false positives.
+		return
+	}
 	if gp.raceignore != 0 {
 		return
 	}
@@ -880,6 +925,12 @@ func racereadrangepc1(addr, size, pc uintptr) {
 	if gp == nil || gp.m == nil || gp.m.curg == nil {
 		return
 	}
+	if gp != gp.m.curg {
+		// Running on g0/gsignal — suppress to prevent detector re-entrancy.
+		// Without this, detector allocations on g0 trigger racewrite which
+		// re-enters the detector, causing cascading false positives.
+		return
+	}
 	if gp.raceignore != 0 {
 		return
 	}
@@ -907,6 +958,12 @@ func racereadrangepc1(addr, size, pc uintptr) {
 func racewriterangepc1(addr, size, pc uintptr) {
 	gp := getg()
 	if gp == nil || gp.m == nil || gp.m.curg == nil {
+		return
+	}
+	if gp != gp.m.curg {
+		// Running on g0/gsignal — suppress to prevent detector re-entrancy.
+		// Without this, detector allocations on g0 trigger racewrite which
+		// re-enters the detector, causing cascading false positives.
 		return
 	}
 	if gp.raceignore != 0 {
