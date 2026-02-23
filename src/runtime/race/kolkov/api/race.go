@@ -847,7 +847,15 @@ func raceAcquireForGoroutine(addr uintptr, goid int64) {
 	}
 	ctx, ok := contextsMap.Load(goid)
 	if !ok {
-		return
+		// Context not yet created — this goroutine hasn't done any instrumented
+		// memory access yet. If goid is the current goroutine (typical for mutex
+		// Lock), lazily initialize the context so the acquire is not lost.
+		if goid == getGoroutineID() {
+			ctx = getCurrentContext()
+		}
+		if ctx == nil {
+			return
+		}
 	}
 	det.OnAcquire(addr, ctx)
 }
@@ -865,7 +873,12 @@ func raceReleaseForGoroutine(addr uintptr, goid int64) {
 	}
 	ctx, ok := contextsMap.Load(goid)
 	if !ok {
-		return
+		if goid == getGoroutineID() {
+			ctx = getCurrentContext()
+		}
+		if ctx == nil {
+			return
+		}
 	}
 	det.OnRelease(addr, ctx)
 }
@@ -883,7 +896,12 @@ func raceReleaseMergeForGoroutine(addr uintptr, goid int64) {
 	}
 	ctx, ok := contextsMap.Load(goid)
 	if !ok {
-		return
+		if goid == getGoroutineID() {
+			ctx = getCurrentContext()
+		}
+		if ctx == nil {
+			return
+		}
 	}
 	det.OnReleaseMerge(addr, ctx)
 }
