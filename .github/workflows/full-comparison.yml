@@ -1,6 +1,10 @@
 name: Full Benchmark Comparison
 
 on:
+  push:
+    branches: [pure-go-race]
+    paths:
+      - '.github/workflows/full-comparison.yml'
   workflow_dispatch:
     inputs:
       count:
@@ -14,6 +18,10 @@ on:
 
 permissions:
   contents: read
+
+env:
+  BENCH_COUNT: ${{ inputs.count || '10' }}
+  BENCH_TIME: ${{ inputs.benchtime || '1s' }}
 
 jobs:
   compare:
@@ -77,8 +85,8 @@ jobs:
         echo "Running BASELINE benchmarks (no -race)..."
         go test \
           -bench=. -benchmem \
-          -count=${{ inputs.count }} \
-          -benchtime=${{ inputs.benchtime }} \
+          -count=${{ env.BENCH_COUNT }} \
+          -benchtime=${{ env.BENCH_TIME }} \
           -timeout=30m \
           > ../baseline.txt 2>&1
         echo "  $(grep -c '^Benchmark' ../baseline.txt) results"
@@ -89,8 +97,8 @@ jobs:
         echo "Running TSAN benchmarks (-race, CGO_ENABLED=1)..."
         CGO_ENABLED=1 go test -race \
           -bench=. -benchmem \
-          -count=${{ inputs.count }} \
-          -benchtime=${{ inputs.benchtime }} \
+          -count=${{ env.BENCH_COUNT }} \
+          -benchtime=${{ env.BENCH_TIME }} \
           -timeout=30m \
           > ../tsan.txt 2>&1
         echo "  $(grep -c '^Benchmark' ../tsan.txt) results"
@@ -101,8 +109,8 @@ jobs:
         echo "Running Kolkov benchmarks (-race, CGO_ENABLED=0, go-race toolchain)..."
         CGO_ENABLED=0 ../bin/go test -race \
           -bench=. -benchmem \
-          -count=${{ inputs.count }} \
-          -benchtime=${{ inputs.benchtime }} \
+          -count=${{ env.BENCH_COUNT }} \
+          -benchtime=${{ env.BENCH_TIME }} \
           -timeout=30m \
           > ../kolkov_raw.txt 2>&1 || true
 
@@ -170,7 +178,7 @@ jobs:
           echo "**CPU:** ${CPU}"
           echo "**Cores:** ${CORES} | **RAM:** ${RAM}"
           echo "**Go:** ${GO_VER}"
-          echo "**Method:** \`go test -bench -count=${{ inputs.count }} -benchtime=${{ inputs.benchtime }} -benchmem\`"
+          echo "**Method:** \`go test -bench -count=${{ env.BENCH_COUNT }} -benchtime=${{ env.BENCH_TIME }} -benchmem\`"
           echo ""
         } >> $GITHUB_STEP_SUMMARY
 
