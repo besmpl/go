@@ -323,8 +323,8 @@ fi
 
 emit "### Performance Comparison"
 emit ""
-emit "| Benchmark | Baseline | TSAN | Kolkov | vs TSAN | vs Baseline | Winner |"
-emit "|-----------|----------|------|--------|---------|-------------|--------|"
+emit "| Benchmark | Baseline | TSAN | TSAN/Base | Kolkov | Kolkov/TSAN | Kolkov/Base | Winner |"
+emit "|-----------|----------|------|----------|--------|-------------|-------------|--------|"
 
 for name in "${all_names[@]}"; do
     b_ns="${baseline_ns[$name]:-}"
@@ -337,6 +337,7 @@ for name in "${all_names[@]}"; do
     k_fmt=$(format_ns "$k_ns")
 
     # Calculate ratios
+    tsan_vs_base=$(format_vs_baseline "$b_ns" "$t_ns")
     vs_tsan=$(format_vs_tsan "$t_ns" "$k_ns")
     vs_base=$(format_vs_baseline "$b_ns" "$k_ns")
 
@@ -351,7 +352,7 @@ for name in "${all_names[@]}"; do
     fi
 
     dname=$(display_name "$name")
-    emit "| ${dname} | ${b_fmt} | ${t_fmt} | ${k_fmt} | ${vs_tsan} | ${vs_base} | ${winner} |"
+    emit "| ${dname} | ${b_fmt} | ${t_fmt} | ${tsan_vs_base} | ${k_fmt} | ${vs_tsan} | ${vs_base} | ${winner} |"
 done
 
 emit ""
@@ -506,7 +507,7 @@ fi
 
 emit "---"
 emit ""
-emit "**Legend:** Bold time = winner in that row. \"vs TSAN\" compares Kolkov to TSAN (lower is better). \"vs Baseline\" shows total overhead vs no-race."
+emit "**Legend:** Bold time = winner in that row. \"TSAN/Base\" and \"Kolkov/Base\" show overhead vs no-race baseline. \"Kolkov/TSAN\" compares the two race detectors directly."
 emit ""
 emit "**Ratio formatting:** ~1x = within 10%, **Nx faster** = Kolkov wins, Nx slower = TSAN wins, **bold >10x** = significant gap."
 emit ""
