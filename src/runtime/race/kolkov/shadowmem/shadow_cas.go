@@ -24,6 +24,13 @@ type CASCell struct {
 	_        [8]byte   // Padding to 24 bytes for cache alignment.
 }
 
+// tombstoneCell is a sentinel value marking a deleted slot in the CAS hash table.
+// Using a tombstone instead of nil preserves linear probing chain integrity:
+// Load() skips tombstones while probing, and Store() can reuse tombstone slots.
+// Without this, clearAddr(X) would break the chain for entries Y stored after X,
+// causing LoadOrStore(Y) to return stale VarState from a previous goroutine.
+var tombstoneCell = &CASCell{}
+
 // CASBasedShadow implements shadow memory using CAS (Compare-And-Swap) operations.
 //
 // This is a high-performance alternative to sync.Map with the following benefits:
@@ -210,8 +217,13 @@ func (s *CASBasedShadow) Load(addr uintptr) *VarState {
 		cellPtr := s.cells[idx].Load()
 
 		if cellPtr == nil {
-			// Empty slot → address not found.
+			// Empty slot → end of chain, address not found.
 			return nil
+		}
+
+		if cellPtr == tombstoneCell {
+			// Deleted slot → chain continues past tombstone.
+			continue
 		}
 
 		if cellPtr.addr == addr {
@@ -271,30 +283,50 @@ func (s *CASBasedShadow) Store(addr uintptr, vs *VarState) *VarState {
 
 	hash := fastHash(addr)
 
-	// Linear probing: try up to 8 slots.
+	// First pass: find existing entry or first available slot (nil or tombstone).
+	firstAvail := uint64(0xFFFFFFFF) // Sentinel: no available slot found yet.
+
 	for i := uint64(0); i < 8; i++ {
 		idx := (hash + i) & 0xFFFF
-
-		// Load current cell.
 		cellPtr := s.cells[idx].Load()
 
-		// If slot is empty, attempt to CAS our cell in.
 		if cellPtr == nil {
-			if s.cells[idx].CompareAndSwap(nil, newCell) {
-				// Successfully stored at this index.
-				return vs
+			// End of chain. Record as insertion point if none found yet.
+			if firstAvail == 0xFFFFFFFF {
+				firstAvail = idx
 			}
-			// CAS failed, someone else stored. Reload and check.
-			cellPtr = s.cells[idx].Load()
+			break
 		}
 
-		// Slot is non-empty. Check if it's our address.
-		if cellPtr != nil && cellPtr.addr == addr {
+		if cellPtr == tombstoneCell {
+			// Deleted slot. Record as insertion point if none found yet.
+			if firstAvail == 0xFFFFFFFF {
+				firstAvail = idx
+			}
+			continue
+		}
+
+		if cellPtr.addr == addr {
 			// Address already exists (lost the race), return existing VarState.
 			return cellPtr.varState
 		}
 
 		// Collision: this slot occupied by different address, try next.
+	}
+
+	// Try to insert at first available slot (tombstone or nil).
+	if firstAvail != 0xFFFFFFFF {
+		old := s.cells[firstAvail].Load()
+		if old == nil || old == tombstoneCell {
+			if s.cells[firstAvail].CompareAndSwap(old, newCell) {
+				return vs
+			}
+			// CAS failed, someone else stored. Reload and check.
+			cellPtr := s.cells[firstAvail].Load()
+			if cellPtr != nil && cellPtr != tombstoneCell && cellPtr.addr == addr {
+				return cellPtr.varState
+			}
+		}
 	}
 
 	// Collision overflow after 8 probes.
@@ -461,10 +493,14 @@ func (s *CASBasedShadow) clearAddr(addr uintptr) {
 		idx := (hash + i) & 0xFFFF
 		cell := s.cells[idx].Load()
 		if cell == nil {
-			return // Empty slot - address not tracked.
+			return // Empty slot — end of chain, address not tracked.
+		}
+		if cell == tombstoneCell {
+			continue // Skip tombstone, chain continues.
 		}
 		if cell.addr == addr {
-			s.cells[idx].Store(nil)
+			// Replace with tombstone to preserve probing chain integrity.
+			s.cells[idx].Store(tombstoneCell)
 			return
 		}
 	}
@@ -498,7 +534,7 @@ func (s *CASBasedShadow) GetCollisionStats() (totalSlots, occupiedSlots, collisi
 
 	for i := range s.cells {
 		cellPtr := s.cells[i].Load()
-		if cellPtr == nil {
+		if cellPtr == nil || cellPtr == tombstoneCell {
 			continue
 		}
 
