@@ -92,6 +92,33 @@ func (s *SyncShadow) GetOrCreate(addr uintptr) *SyncVar {
 	return &SyncVar{}
 }
 
+// HasEntry checks if a sync variable exists for the given address.
+//
+// This is used to suppress false positive race reports on addresses that
+// are used for synchronization (mutex/rwmutex/channel internal state).
+// Go's sync primitives use atomic CAS on their internal fields, which
+// triggers raceread/racewrite. Since the actual synchronization is tracked
+// via raceacquire/racerelease, races on the primitive's own address are
+// false positives from the detector's perspective.
+//
+// Thread Safety: Safe for concurrent calls (read-only atomic loads).
+//
+//go:nosplit
+func (s *SyncShadow) HasEntry(addr uintptr) bool {
+	hash := fastHashSync(addr)
+	for i := uint64(0); i < 8; i++ {
+		idx := (hash + i) & 0x3FFF
+		cellPtr := s.cells[idx].Load()
+		if cellPtr == nil {
+			return false
+		}
+		if cellPtr.addr == addr {
+			return true
+		}
+	}
+	return false
+}
+
 // Reset clears all sync variable state.
 //
 // Thread Safety: NOT safe for concurrent access.

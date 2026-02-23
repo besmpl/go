@@ -793,6 +793,18 @@ func (r *RaceReport) String() string {
 // Phase 5 Task 5.3: ✅ Deduplication to prevent duplicate reports
 // v0.2.0 Task 6: ✅ Complete race reports with both stacks.
 func (d *Detector) reportRaceV2(raceType string, addr uintptr, vs interface{}, prevEpoch, currEpoch epoch.Epoch) {
+	// Suppress false positives on sync primitive addresses.
+	// Go's sync.Mutex/RWMutex use atomic CAS on their internal fields (e.g., m.state),
+	// which triggers raceread/racewrite. Since Go 1.26's internal/sync.Mutex does NOT
+	// call race.Disable() around its CAS (unlike older versions), the CAS happens
+	// BEFORE race.Acquire. Our detector sees an unsynchronized write because the
+	// goroutine's VectorClock hasn't been updated yet (Acquire hasn't happened).
+	// The actual synchronization is tracked via raceacquire/racerelease on the same
+	// address, so these "races" are false positives.
+	if d.syncShadow != nil && d.syncShadow.HasEntry(addr) {
+		return
+	}
+
 	// Create structured race report (this generates the deduplication key).
 	report := NewRaceReportWithStacks(raceType, addr, vs, prevEpoch, currEpoch)
 

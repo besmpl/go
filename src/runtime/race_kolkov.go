@@ -354,40 +354,33 @@ func racemapshadow(addr unsafe.Pointer, size uintptr) {
 // Clears shadow memory for the allocated range to prevent false positives
 // from stale access history when the allocator reuses addresses.
 //
+// IMPORTANT: Must always clear shadow, even when raceignore > 0.
+// GC sweep can trigger racemalloc during a detector call (systemstack with
+// raceignore set). Skipping the clear leaves stale VarState entries that
+// cause false positives when the allocator reuses the address.
+// Shadow clearing (ClearShadowRange) is in a NoInstrument package and
+// does not re-enter the detector, so this is safe.
+//
 //go:nosplit
 func racemalloc(p unsafe.Pointer, sz uintptr) {
-	gp := getg()
-	if gp.m != nil && gp.m.curg != nil {
-		gp = gp.m.curg
-	}
-	if gp.raceignore != 0 {
-		return
-	}
-	gp.raceignore++
 	systemstack(func() {
 		kolkovApiClearShadow(uintptr(p), sz)
 	})
-	gp.raceignore--
 }
 
 // racefree notifies the race detector of a memory free.
 // Clears shadow memory for the freed range to prevent false positives
 // when the allocator reuses the same addresses for new objects.
 //
+// IMPORTANT: Must always clear shadow, even when raceignore > 0.
+// GC sweep can call racefree during a detector call on systemstack.
+// Skipping would leave stale shadow entries causing false positives.
+//
 //go:nosplit
 func racefree(p unsafe.Pointer, sz uintptr) {
-	gp := getg()
-	if gp.m != nil && gp.m.curg != nil {
-		gp = gp.m.curg
-	}
-	if gp.raceignore != 0 {
-		return
-	}
-	gp.raceignore++
 	systemstack(func() {
 		kolkovApiClearShadow(uintptr(p), sz)
 	})
-	gp.raceignore--
 }
 
 // racegostart notifies the race detector that a new goroutine is starting.
