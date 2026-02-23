@@ -1,0 +1,61 @@
+# Benchmark History Tracking
+# Runs Kolkov race detector benchmarks on each push to pure-go-race
+# and publishes results to gh-pages for historical tracking.
+#
+# Dashboard: https://kolkov.github.io/go-race/dev/bench/
+name: Benchmark History
+
+on:
+  push:
+    branches: [pure-go-race]
+    paths:
+      - 'src/runtime/race/**'
+      - 'src/runtime/race_kolkov*.go'
+      - 'benchmarks/**'
+
+permissions:
+  contents: write
+  deployments: write
+
+jobs:
+  benchmark:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go 1.26 (bootstrap)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Build go-race toolchain
+        env:
+          CGO_ENABLED: 0
+        run: |
+          cd src && GOROOT_BOOTSTRAP=$(go env GOROOT) ./make.bash
+
+      - name: Run Kolkov benchmarks
+        run: |
+          cd benchmarks
+          CGO_ENABLED=0 ../bin/go test -race \
+            -bench=. -benchmem -count=6 -benchtime=1s -timeout=15m \
+            > raw_output.txt 2>&1 || true
+
+          # Clean noise from race detector output (TID warnings, race reports)
+          grep "^Benchmark\|^goos:\|^goarch:\|^pkg:\|^cpu:\|^ok\|^PASS" raw_output.txt > output.txt
+
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: 'go'
+          output-file-path: benchmarks/output.txt
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: '115%'
+          comment-on-alert: true
+          alert-comment-cc-users: '@kolkov'
+          summary-always: true

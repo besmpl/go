@@ -16,6 +16,9 @@
 # Usage:
 #   bash run_comparison.sh [--count N] [--benchtime T] [--quick]
 #   bash run_comparison.sh --system-go /path/to/go --gorace-bin /path/to/go-race/bin/go
+#   bash run_comparison.sh --save VERSION    Save current results as a named baseline
+#   bash run_comparison.sh --diff V1 V2      Compare two saved baselines with benchstat
+#   bash run_comparison.sh --list            List available saved baselines
 
 set -euo pipefail
 
@@ -25,6 +28,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_DIR="${SCRIPT_DIR}/results"
+BASELINES_DIR="${SCRIPT_DIR}/baselines"
 
 # Defaults — override via flags or environment
 GORACE_BIN="${GORACE_BIN:-${SCRIPT_DIR}/../bin/go}"
@@ -42,6 +46,37 @@ while [[ $# -gt 0 ]]; do
         --quick)       COUNT=3; BENCHTIME="500ms"; shift ;;
         --system-go)   SYSTEM_GO="$2"; shift 2 ;;
         --gorace-bin)  GORACE_BIN="$2"; shift 2 ;;
+        --save)
+            VERSION="$2"
+            mkdir -p "${BASELINES_DIR}"
+            for cfg in baseline tsan kolkov; do
+                if [[ -f "${RESULTS_DIR}/${cfg}.txt" ]]; then
+                    cp "${RESULTS_DIR}/${cfg}.txt" "${BASELINES_DIR}/${VERSION}-${cfg}.txt"
+                else
+                    echo "WARNING: ${RESULTS_DIR}/${cfg}.txt not found, skipping"
+                fi
+            done
+            echo "Saved baselines as ${VERSION}"
+            exit 0
+            ;;
+        --diff)
+            V1="$2"; V2="$3"
+            if [[ ! -f "${BASELINES_DIR}/${V1}-kolkov.txt" ]]; then
+                echo "ERROR: baseline ${V1} not found in ${BASELINES_DIR}/"
+                exit 1
+            fi
+            if [[ ! -f "${BASELINES_DIR}/${V2}-kolkov.txt" ]]; then
+                echo "ERROR: baseline ${V2} not found in ${BASELINES_DIR}/"
+                exit 1
+            fi
+            benchstat "${BASELINES_DIR}/${V1}-kolkov.txt" "${BASELINES_DIR}/${V2}-kolkov.txt"
+            exit 0
+            ;;
+        --list)
+            echo "Available baselines:"
+            ls -1 "${BASELINES_DIR}"/*-kolkov.txt 2>/dev/null | sed 's|.*/||; s|-kolkov.txt||' || echo "  (none)"
+            exit 0
+            ;;
         --help|-h)
             echo "Usage: $0 [OPTIONS]"
             echo ""
@@ -51,6 +86,11 @@ while [[ $# -gt 0 ]]; do
             echo "  --quick           Quick mode: count=3, benchtime=500ms"
             echo "  --system-go PATH  Path to system Go binary (for TSAN)"
             echo "  --gorace-bin PATH Path to go-race binary (for Kolkov)"
+            echo ""
+            echo "Baseline management:"
+            echo "  --save VERSION    Save current results as a named baseline"
+            echo "  --diff V1 V2     Compare two saved baselines with benchstat"
+            echo "  --list            List available saved baselines"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;

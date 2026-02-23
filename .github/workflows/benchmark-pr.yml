@@ -1,0 +1,153 @@
+name: Benchmark Regression Check
+
+on:
+  pull_request:
+    branches: [pure-go-race]
+    paths:
+      - 'src/runtime/race/**'
+      - 'src/runtime/race_kolkov*.go'
+      - 'benchmarks/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  benchmark:
+    name: Kolkov Benchmark Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: github.event.pull_request.draft == false
+
+    steps:
+    - name: Checkout PR branch
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        path: pr
+
+    - name: Checkout base branch
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.base.sha }}
+        path: base
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.26'
+        cache: false
+
+    - name: Install benchstat
+      run: go install golang.org/x/perf/cmd/benchstat@latest
+
+    - name: Build base toolchain
+      working-directory: base
+      run: cd src && GOROOT_BOOTSTRAP=$(go env GOROOT) ./make.bash
+      env:
+        CGO_ENABLED: 0
+
+    - name: Build PR toolchain
+      working-directory: pr
+      run: cd src && GOROOT_BOOTSTRAP=$(go env GOROOT) ./make.bash
+      env:
+        CGO_ENABLED: 0
+
+    - name: Run base benchmarks (Kolkov only)
+      working-directory: base/benchmarks
+      run: |
+        CGO_ENABLED=0 ../bin/go test -race \
+          -bench=. -benchmem -count=6 -benchtime=1s -timeout=15m \
+          > ../../base_raw.txt 2>&1 || true
+        grep "^Benchmark\|^goos:\|^goarch:\|^pkg:\|^cpu:\|^ok\|^PASS" \
+          ../../base_raw.txt > ../../base-kolkov.txt || true
+        echo "Base: $(grep -c '^Benchmark' ../../base-kolkov.txt) results"
+
+    - name: Run PR benchmarks (Kolkov only)
+      working-directory: pr/benchmarks
+      run: |
+        CGO_ENABLED=0 ../bin/go test -race \
+          -bench=. -benchmem -count=6 -benchtime=1s -timeout=15m \
+          > ../../pr_raw.txt 2>&1 || true
+        grep "^Benchmark\|^goos:\|^goarch:\|^pkg:\|^cpu:\|^ok\|^PASS" \
+          ../../pr_raw.txt > ../../pr-kolkov.txt || true
+        echo "PR: $(grep -c '^Benchmark' ../../pr-kolkov.txt) results"
+
+    - name: Compare with benchstat
+      id: compare
+      run: |
+        benchstat base-kolkov.txt pr-kolkov.txt > comparison.txt 2>&1 || true
+
+        # Build PR comment
+        {
+          echo "## Benchmark Comparison (Kolkov)"
+          echo ""
+          echo "Comparing \`${{ github.event.pull_request.base.ref }}\` -> PR #${{ github.event.pull_request.number }} (\`${{ github.event.pull_request.head.ref }}\`)"
+          echo ""
+        } > comment.md
+
+        # Extract geomean
+        GEOMEAN=$(grep -E "^geomean" comparison.txt | head -1 || echo "")
+        if [ -n "$GEOMEAN" ]; then
+          echo "**Geomean:** \`$GEOMEAN\`" >> comment.md
+          echo "" >> comment.md
+        fi
+
+        # Check for improvements
+        IMPROVEMENTS=$(grep -E "\-[0-9]+\.[0-9]+%" comparison.txt | grep -v "~" | head -10 || echo "")
+        if [ -n "$IMPROVEMENTS" ]; then
+          echo "**Improvements:**" >> comment.md
+          echo '```' >> comment.md
+          echo "$IMPROVEMENTS" >> comment.md
+          echo '```' >> comment.md
+          echo "" >> comment.md
+        fi
+
+        # Check for regressions
+        REGRESSIONS=$(grep -E "\+[0-9]+\.[0-9]+%" comparison.txt | grep -v "~" | head -10 || echo "")
+        if [ -n "$REGRESSIONS" ]; then
+          echo "**Potential regressions:**" >> comment.md
+          echo '```' >> comment.md
+          echo "$REGRESSIONS" >> comment.md
+          echo '```' >> comment.md
+        else
+          echo "No significant regressions detected." >> comment.md
+        fi
+
+        {
+          echo ""
+          echo "<details><summary>Full benchstat output</summary>"
+          echo ""
+          echo '```'
+          grep -v "parsing iteration count" comparison.txt || cat comparison.txt
+          echo '```'
+          echo "</details>"
+          echo ""
+          echo "> CI runners have ~10-20% variance. Run \`bash benchmarks/run_comparison.sh\` locally for accurate results."
+        } >> comment.md
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-pr-${{ github.event.pull_request.number }}
+        path: |
+          base-kolkov.txt
+          pr-kolkov.txt
+          comparison.txt
+        retention-days: 30
+
+    - name: Find existing comment
+      uses: peter-evans/find-comment@v3
+      id: fc
+      with:
+        issue-number: ${{ github.event.pull_request.number }}
+        comment-author: 'github-actions[bot]'
+        body-includes: '## Benchmark Comparison (Kolkov)'
+
+    - name: Post PR comment
+      uses: peter-evans/create-or-update-comment@v4
+      with:
+        comment-id: ${{ steps.fc.outputs.comment-id }}
+        issue-number: ${{ github.event.pull_request.number }}
+        body-path: comment.md
+        edit-mode: replace

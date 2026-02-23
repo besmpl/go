@@ -1,0 +1,256 @@
+name: Full Benchmark Comparison
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: 'Benchmark iterations (higher = more stable)'
+        default: '10'
+        type: string
+      benchtime:
+        description: 'Time per benchmark iteration'
+        default: '1s'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: BASELINE vs TSAN vs KOLKOV
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set up Go (system — for BASELINE and TSAN)
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.26'
+        cache: false
+
+    - name: Install tools
+      run: |
+        go install golang.org/x/perf/cmd/benchstat@latest
+        sudo apt-get update && sudo apt-get install -y gcc bc
+
+    - name: Build go-race toolchain (for Kolkov)
+      run: cd src && GOROOT_BOOTSTRAP=$(go env GOROOT) ./make.bash
+      env:
+        CGO_ENABLED: 0
+
+    - name: Capture environment
+      id: env
+      run: |
+        CPU=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)
+        RAM=$(free -h | awk '/^Mem:/{print $2}')
+        CORES=$(nproc)
+        GO_VER=$(go version | awk '{print $3}')
+        GCC_VER=$(gcc --version | head -1)
+
+        {
+          echo "=== Environment ==="
+          echo "Date:    $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "Runner:  $(uname -s) $(uname -r)"
+          echo "CPU:     ${CPU}"
+          echo "Cores:   ${CORES}"
+          echo "RAM:     ${RAM}"
+          echo "Go:      ${GO_VER}"
+          echo "GCC:     ${GCC_VER}"
+          echo "GOARCH:  $(go env GOARCH)"
+          echo "GOOS:    $(go env GOOS)"
+        } > env.txt
+
+        cat env.txt
+
+        # Export for summary script
+        echo "CPU=${CPU}" >> $GITHUB_ENV
+        echo "CORES=${CORES}" >> $GITHUB_ENV
+        echo "RAM=${RAM}" >> $GITHUB_ENV
+        echo "GO_VER=${GO_VER}" >> $GITHUB_ENV
+
+    - name: Run BASELINE (no -race)
+      working-directory: benchmarks
+      run: |
+        echo "Running BASELINE benchmarks (no -race)..."
+        go test \
+          -bench=. -benchmem \
+          -count=${{ inputs.count }} \
+          -benchtime=${{ inputs.benchtime }} \
+          -timeout=30m \
+          > ../baseline.txt 2>&1
+        echo "  $(grep -c '^Benchmark' ../baseline.txt) results"
+
+    - name: Run TSAN (system Go, -race, CGO_ENABLED=1)
+      working-directory: benchmarks
+      run: |
+        echo "Running TSAN benchmarks (-race, CGO_ENABLED=1)..."
+        CGO_ENABLED=1 go test -race \
+          -bench=. -benchmem \
+          -count=${{ inputs.count }} \
+          -benchtime=${{ inputs.benchtime }} \
+          -timeout=30m \
+          > ../tsan.txt 2>&1
+        echo "  $(grep -c '^Benchmark' ../tsan.txt) results"
+
+    - name: Run KOLKOV (go-race, -race, CGO_ENABLED=0)
+      working-directory: benchmarks
+      run: |
+        echo "Running Kolkov benchmarks (-race, CGO_ENABLED=0, go-race toolchain)..."
+        CGO_ENABLED=0 ../bin/go test -race \
+          -bench=. -benchmem \
+          -count=${{ inputs.count }} \
+          -benchtime=${{ inputs.benchtime }} \
+          -timeout=30m \
+          > ../kolkov_raw.txt 2>&1 || true
+
+        # Clean race detector noise (TID warnings, race reports)
+        grep "^Benchmark\|^goos:\|^goarch:\|^pkg:\|^cpu:\|^ok\|^PASS\|^FAIL" \
+          ../kolkov_raw.txt > ../kolkov.txt || true
+        echo "  $(grep -c '^Benchmark' ../kolkov.txt) results"
+
+    - name: Run benchstat comparisons
+      run: |
+        # TSAN vs Kolkov (primary comparison)
+        benchstat tsan.txt kolkov.txt \
+          > benchstat_tsan_vs_kolkov.txt 2>&1 || true
+
+        # All three configs
+        benchstat baseline.txt tsan.txt kolkov.txt \
+          > benchstat_all.txt 2>&1 || true
+
+    - name: Measure peak RSS
+      working-directory: benchmarks
+      run: |
+        echo "Measuring peak RSS (WorkerPool/g64, benchtime=3s)..."
+        > ../memory_rss.txt
+
+        # BASELINE RSS
+        tmpfile=$(mktemp)
+        /usr/bin/time -v go test \
+          -bench=BenchmarkWorkerPool/g64 \
+          -benchtime=3s -count=1 -timeout=5m \
+          > /dev/null 2> "$tmpfile" || true
+        peak_kb=$(grep "Maximum resident set size" "$tmpfile" | awk '{print $NF}' || echo 0)
+        peak_mb=$(( peak_kb / 1024 ))
+        echo "BASELINE: ${peak_mb} MB (${peak_kb} KB)" | tee -a ../memory_rss.txt
+        rm -f "$tmpfile"
+
+        # TSAN RSS
+        tmpfile=$(mktemp)
+        CGO_ENABLED=1 /usr/bin/time -v go test -race \
+          -bench=BenchmarkWorkerPool/g64 \
+          -benchtime=3s -count=1 -timeout=5m \
+          > /dev/null 2> "$tmpfile" || true
+        peak_kb=$(grep "Maximum resident set size" "$tmpfile" | awk '{print $NF}' || echo 0)
+        peak_mb=$(( peak_kb / 1024 ))
+        echo "TSAN: ${peak_mb} MB (${peak_kb} KB)" | tee -a ../memory_rss.txt
+        rm -f "$tmpfile"
+
+        # KOLKOV RSS
+        tmpfile=$(mktemp)
+        CGO_ENABLED=0 /usr/bin/time -v ../bin/go test -race \
+          -bench=BenchmarkWorkerPool/g64 \
+          -benchtime=3s -count=1 -timeout=5m \
+          > /dev/null 2> "$tmpfile" || true
+        peak_kb=$(grep "Maximum resident set size" "$tmpfile" | awk '{print $NF}' || echo 0)
+        peak_mb=$(( peak_kb / 1024 ))
+        echo "KOLKOV: ${peak_mb} MB (${peak_kb} KB)" | tee -a ../memory_rss.txt
+        rm -f "$tmpfile"
+
+    - name: Generate Step Summary
+      run: |
+        # Header
+        {
+          echo "## Benchmark Results: Pure-Go Race Detector vs TSAN"
+          echo ""
+          echo "**Platform:** Ubuntu $(lsb_release -rs 2>/dev/null || echo '24.04'), $(uname -m)"
+          echo "**CPU:** ${CPU}"
+          echo "**Cores:** ${CORES} | **RAM:** ${RAM}"
+          echo "**Go:** ${GO_VER}"
+          echo "**Method:** \`go test -bench -count=${{ inputs.count }} -benchtime=${{ inputs.benchtime }} -benchmem\`"
+          echo ""
+        } >> $GITHUB_STEP_SUMMARY
+
+        # Generate comparison table using script if available
+        if [ -f benchmarks/scripts/generate-summary.sh ]; then
+          bash benchmarks/scripts/generate-summary.sh \
+            baseline.txt tsan.txt kolkov.txt >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # benchstat section
+        {
+          echo ""
+          echo "### benchstat: TSAN vs Kolkov"
+          echo ""
+          echo '```'
+          # Filter out "parsing iteration count" warnings
+          grep -v "parsing iteration count" benchstat_tsan_vs_kolkov.txt || cat benchstat_tsan_vs_kolkov.txt
+          echo '```'
+          echo ""
+        } >> $GITHUB_STEP_SUMMARY
+
+        # Peak RSS
+        {
+          echo "### Peak RSS (Memory)"
+          echo ""
+          echo "| Config | Peak RSS |"
+          echo "|--------|----------|"
+          while IFS= read -r line; do
+            config=$(echo "$line" | cut -d: -f1)
+            value=$(echo "$line" | cut -d: -f2 | xargs)
+            echo "| ${config} | ${value} |"
+          done < memory_rss.txt
+          echo ""
+        } >> $GITHUB_STEP_SUMMARY
+
+        # Raw output in collapsible sections
+        {
+          echo "<details><summary>Raw Output: BASELINE (click to expand)</summary>"
+          echo ""
+          echo '```'
+          head -50 baseline.txt
+          echo '```'
+          echo "</details>"
+          echo ""
+
+          echo "<details><summary>Raw Output: TSAN</summary>"
+          echo ""
+          echo '```'
+          head -50 tsan.txt
+          echo '```'
+          echo "</details>"
+          echo ""
+
+          echo "<details><summary>Raw Output: KOLKOV</summary>"
+          echo ""
+          echo '```'
+          head -50 kolkov.txt
+          echo '```'
+          echo "</details>"
+          echo ""
+
+          echo "<details><summary>Full benchstat (all 3 configs)</summary>"
+          echo ""
+          echo '```'
+          grep -v "parsing iteration count" benchstat_all.txt || cat benchstat_all.txt
+          echo '```'
+          echo "</details>"
+        } >> $GITHUB_STEP_SUMMARY
+
+    - name: Upload results
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-results-${{ github.sha }}
+        path: |
+          env.txt
+          baseline.txt
+          tsan.txt
+          kolkov.txt
+          kolkov_raw.txt
+          benchstat_tsan_vs_kolkov.txt
+          benchstat_all.txt
+          memory_rss.txt
+        retention-days: 90

@@ -1,0 +1,5 @@
+# Generated benchmark results (not committed)
+results/
+
+# Keep baselines (milestone snapshots)
+!baselines/
