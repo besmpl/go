@@ -41,17 +41,51 @@ jobs:
     - name: Install benchstat
       run: go install golang.org/x/perf/cmd/benchstat@latest
 
-    - name: Build base toolchain
+    - name: Cache base toolchain
+      id: cache-base
+      uses: actions/cache@v4
+      with:
+        path: |
+          base/bin
+          base/pkg
+        key: go-race-toolchain-${{ runner.os }}-base-${{ hashFiles('base/src/cmd/**', 'base/src/internal/buildcfg/**', 'base/src/internal/goarch/**', 'base/src/internal/goos/**', 'base/src/VERSION') }}
+
+    - name: Build base toolchain (full — cache miss)
+      if: steps.cache-base.outputs.cache-hit != 'true'
       working-directory: base
       run: cd src && GOROOT_BOOTSTRAP=$(go env GOROOT) ./make.bash
       env:
         CGO_ENABLED: 0
 
-    - name: Build PR toolchain
+    - name: Rebuild base runtime (fast — cache hit)
+      if: steps.cache-base.outputs.cache-hit == 'true'
+      working-directory: base
+      run: |
+        export GOROOT=$(pwd)
+        CGO_ENABLED=0 ./bin/go install std
+
+    - name: Cache PR toolchain
+      id: cache-pr
+      uses: actions/cache@v4
+      with:
+        path: |
+          pr/bin
+          pr/pkg
+        key: go-race-toolchain-${{ runner.os }}-pr-${{ hashFiles('pr/src/cmd/**', 'pr/src/internal/buildcfg/**', 'pr/src/internal/goarch/**', 'pr/src/internal/goos/**', 'pr/src/VERSION') }}
+
+    - name: Build PR toolchain (full — cache miss)
+      if: steps.cache-pr.outputs.cache-hit != 'true'
       working-directory: pr
       run: cd src && GOROOT_BOOTSTRAP=$(go env GOROOT) ./make.bash
       env:
         CGO_ENABLED: 0
+
+    - name: Rebuild PR runtime (fast — cache hit)
+      if: steps.cache-pr.outputs.cache-hit == 'true'
+      working-directory: pr
+      run: |
+        export GOROOT=$(pwd)
+        CGO_ENABLED=0 ./bin/go install std
 
     - name: Run base benchmarks (Kolkov only)
       working-directory: base/benchmarks
