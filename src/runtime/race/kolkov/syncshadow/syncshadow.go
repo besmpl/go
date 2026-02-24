@@ -10,6 +10,19 @@ type syncCell struct {
 	syncVar *SyncVar
 }
 
+// syncTableSize is the number of slots in the SyncShadow hash table.
+// Must be a power of two. 131072 (128K) supports ~60K concurrent sync
+// primitives at <50% load factor, preventing overflow in long-running
+// benchmark suites that create many short-lived channels/WaitGroups.
+const syncTableSize = 131072
+
+// syncTableMask is syncTableSize - 1, used for fast modular indexing.
+const syncTableMask = syncTableSize - 1
+
+// syncMaxProbe is the maximum number of linear probing steps before
+// falling back to eviction.
+const syncMaxProbe = 16
+
 // SyncShadow manages shadow memory for synchronization primitives.
 //
 // This maps each sync primitive address (uintptr) to its SyncVar, which
@@ -19,6 +32,7 @@ type syncCell struct {
 //   - Uses CAS-based fixed-size array for runtime-compatible concurrent access
 //   - SyncVar allocated on first access to a mutex address
 //   - Never freed (mutexes typically live for program lifetime)
+//   - On probe overflow, evicts first collision slot to maintain HB chain
 //
 // Memory Model:
 //   - Key: uintptr (address of sync.Mutex, sync.RWMutex, etc.)
@@ -28,7 +42,7 @@ type syncCell struct {
 type SyncShadow struct {
 	// cells is a fixed-size array for CAS-based sync var storage.
 	// Using atomic.Pointer for lock-free access.
-	cells [16384]atomic.Pointer[syncCell]
+	cells [syncTableSize]atomic.Pointer[syncCell]
 }
 
 // NewSyncShadow creates and initializes a new SyncShadow instance.
@@ -45,7 +59,7 @@ func NewSyncShadow() *SyncShadow {
 func fastHashSync(addr uintptr) uint64 {
 	const goldenRatio = 0x9E3779B97F4A7C15
 	hash := uint64(addr) * goldenRatio
-	return hash >> 50 // 14 bits = 16384 slots
+	return hash >> 47 // 17 bits = 131072 slots
 }
 
 // GetOrCreate returns the SyncVar for the given address, creating it if needed.
@@ -58,9 +72,9 @@ func fastHashSync(addr uintptr) uint64 {
 func (s *SyncShadow) GetOrCreate(addr uintptr) *SyncVar {
 	hash := fastHashSync(addr)
 
-	// Linear probing: try up to 8 slots.
-	for i := uint64(0); i < 8; i++ {
-		idx := (hash + i) & 0x3FFF // 16384 - 1
+	// Linear probing: try up to syncMaxProbe slots.
+	for i := uint64(0); i < syncMaxProbe; i++ {
+		idx := (hash + i) & syncTableMask
 
 		cellPtr := s.cells[idx].Load()
 
@@ -87,9 +101,16 @@ func (s *SyncShadow) GetOrCreate(addr uintptr) *SyncVar {
 		// Collision, try next slot.
 	}
 
-	// Overflow - allocate standalone SyncVar.
-	// This is rare but handles edge cases.
-	return &SyncVar{}
+	// Overflow — evict first probe slot to maintain HB chain.
+	// The evicted entry likely belongs to a GC'd sync primitive
+	// (e.g., short-lived channel from a previous benchmark).
+	idx := hash & syncTableMask
+	newCell := &syncCell{
+		addr:    addr,
+		syncVar: &SyncVar{},
+	}
+	s.cells[idx].Store(newCell)
+	return newCell.syncVar
 }
 
 // HasEntry checks if a sync variable exists for the given address.
@@ -106,8 +127,8 @@ func (s *SyncShadow) GetOrCreate(addr uintptr) *SyncVar {
 //go:nosplit
 func (s *SyncShadow) HasEntry(addr uintptr) bool {
 	hash := fastHashSync(addr)
-	for i := uint64(0); i < 8; i++ {
-		idx := (hash + i) & 0x3FFF
+	for i := uint64(0); i < syncMaxProbe; i++ {
+		idx := (hash + i) & syncTableMask
 		cellPtr := s.cells[idx].Load()
 		if cellPtr == nil {
 			return false

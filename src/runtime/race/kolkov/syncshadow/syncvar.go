@@ -242,8 +242,16 @@ func (sv *SyncVar) GetReleaseClock() *vectorclock.VectorClock {
 //	ctx.IncrementClock()
 //	sv.SetReleaseClock(ctx.C)  // Second call: stores new clone
 func (sv *SyncVar) SetReleaseClock(clock *vectorclock.VectorClock) {
-	// Atomic store: always clone to avoid aliasing the caller's clock.
-	sv.releaseClock.Store(clock.Clone())
+	old := sv.releaseClock.Load()
+	if old == nil {
+		// First Release: allocate and store.
+		sv.releaseClock.Store(clock.Clone())
+	} else {
+		// Subsequent Release: update in place.
+		// Safe because SetReleaseClock is serialized by the sync primitive:
+		// racerelease runs while the lock is held, raceacquire runs after acquiring.
+		old.CopyFrom(clock)
+	}
 }
 
 // MergeReleaseClock merges a clock into the release clock (for RWMutex).
