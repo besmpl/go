@@ -1,6 +1,7 @@
 package syncshadow
 
 import (
+	"internal/runtime/atomic"
 	"runtime/race/kolkov/vectorclock"
 )
 
@@ -177,7 +178,12 @@ type SyncVar struct {
 	// happens-before from the previous Unlock.
 	//
 	// On Release (Unlock), this is updated to the current thread's clock.
-	releaseClock *vectorclock.VectorClock
+	//
+	// Thread Safety: Uses atomic.Pointer for concurrent access.
+	// MergeReleaseClock (from wg.Done/RWMutex.RUnlock) can be called
+	// concurrently by multiple goroutines. The atomic pointer + CAS loop
+	// ensures no data races on the underlying VectorClock.
+	releaseClock atomic.Pointer[vectorclock.VectorClock]
 
 	// channel tracks happens-before relationships for channel operations.
 	// nil means this SyncVar is not used for a channel (it's a mutex/rwmutex).
@@ -199,8 +205,7 @@ type SyncVar struct {
 // Returns nil if no Release has occurred yet (uninitialized mutex).
 // The caller should check for nil before using the clock.
 //
-// Thread Safety: NOT thread-safe on its own. The caller (SyncShadow) must
-// ensure synchronization via sync.Map or other mechanisms.
+// Thread Safety: Uses atomic.Pointer.Load — safe for concurrent reads.
 //
 // Example:
 //
@@ -209,7 +214,7 @@ type SyncVar struct {
 //	sv.SetReleaseClock(someClock)
 //	clock = sv.GetReleaseClock()   // Returns someClock
 func (sv *SyncVar) GetReleaseClock() *vectorclock.VectorClock {
-	return sv.releaseClock
+	return sv.releaseClock.Load()
 }
 
 // SetReleaseClock sets the release clock for this sync variable.
@@ -227,8 +232,7 @@ func (sv *SyncVar) GetReleaseClock() *vectorclock.VectorClock {
 //   - First call: Allocates VectorClock (~1KB) and copies
 //   - Subsequent calls: Updates in place (no allocations)
 //
-// Thread Safety: NOT thread-safe on its own. The caller must ensure
-// synchronization.
+// Thread Safety: Uses atomic.Pointer.Store — safe for concurrent access.
 //
 // Example:
 //
@@ -236,16 +240,10 @@ func (sv *SyncVar) GetReleaseClock() *vectorclock.VectorClock {
 //	ctx := goroutine.Alloc(0)
 //	sv.SetReleaseClock(ctx.C)  // First call: allocates + copies
 //	ctx.IncrementClock()
-//	sv.SetReleaseClock(ctx.C)  // Second call: updates in place
+//	sv.SetReleaseClock(ctx.C)  // Second call: stores new clone
 func (sv *SyncVar) SetReleaseClock(clock *vectorclock.VectorClock) {
-	if sv.releaseClock == nil {
-		// First Release: Allocate a new VectorClock and copy.
-		sv.releaseClock = clock.Clone()
-	} else {
-		// Subsequent Release: Update in place to avoid allocations.
-		// v0.3.0: Use CopyFrom for sparse-aware copying.
-		sv.releaseClock.CopyFrom(clock)
-	}
+	// Atomic store: always clone to avoid aliasing the caller's clock.
+	sv.releaseClock.Store(clock.Clone())
 }
 
 // MergeReleaseClock merges a clock into the release clock (for RWMutex).
@@ -264,8 +262,8 @@ func (sv *SyncVar) SetReleaseClock(clock *vectorclock.VectorClock) {
 //   - First call: Allocates VectorClock (~1KB) and copies
 //   - Subsequent calls: Element-wise max (no allocations)
 //
-// Thread Safety: NOT thread-safe on its own. The caller must ensure
-// synchronization.
+// Thread Safety: Uses atomic CAS loop — safe for concurrent access from
+// multiple goroutines (e.g., concurrent wg.Done or RWMutex.RUnlock).
 //
 // Example (RWMutex scenario):
 //
@@ -277,13 +275,22 @@ func (sv *SyncVar) SetReleaseClock(clock *vectorclock.VectorClock) {
 //	// Writer locks
 //	writerClock.Join(sv.GetReleaseClock())  // Gets union of both readers
 func (sv *SyncVar) MergeReleaseClock(clock *vectorclock.VectorClock) {
-	if sv.releaseClock == nil {
-		// First Release: Allocate a new VectorClock and copy.
-		sv.releaseClock = clock.Clone()
-	} else {
-		// Subsequent Release: Merge (join) the clocks.
-		// For each thread, take the maximum clock value.
-		sv.releaseClock.Join(clock)
+	// CAS loop: concurrent goroutines (wg.Done, RWMutex.RUnlock) can call
+	// this simultaneously. Clone-merge-CAS ensures no data race on the
+	// underlying VectorClock.
+	for {
+		old := sv.releaseClock.Load()
+		var merged *vectorclock.VectorClock
+		if old == nil {
+			merged = clock.Clone()
+		} else {
+			merged = old.Clone()
+			merged.Join(clock)
+		}
+		if sv.releaseClock.CompareAndSwap(old, merged) {
+			return
+		}
+		// CAS failed — another goroutine updated concurrently. Retry.
 	}
 }
 
