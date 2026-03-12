@@ -35,12 +35,13 @@ var (
 
 // DefaultShadow returns the recommended shadow memory implementation.
 //
-// Currently returns CASBasedShadow which performs better for random
-// access patterns (1 atomic load on hot path vs 4 for PageTableShadow).
-// PageTableShadow is better for sequential patterns but runtime workloads
-// are dominated by random accesses across goroutines.
+// Returns PageTableShadow which uses direct index computation instead of
+// hash + linear probing. Hot path cost: 1 base load + 2 pointer loads (~5-8ns)
+// vs CASBasedShadow hash + probe (~15-25ns with collisions).
+//
+// PageTableShadow covers 128GB of address space via a two-level page table
+// with lazy L2 page allocation. Addresses outside the range fall back to
+// CASBasedShadow automatically.
 func DefaultShadow() Shadow {
-	s := NewCASBasedShadow()
-	s.SetAddressCompression(true)
-	return s
+	return NewPageTableShadow()
 }
