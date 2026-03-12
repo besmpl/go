@@ -89,7 +89,6 @@ var (
 //
 // Clamping prevents wrap-around which causes false negatives (worse than false positives).
 //
-//go:nosplit
 func NewEpoch(tid uint16, clock uint64) Epoch {
 	// Convert tid to uint32 for comparison with MaxTID constant.
 	tid32 := uint32(tid)
@@ -121,7 +120,6 @@ func NewEpoch(tid uint16, clock uint64) Epoch {
 //
 // Returns: (tid uint16, clock uint64)
 //
-//go:nosplit
 func (e Epoch) Decode() (tid uint16, clock uint64) {
 	//nolint:gosec // G115: Intentional truncation to extract top 16 bits as TID.
 	tid = uint16(e >> ClockBits)
@@ -139,7 +137,6 @@ func (e Epoch) Decode() (tid uint16, clock uint64) {
 // Note: VectorClock stores uint32 clocks per thread, but Epoch uses uint64 global clock.
 // The comparison is safe since per-thread clocks rarely exceed 32-bit range.
 //
-//go:nosplit
 func (e Epoch) HappensBefore(vc *vectorclock.VectorClock) bool {
 	tid, clock := e.Decode()
 	return clock <= uint64(vc.Get(tid))
@@ -149,7 +146,6 @@ func (e Epoch) HappensBefore(vc *vectorclock.VectorClock) bool {
 //
 // Used for fast-path same-epoch optimization (71% writes, 63% reads).
 //
-//go:nosplit
 func (e Epoch) Same(other Epoch) bool {
 	return e == other
 }

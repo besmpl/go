@@ -124,7 +124,6 @@ func NewSampler(config SamplerConfig) *Sampler {
 //
 // Thread Safety: Safe for concurrent calls.
 //
-//go:nosplit
 func (s *Sampler) ShouldSample() bool {
 	// Fast path: Sampling disabled
 	if !s.config.Enabled || s.config.Rate <= 1 {

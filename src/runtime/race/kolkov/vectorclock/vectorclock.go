@@ -183,7 +183,6 @@ func (vc *VectorClock) Clone() *VectorClock {
 //
 // Performance: Critical operation, must be fast. Target: < 10ns for sparse clocks.
 //
-//go:nosplit
 func (vc *VectorClock) Join(other *VectorClock) {
 	// Determine the range to iterate (sparse optimization).
 	limit := uint32(vc.maxTID)
@@ -218,7 +217,6 @@ func (vc *VectorClock) Join(other *VectorClock) {
 //
 // Performance: Critical operation on race check path. Target: < 5ns for sparse clocks.
 //
-//go:nosplit
 func (vc *VectorClock) LessOrEqual(other *VectorClock) bool {
 	// Only need to check up to vc.maxTID (elements beyond are 0, which is always <= other[i]).
 	// Use uint32 loop counter to avoid uint16 overflow at maxTID=65535.
@@ -239,7 +237,6 @@ func (vc *VectorClock) LessOrEqual(other *VectorClock) bool {
 //
 // Performance: Same as LessOrEqual, < 300ns, 0 allocs.
 //
-//go:nosplit
 func (vc *VectorClock) HappensBefore(other *VectorClock) bool {
 	return vc.LessOrEqual(other)
 }

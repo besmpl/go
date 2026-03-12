@@ -40,14 +40,12 @@ type spinlock struct {
 	state atomic.Uint32
 }
 
-//go:nosplit
 func (s *spinlock) lock() {
 	for !s.state.CompareAndSwap(0, 1) {
 		// Spin
 	}
 }
 
-//go:nosplit
 func (s *spinlock) unlock() {
 	s.state.Store(0)
 }
@@ -308,7 +306,6 @@ func NewDetectorWithOptions(opts DetectorOptions) *Detector {
 // Performance: Atomic increment (~5ns) on every call, reporting only every 10K ops.
 // Total overhead: <0.1% (acceptable for critical safety feature).
 //
-//go:nosplit
 func (d *Detector) checkOverflowPeriodically() {
 	count := d.operationCount.Add(1)
 	if count%overflowCheckInterval == 0 {
@@ -449,7 +446,6 @@ func captureCallerPC() uintptr {
 // All required objects (VarState, RaceContext) are pre-allocated or
 // retrieved from pools.
 //
-//go:nosplit
 //nolint:gocognit,nestif,gocyclo,cyclop // Complex race detection logic requires nested conditionals
 func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) {
 	// Step 0: Sampling check (v0.3.0 P0).
@@ -684,7 +680,6 @@ func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext, pc uintptr)
 //
 // Zero Allocations: Fast path allocates nothing. Slow path may allocate VectorClock on promotion.
 //
-//go:nosplit
 func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) {
 	// Step 0: Sampling check (v0.3.0 P0).
 	// If sampling is enabled and this access is not sampled, skip detection.
@@ -819,7 +814,6 @@ func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) 
 //   - true if prevWrite happened-before current operation
 //   - false if there's a potential race (concurrent access)
 //
-//go:nosplit
 func (d *Detector) happensBeforeWrite(prevWrite epoch.Epoch, ctx *goroutine.RaceContext) bool {
 	// Use the epoch's HappensBefore method which checks against vector clock.
 	// This handles both same-thread and cross-thread cases correctly.
@@ -840,7 +834,6 @@ func (d *Detector) happensBeforeWrite(prevWrite epoch.Epoch, ctx *goroutine.Race
 //   - true if prevRead happened-before current operation
 //   - false if there's a potential race
 //
-//go:nosplit
 func (d *Detector) happensBeforeRead(prevRead epoch.Epoch, ctx *goroutine.RaceContext) bool {
 	// MVP: Same logic as write happens-before.
 	// Phase 3: This will need to handle vector clock reads.
@@ -942,7 +935,6 @@ func (d *Detector) RacesDetected() int {
 //	// OnAcquire merges previous Unlock's clock into current thread
 //	x = 42     // Now happens-after previous critical section
 //
-//go:nosplit
 func (d *Detector) OnAcquire(addr uintptr, ctx *goroutine.RaceContext) {
 	// Periodic overflow detection (v0.9.0: moved from OnRead/OnWrite to sync events).
 	// TID/clock overflow happens at clock advancement, not memory access.
@@ -990,7 +982,6 @@ func (d *Detector) OnAcquire(addr uintptr, ctx *goroutine.RaceContext) {
 //	mu.Unlock()  // Compiler inserts: racerelease(&mu)
 //	// OnRelease captures current clock for next Lock to see
 //
-//go:nosplit
 func (d *Detector) OnRelease(addr uintptr, ctx *goroutine.RaceContext) {
 	// Periodic overflow detection (v0.9.0: moved from OnRead/OnWrite to sync events).
 	d.checkOverflowPeriodically()
@@ -1045,7 +1036,6 @@ func (d *Detector) OnRelease(addr uintptr, ctx *goroutine.RaceContext) {
 //	mu.Lock()    // Acquire (sees union of Reader 1 and Reader 2 clocks)
 //	x = 42       // Write happens-after both readers
 //
-//go:nosplit
 func (d *Detector) OnReleaseMerge(addr uintptr, ctx *goroutine.RaceContext) {
 	// Step 1: Get or create SyncVar for this mutex address.
 	syncVar := d.syncShadow.GetOrCreate(addr)
@@ -1072,7 +1062,6 @@ func (d *Detector) OnReleaseMerge(addr uintptr, ctx *goroutine.RaceContext) {
 //
 // Performance Target: <100ns (minimal overhead).
 //
-//go:nosplit
 func (d *Detector) OnChannelSendBefore(ch uintptr, ctx *goroutine.RaceContext) {
 	// MVP: No-op. Future: could check if channel is closed.
 	_ = ch
@@ -1105,7 +1094,6 @@ func (d *Detector) OnChannelSendBefore(ch uintptr, ctx *goroutine.RaceContext) {
 //	ch <- value  // Compiler inserts: racechansendbefore(&ch); ...; racechansendafter(&ch)
 //	// OnChannelSendAfter captures sender's clock for receiver to see
 //
-//go:nosplit
 func (d *Detector) OnChannelSendAfter(ch uintptr, ctx *goroutine.RaceContext) {
 	// Step 1: Get or create SyncVar for this channel address.
 	syncVar := d.syncShadow.GetOrCreate(ch)
@@ -1130,7 +1118,6 @@ func (d *Detector) OnChannelSendAfter(ch uintptr, ctx *goroutine.RaceContext) {
 //
 // Performance Target: <100ns (minimal overhead).
 //
-//go:nosplit
 func (d *Detector) OnChannelRecvBefore(ch uintptr, ctx *goroutine.RaceContext) {
 	// MVP: No-op.
 	_ = ch
@@ -1165,7 +1152,6 @@ func (d *Detector) OnChannelRecvBefore(ch uintptr, ctx *goroutine.RaceContext) {
 //	// OnChannelRecvAfter merges sender's clock into receiver
 //	// Receiver now happens-after sender
 //
-//go:nosplit
 func (d *Detector) OnChannelRecvAfter(ch uintptr, ctx *goroutine.RaceContext) {
 	// Step 1: Get or create SyncVar for this channel address.
 	syncVar := d.syncShadow.GetOrCreate(ch)
@@ -1224,7 +1210,6 @@ func (d *Detector) OnChannelRecvAfter(ch uintptr, ctx *goroutine.RaceContext) {
 //	// OnChannelClose captures closer's clock
 //	// Future receives will merge this clock
 //
-//go:nosplit
 func (d *Detector) OnChannelClose(ch uintptr, ctx *goroutine.RaceContext) {
 	// Step 1: Get or create SyncVar for this channel address.
 	syncVar := d.syncShadow.GetOrCreate(ch)
@@ -1268,7 +1253,6 @@ func (d *Detector) OnChannelClose(ch uintptr, ctx *goroutine.RaceContext) {
 //	wg.Add(1)  // Compiler inserts: racewaitgroupadd(&wg, 1)
 //	// OnWaitGroupAdd increments counter to 1
 //
-//go:nosplit
 func (d *Detector) OnWaitGroupAdd(wg uintptr, delta int, ctx *goroutine.RaceContext) {
 	// Step 1: Get or create SyncVar for this WaitGroup address.
 	syncVar := d.syncShadow.GetOrCreate(wg)
@@ -1312,7 +1296,6 @@ func (d *Detector) OnWaitGroupAdd(wg uintptr, delta int, ctx *goroutine.RaceCont
 //	wg.Done()          // Compiler inserts: racewaitgroupdone(&wg)
 //	// OnWaitGroupDone merges child's clock into doneClock
 //
-//go:nosplit
 func (d *Detector) OnWaitGroupDone(wg uintptr, ctx *goroutine.RaceContext) {
 	// Step 1: Get or create SyncVar for this WaitGroup address.
 	syncVar := d.syncShadow.GetOrCreate(wg)
@@ -1352,7 +1335,6 @@ func (d *Detector) OnWaitGroupDone(wg uintptr, ctx *goroutine.RaceContext) {
 //
 //	wg.Wait()  // Compiler inserts: racewaitgroupwaitbefore(&wg); ...; racewaitgroupwaitafter(&wg)
 //
-//go:nosplit
 func (d *Detector) OnWaitGroupWaitBefore(_ uintptr, ctx *goroutine.RaceContext) {
 	// For MVP, just increment the clock to mark the synchronization point.
 	// Future phases could add validation or monitoring here.
@@ -1389,7 +1371,6 @@ func (d *Detector) OnWaitGroupWaitBefore(_ uintptr, ctx *goroutine.RaceContext) 
 //	// OnWaitGroupWaitAfter merges doneClock into parent's clock
 //	_ = data           // Parent can now safely read child's writes (no race)
 //
-//go:nosplit
 func (d *Detector) OnWaitGroupWaitAfter(wg uintptr, ctx *goroutine.RaceContext) {
 	// Step 1: Get or create SyncVar for this WaitGroup address.
 	syncVar := d.syncShadow.GetOrCreate(wg)
@@ -1412,7 +1393,6 @@ func (d *Detector) OnWaitGroupWaitAfter(wg uintptr, ctx *goroutine.RaceContext) 
 // Called during memory allocation/free to prevent false positives from
 // stale shadow state when the allocator reuses addresses.
 //
-//go:nosplit
 func (d *Detector) ClearShadowRange(addr, size uintptr) {
 	d.shadowMemory.ClearRange(addr, size)
 }
