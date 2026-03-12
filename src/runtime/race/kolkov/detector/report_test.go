@@ -1,7 +1,6 @@
 package detector
 
 import (
-	"bytes"
 	"strings"
 	"testing"
 
@@ -165,9 +164,7 @@ func TestRaceReport_Format(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			report := NewRaceReport(tt.raceType, addr, prevEpoch, currEpoch)
 
-			var buf bytes.Buffer
-			report.Format(&buf)
-			output := buf.String()
+			output := report.String()
 
 			// Check that all expected strings are present.
 			for _, want := range tt.wantContains {
@@ -274,12 +271,9 @@ func BenchmarkRaceReport_Format(b *testing.B) {
 	currEpoch := epoch.NewEpoch(7, 200) // tid=7, clock=200
 	report := NewRaceReport("write-write", addr, prevEpoch, currEpoch)
 
-	var buf bytes.Buffer
-
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buf.Reset()
-		report.Format(&buf)
+		_ = report.String()
 	}
 }
 
@@ -327,8 +321,7 @@ func BenchmarkRaceReportWithStackTrace(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		report := NewRaceReport("write-write", addr, prevEpoch, currEpoch)
-		var buf bytes.Buffer
-		report.Format(&buf)
+		_ = report.String()
 	}
 }
 
@@ -336,67 +329,45 @@ func BenchmarkRaceReportWithStackTrace(b *testing.B) {
 
 // TestGenerateDeduplicationKey tests the deduplication key generation function.
 func TestGenerateDeduplicationKey(t *testing.T) {
-	tests := []struct {
-		name     string
-		raceType string
-		addr     uintptr
-		gid1     uint32
-		gid2     uint32
-		wantKey  string
-	}{
-		{
-			name:     "write-write race with sorted IDs",
-			raceType: "write-write",
-			addr:     0x1234,
-			gid1:     3,
-			gid2:     5,
-			wantKey:  "write-write:0x1234:3:5",
-		},
-		{
-			name:     "write-write race with unsorted IDs (should sort)",
-			raceType: "write-write",
-			addr:     0x1234,
-			gid1:     5,
-			gid2:     3,
-			wantKey:  "write-write:0x1234:3:5", // IDs sorted
-		},
-		{
-			name:     "read-write race",
-			raceType: "read-write",
-			addr:     0xabcdef,
-			gid1:     10,
-			gid2:     20,
-			wantKey:  "read-write:0xabcdef:10:20",
-		},
-		{
-			name:     "write-read race",
-			raceType: "write-read",
-			addr:     0xffffff,
-			gid1:     100,
-			gid2:     50,
-			wantKey:  "write-read:0xffffff:50:100", // IDs sorted
-		},
-		{
-			name:     "same goroutine (edge case)",
-			raceType: "write-write",
-			addr:     0x5678,
-			gid1:     7,
-			gid2:     7,
-			wantKey:  "write-write:0x5678:7:7",
-		},
+	// Same inputs produce same key.
+	key1 := generateDeduplicationKey("write-write", 0x1234, 3, 5)
+	key2 := generateDeduplicationKey("write-write", 0x1234, 3, 5)
+	if key1 != key2 {
+		t.Errorf("Same inputs produced different keys: %d vs %d", key1, key2)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gotKey := generateDeduplicationKey(tt.raceType, tt.addr, tt.gid1, tt.gid2)
-			if gotKey != tt.wantKey {
-				t.Errorf("generateDeduplicationKey() = %q, want %q", gotKey, tt.wantKey)
-			}
-		})
+	// Unsorted gid1/gid2 should produce same key as sorted.
+	key3 := generateDeduplicationKey("write-write", 0x1234, 5, 3)
+	if key1 != key3 {
+		t.Errorf("Unsorted IDs produced different key: sorted=%d, unsorted=%d", key1, key3)
+	}
+
+	// Different race type produces different key.
+	key4 := generateDeduplicationKey("read-write", 0x1234, 3, 5)
+	if key1 == key4 {
+		t.Errorf("Different race types produced same key: %d", key1)
+	}
+
+	// Different address produces different key.
+	key5 := generateDeduplicationKey("write-write", 0x5678, 3, 5)
+	if key1 == key5 {
+		t.Errorf("Different addresses produced same key: %d", key1)
+	}
+
+	// Different goroutine IDs produce different key.
+	key6 := generateDeduplicationKey("write-write", 0x1234, 7, 9)
+	if key1 == key6 {
+		t.Errorf("Different GIDs produced same key: %d", key1)
+	}
+
+	// Same goroutine (edge case) should not panic.
+	key7 := generateDeduplicationKey("write-write", 0x5678, 7, 7)
+	if key7 == 0 {
+		t.Errorf("Same GID produced zero key")
 	}
 }
 
-// TestNewRaceReport_DeduplicationKey tests that NewRaceReport generates correct dedup key.
+// TestNewRaceReport_DeduplicationKey tests that NewRaceReport generates a non-zero dedup key.
 func TestNewRaceReport_DeduplicationKey(t *testing.T) {
 	addr := uintptr(0x1000)
 	prevEpoch := epoch.NewEpoch(3, 10) // tid=3, clock=10
@@ -404,10 +375,8 @@ func TestNewRaceReport_DeduplicationKey(t *testing.T) {
 
 	report := NewRaceReport("write-write", addr, prevEpoch, currEpoch)
 
-	// Expected key: "write-write:0x1000:3:5" (IDs sorted)
-	expectedKey := "write-write:0x1000:3:5"
-	if report.DeduplicationKey != expectedKey {
-		t.Errorf("DeduplicationKey = %q, want %q", report.DeduplicationKey, expectedKey)
+	if report.DeduplicationKey == 0 {
+		t.Error("DeduplicationKey should not be zero")
 	}
 }
 

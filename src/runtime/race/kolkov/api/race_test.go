@@ -14,7 +14,7 @@ func TestInit(t *testing.T) {
 		t.Fatal("Global detector not initialized")
 	}
 
-	if !enabled.Load() {
+	if enabled.Load() == 0 {
 		t.Error("Detector should be enabled by default")
 	}
 }
@@ -333,19 +333,19 @@ func TestRaceWrite_Disabled(t *testing.T) {
 func TestEnableDisable(t *testing.T) {
 	// Enable.
 	Enable()
-	if !enabled.Load() {
+	if enabled.Load() == 0 {
 		t.Error("Enable() did not enable detector")
 	}
 
 	// Disable.
 	Disable()
-	if enabled.Load() {
+	if enabled.Load() != 0 {
 		t.Error("Disable() did not disable detector")
 	}
 
 	// Re-enable.
 	Enable()
-	if !enabled.Load() {
+	if enabled.Load() == 0 {
 		t.Error("Re-Enable() did not enable detector")
 	}
 }
@@ -645,7 +645,7 @@ func TestInitFunctionality(t *testing.T) {
 	Init()
 
 	// Verify detector is enabled.
-	if !enabled.Load() {
+	if enabled.Load() == 0 {
 		t.Error("Init() did not enable detector")
 	}
 
@@ -705,7 +705,7 @@ func TestInitIdempotent(t *testing.T) {
 	}
 
 	// Verify enabled.
-	if !enabled.Load() {
+	if enabled.Load() == 0 {
 		t.Error("After second Init(), detector not enabled")
 	}
 }
@@ -764,7 +764,7 @@ func TestFiniOutput(t *testing.T) {
 	Fini()
 
 	// Verify detector is disabled after Fini.
-	if enabled.Load() {
+	if enabled.Load() != 0 {
 		t.Error("Fini() did not disable detector")
 	}
 }
@@ -818,7 +818,7 @@ func TestInitFiniCycle(t *testing.T) {
 	Fini()
 
 	// Detector should be disabled now.
-	if enabled.Load() {
+	if enabled.Load() != 0 {
 		t.Error("After Fini(), detector still enabled")
 	}
 
@@ -826,7 +826,7 @@ func TestInitFiniCycle(t *testing.T) {
 	Init()
 
 	// Should be able to use detector again.
-	if !enabled.Load() {
+	if enabled.Load() == 0 {
 		t.Error("After second Init(), detector not enabled")
 	}
 
@@ -836,7 +836,7 @@ func TestInitFiniCycle(t *testing.T) {
 	Fini()
 
 	// Should be disabled again.
-	if enabled.Load() {
+	if enabled.Load() != 0 {
 		t.Error("After second Fini(), detector still enabled")
 	}
 }
@@ -902,7 +902,7 @@ func TestFiniMultipleCalls(t *testing.T) {
 	Fini()
 
 	// Detector should remain disabled.
-	if enabled.Load() {
+	if enabled.Load() != 0 {
 		t.Error("After multiple Fini() calls, detector enabled")
 	}
 }

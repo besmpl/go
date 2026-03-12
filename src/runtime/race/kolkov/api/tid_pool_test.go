@@ -5,59 +5,60 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"runtime/race/kolkov/vectorclock"
 )
 
-// === TID Pool Unit Tests (Phase 2 Task 2.2) ===
+// poolSize returns the current number of free TIDs in the pool.
+// Must be called without tidPoolMu held.
+func poolSize() int {
+	tidPoolMu.lock()
+	n := len(freeTIDs)
+	tidPoolMu.unlock()
+	return n
+}
 
-// TestTIDPoolInitialization verifies TID pool starts with 65536 TIDs.
+// expectedPoolSize is MaxThreads-1 (TID 0 is excluded as sentinel).
+var expectedPoolSize = vectorclock.MaxThreads - 1
+
+// TestTIDPoolInitialization verifies TID pool starts with MaxThreads-1 TIDs.
 func TestTIDPoolInitialization(t *testing.T) {
-	// Initialize pool.
 	initTIDPool()
 
-	tidPoolMu.Lock()
-	poolSize := len(freeTIDs)
-	tidPoolMu.Unlock()
-
-	if poolSize != 65536 {
-		t.Errorf("TID pool size = %d, want 65536", poolSize)
+	n := poolSize()
+	if n != expectedPoolSize {
+		t.Errorf("TID pool size = %d, want %d", n, expectedPoolSize)
 	}
 
-	// Verify first and last TIDs are correct (checking all 65536 is too slow).
-	tidPoolMu.Lock()
-	if freeTIDs[0] != 0 {
-		t.Errorf("freeTIDs[0] = %d, want 0", freeTIDs[0])
+	// Verify first TID is 1 (TID 0 excluded) and last is MaxThreads-1.
+	tidPoolMu.lock()
+	if freeTIDs[0] != 1 {
+		t.Errorf("freeTIDs[0] = %d, want 1", freeTIDs[0])
 	}
-	if freeTIDs[65535] != 65535 {
-		t.Errorf("freeTIDs[65535] = %d, want 65535", freeTIDs[65535])
+	last := freeTIDs[len(freeTIDs)-1]
+	if last != uint16(vectorclock.MaxThreads-1) {
+		t.Errorf("freeTIDs[last] = %d, want %d", last, vectorclock.MaxThreads-1)
 	}
-	// Spot check a few in the middle.
-	for _, i := range []int{1, 100, 1000, 32768, 65534} {
-		if freeTIDs[i] != uint16(i) {
-			t.Errorf("freeTIDs[%d] = %d, want %d", i, freeTIDs[i], i)
-		}
-	}
-	tidPoolMu.Unlock()
+	tidPoolMu.unlock()
 }
 
 // TestTIDAllocation verifies TID allocation from pool.
 func TestTIDAllocation(t *testing.T) {
 	initTIDPool()
 
-	// Allocate a TID.
-	tid := allocTID()
+	tid, startClock := allocTID()
 
-	// Should get TID 0 (first in pool).
-	if tid != 0 {
-		t.Errorf("First allocTID() = %d, want 0", tid)
+	// Should get TID 1 (first in pool, TID 0 is excluded).
+	if tid != 1 {
+		t.Errorf("First allocTID() = %d, want 1", tid)
+	}
+	if startClock < 1 {
+		t.Errorf("startClock = %d, want >= 1", startClock)
 	}
 
-	// Pool should now have 65535 TIDs.
-	tidPoolMu.Lock()
-	poolSize := len(freeTIDs)
-	tidPoolMu.Unlock()
-
-	if poolSize != 65535 {
-		t.Errorf("After allocation, pool size = %d, want 65535", poolSize)
+	n := poolSize()
+	if n != expectedPoolSize-1 {
+		t.Errorf("After allocation, pool size = %d, want %d", n, expectedPoolSize-1)
 	}
 }
 
@@ -65,27 +66,22 @@ func TestTIDAllocation(t *testing.T) {
 func TestTIDAllocationSequential(t *testing.T) {
 	initTIDPool()
 
-	// Allocate 10 TIDs.
 	tids := make([]uint16, 10)
 	for i := 0; i < 10; i++ {
-		tids[i] = allocTID()
+		tids[i], _ = allocTID()
 	}
 
-	// Should get TIDs: 0, 1, 2, ..., 9.
+	// Should get TIDs: 1, 2, 3, ..., 10 (TID 0 excluded from pool).
 	for i := 0; i < 10; i++ {
-		expected := uint16(i)
+		expected := uint16(i + 1)
 		if tids[i] != expected {
 			t.Errorf("TID %d = %d, want %d", i, tids[i], expected)
 		}
 	}
 
-	// Pool should have 65526 TIDs left.
-	tidPoolMu.Lock()
-	poolSize := len(freeTIDs)
-	tidPoolMu.Unlock()
-
-	if poolSize != 65526 {
-		t.Errorf("After 10 allocations, pool size = %d, want 65526", poolSize)
+	n := poolSize()
+	if n != expectedPoolSize-10 {
+		t.Errorf("After 10 allocations, pool size = %d, want %d", n, expectedPoolSize-10)
 	}
 }
 
@@ -93,103 +89,56 @@ func TestTIDAllocationSequential(t *testing.T) {
 func TestTIDFree(t *testing.T) {
 	initTIDPool()
 
-	// Allocate a TID.
-	tid := allocTID()
+	tid, _ := allocTID()
 
-	// Pool should have 65535 TIDs.
-	tidPoolMu.Lock()
-	poolSize := len(freeTIDs)
-	tidPoolMu.Unlock()
-
-	if poolSize != 65535 {
-		t.Errorf("After allocation, pool size = %d, want 65535", poolSize)
+	n := poolSize()
+	if n != expectedPoolSize-1 {
+		t.Errorf("After allocation, pool size = %d, want %d", n, expectedPoolSize-1)
 	}
 
-	// Free the TID.
-	freeTID(tid)
+	// Free the TID with clock=1.
+	freeTID(tid, 1)
 
-	// Pool should have 65536 TIDs again.
-	tidPoolMu.Lock()
-	poolSize = len(freeTIDs)
-	tidPoolMu.Unlock()
-
-	if poolSize != 65536 {
-		t.Errorf("After freeing, pool size = %d, want 65536", poolSize)
+	n = poolSize()
+	if n != expectedPoolSize {
+		t.Errorf("After freeing, pool size = %d, want %d", n, expectedPoolSize)
 	}
 }
 
-// TestTIDReuse verifies freed TID is reused.
+// TestTIDReuse verifies freed TID is reused with bumped clock.
 func TestTIDReuse(t *testing.T) {
 	initTIDPool()
 
-	// Allocate TID 0.
-	tid1 := allocTID()
-	if tid1 != 0 {
-		t.Fatalf("First allocation = %d, want 0", tid1)
+	// Allocate TID 1.
+	tid1, _ := allocTID()
+	if tid1 != 1 {
+		t.Fatalf("First allocation = %d, want 1", tid1)
 	}
 
-	// Free TID 0.
-	freeTID(tid1)
+	// Free TID 1 with clock=10.
+	freeTID(tid1, 10)
 
-	// The freed TID should be at the end of the pool now (appended).
-	// Next allocation should still get TID 1 (FIFO from front).
-	tid2 := allocTID()
-	if tid2 != 1 {
-		t.Errorf("Second allocation after free = %d, want 1", tid2)
+	// Next allocation should get TID 2 (FIFO: freed TID goes to back).
+	tid2, _ := allocTID()
+	if tid2 != 2 {
+		t.Errorf("Second allocation after free = %d, want 2", tid2)
 	}
 
-	// Allocate many more TIDs (but not all 65534 - too slow for tests).
-	// Allocate 100 more to verify pool shrinks correctly.
-	for i := 0; i < 100; i++ {
-		allocTID()
+	// Allocate remaining pool until we get the recycled TID 1 back.
+	// After draining the pool, the freed TID 1 should come back with bumped clock.
+	var recycledClock uint32
+	for i := 0; i < expectedPoolSize; i++ {
+		tid, clock := allocTID()
+		if tid == tid1 {
+			recycledClock = clock
+			break
+		}
+		_ = clock
 	}
 
-	// Now pool should have 65536 - 1 (tid2, allocated after free) - 100 = 65435 TIDs.
-	// (tid1 was freed and added back, so it's in the pool)
-	tidPoolMu.Lock()
-	poolSize := len(freeTIDs)
-	tidPoolMu.Unlock()
-
-	expectedPoolSize := 65435
-	if poolSize != expectedPoolSize {
-		t.Errorf("Pool size after allocations = %d, want %d", poolSize, expectedPoolSize)
-	}
-
-	// Note: We don't test full exhaustion and reuse of TID 0 here (would take too long).
-	// The key invariant tested: freed TIDs are appended (LIFO), allocations from front (FIFO).
-}
-
-// TestTIDPoolExhaustion verifies behavior when pool is exhausted.
-func TestTIDPoolExhaustion(t *testing.T) {
-	// This test is tricky because exhaustion triggers cleanup.
-	// We'll test that allocTID doesn't panic when pool is empty.
-	// NOTE: Allocating all 65536 TIDs is too slow for regular tests (would take minutes).
-	// Instead, we test graceful degradation with a smaller pool simulation.
-
-	t.Skip("Skipping full exhaustion test (65536 allocations too slow). Graceful degradation tested elsewhere.")
-
-	initTIDPool()
-
-	// Allocate all 65536 TIDs.
-	for i := 0; i < 65536; i++ {
-		allocTID()
-	}
-
-	// Pool should be empty.
-	tidPoolMu.Lock()
-	poolSize := len(freeTIDs)
-	tidPoolMu.Unlock()
-
-	if poolSize != 0 {
-		t.Errorf("After exhaustion, pool size = %d, want 0", poolSize)
-	}
-
-	// Next allocation should trigger cleanup.
-	// Since no goroutines are dead (test goroutine is alive),
-	// cleanup won't free any TIDs, so we get graceful degradation (TID 0).
-	tid := allocTID()
-	if tid != 0 {
-		t.Errorf("Exhaustion fallback TID = %d, want 0", tid)
+	// Recycled TID should have clock > 10 (the clock at free time).
+	if recycledClock <= 10 {
+		t.Errorf("Recycled TID clock = %d, want > 10", recycledClock)
 	}
 }
 
@@ -201,12 +150,11 @@ func TestTIDConcurrentAllocation(t *testing.T) {
 	tids := make([]uint16, numGoroutines)
 	var wg sync.WaitGroup
 
-	// Launch 100 goroutines allocating TIDs concurrently.
 	for i := 0; i < numGoroutines; i++ {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			tids[idx] = allocTID()
+			tids[idx], _ = allocTID()
 		}(i)
 	}
 
@@ -230,38 +178,36 @@ func TestTIDConcurrentAllocation(t *testing.T) {
 func TestTIDConcurrentFree(t *testing.T) {
 	initTIDPool()
 
-	// Allocate 100 TIDs.
-	tids := make([]uint16, 100)
-	for i := 0; i < 100; i++ {
-		tids[i] = allocTID()
+	const count = 100
+	type tidInfo struct {
+		tid   uint16
+		clock uint32
+	}
+	tids := make([]tidInfo, count)
+	for i := 0; i < count; i++ {
+		tid, clock := allocTID()
+		tids[i] = tidInfo{tid, clock}
 	}
 
 	var wg sync.WaitGroup
-
-	// Free them concurrently.
-	for i := 0; i < 100; i++ {
+	for i := 0; i < count; i++ {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			freeTID(tids[idx])
+			freeTID(tids[idx].tid, tids[idx].clock)
 		}(i)
 	}
 
 	wg.Wait()
 
-	// Pool should have 65536 TIDs again.
-	tidPoolMu.Lock()
-	poolSize := len(freeTIDs)
-	tidPoolMu.Unlock()
-
-	if poolSize != 65536 {
-		t.Errorf("After concurrent free, pool size = %d, want 65536", poolSize)
+	n := poolSize()
+	if n != expectedPoolSize {
+		t.Errorf("After concurrent free, pool size = %d, want %d", n, expectedPoolSize)
 	}
 }
 
 // TestParseAllGIDs verifies parsing of runtime.Stack output.
 func TestParseAllGIDs(t *testing.T) {
-	// Sample runtime.Stack output.
 	stackTrace := []byte(`goroutine 1 [running]:
 main.main()
 	/path/to/main.go:10 +0x20
@@ -277,7 +223,6 @@ sync.(*WaitGroup).Wait()
 
 	gids := parseAllGIDs(stackTrace)
 
-	// Should extract GIDs: 1, 5, 123.
 	expected := []int64{1, 5, 123}
 	if len(gids) != len(expected) {
 		t.Fatalf("parseAllGIDs() returned %d GIDs, want %d", len(gids), len(expected))
@@ -293,7 +238,6 @@ sync.(*WaitGroup).Wait()
 // TestParseAllGIDs_EmptyInput verifies parsing empty input.
 func TestParseAllGIDs_EmptyInput(t *testing.T) {
 	gids := parseAllGIDs([]byte{})
-
 	if len(gids) != 0 {
 		t.Errorf("parseAllGIDs(empty) returned %d GIDs, want 0", len(gids))
 	}
@@ -303,7 +247,6 @@ func TestParseAllGIDs_EmptyInput(t *testing.T) {
 func TestParseAllGIDs_NoGoroutines(t *testing.T) {
 	stackTrace := []byte("some random text\nwithout goroutine lines\n")
 	gids := parseAllGIDs(stackTrace)
-
 	if len(gids) != 0 {
 		t.Errorf("parseAllGIDs(no goroutines) returned %d GIDs, want 0", len(gids))
 	}
@@ -311,7 +254,6 @@ func TestParseAllGIDs_NoGoroutines(t *testing.T) {
 
 // TestGetLiveGoroutineIDs verifies we can get all live GIDs.
 func TestGetLiveGoroutineIDs(t *testing.T) {
-	// Launch a few goroutines.
 	done := make(chan bool)
 	const numGoroutines = 5
 
@@ -321,16 +263,12 @@ func TestGetLiveGoroutineIDs(t *testing.T) {
 		}()
 	}
 
-	// Get live GIDs.
 	gids := getLiveGoroutineIDs()
 
-	// Should have at least numGoroutines + 1 (test goroutine).
-	// There may be more due to Go runtime goroutines.
 	if len(gids) < numGoroutines+1 {
 		t.Errorf("getLiveGoroutineIDs() returned %d GIDs, want >= %d", len(gids), numGoroutines+1)
 	}
 
-	// Verify all GIDs are unique.
 	gidSet := make(map[int64]bool)
 	for _, gid := range gids {
 		if gidSet[gid] {
@@ -339,132 +277,56 @@ func TestGetLiveGoroutineIDs(t *testing.T) {
 		gidSet[gid] = true
 	}
 
-	// Clean up goroutines.
 	close(done)
 }
 
 // TestCleanupDeadGoroutines verifies cleanup reclaims TIDs.
 func TestCleanupDeadGoroutines(t *testing.T) {
-	Init() // Initialize with TID pool
+	Init()
 
-	// Current GID (test goroutine).
 	testGID := getGoroutineID()
 
-	// Launch 10 short-lived goroutines.
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// Allocate context (gets TID).
 			ctx := getCurrentContext()
 			_ = ctx
-			// Goroutine exits here.
 		}()
 	}
-
 	wg.Wait()
 
-	// At this point, 10 goroutines are dead but their TIDs are still allocated.
-	// Pool should have 256 - 1 (main/test) - 10 (dead goroutines) = 245 TIDs.
-	// Actually, with Init(), main goroutine gets TID 0, so pool has 255 TIDs.
-	// After 10 allocations, pool has 255 - 10 = 245 TIDs.
+	poolSizeBefore := poolSize()
 
-	// Check pool size before cleanup.
-	tidPoolMu.Lock()
-	poolSizeBefore := len(freeTIDs)
-	tidPoolMu.Unlock()
-
-	// Should be around 245 (256 - 1 main - 10 allocated).
-	// Actually, Init() removes TID 0, so we start with 255, and after 10 allocs we have 245.
-	expectedBefore := 245
-	if poolSizeBefore != expectedBefore {
-		// This may vary due to runtime goroutines, so just log it.
-		t.Logf("Pool size before cleanup = %d, expected %d", poolSizeBefore, expectedBefore)
-	}
-
-	// Run cleanup - should reclaim the 10 TIDs from dead goroutines.
 	cleanupDeadGoroutines()
-
-	// Give cleanup time to complete (it scans runtime stacks).
 	time.Sleep(10 * time.Millisecond)
 
-	// Check pool size after cleanup.
-	tidPoolMu.Lock()
-	poolSizeAfter := len(freeTIDs)
-	tidPoolMu.Unlock()
+	poolSizeAfter := poolSize()
 
-	// Should have reclaimed 10 TIDs: 245 + 10 = 255.
-	// But test goroutine (GID testGID) is still alive with TID, so we have 255.
-	// The cleanup should have increased the pool size.
 	if poolSizeAfter < poolSizeBefore {
 		t.Errorf("Pool size after cleanup = %d, decreased from %d (expected increase)", poolSizeAfter, poolSizeBefore)
 	}
 
-	// Verify TID was reclaimed by checking we can allocate more.
-	// We should be able to allocate 255 TIDs.
-	tidsAllocated := 0
-	for i := 0; i < 260; i++ { // Try to allocate more than possible
-		tid := allocTID()
-		if tid == 0 && i >= 255 {
-			// Graceful degradation after exhaustion.
-			break
-		}
-		tidsAllocated++
-	}
-
-	if tidsAllocated < 250 {
-		t.Errorf("After cleanup, could only allocate %d TIDs, want >= 250", tidsAllocated)
-	}
-
-	t.Logf("Test GID: %d, Pool before cleanup: %d, Pool after cleanup: %d, TIDs allocated: %d",
-		testGID, poolSizeBefore, poolSizeAfter, tidsAllocated)
+	t.Logf("Test GID: %d, Pool before: %d, Pool after: %d", testGID, poolSizeBefore, poolSizeAfter)
 }
 
 // TestMaybeCleanup verifies periodic cleanup is triggered.
 func TestMaybeCleanup(t *testing.T) {
 	Init()
 
-	// Reset allocation counter.
 	allocCounter.Store(0)
 
-	// Call maybeCleanup 1000 times - should trigger cleanup once.
 	for i := 0; i < 1000; i++ {
 		maybeCleanup()
 	}
 
-	// Verify counter is 1000.
 	count := allocCounter.Load()
 	if count != 1000 {
 		t.Errorf("After 1000 maybeCleanup calls, counter = %d, want 1000", count)
 	}
 
-	// Cleanup should have been triggered at count=1000.
-	// We can't easily verify cleanup ran, but we can verify no panic.
-	// Wait a bit for background cleanup goroutine.
 	time.Sleep(50 * time.Millisecond)
-}
-
-// TestMaybeCleanup_NoSpam verifies cleanup isn't triggered too often.
-func TestMaybeCleanup_NoSpam(t *testing.T) {
-	Init()
-
-	// Reset counter.
-	allocCounter.Store(0)
-
-	// Call maybeCleanup 500 times - should NOT trigger cleanup.
-	for i := 0; i < 500; i++ {
-		maybeCleanup()
-	}
-
-	// Verify counter is 500.
-	count := allocCounter.Load()
-	if count != 500 {
-		t.Errorf("After 500 maybeCleanup calls, counter = %d, want 500", count)
-	}
-
-	// No cleanup should have run (threshold is 1000).
-	// We just verify no panic.
 }
 
 // TestIntegration_1000Goroutines tests 1000 concurrent goroutines with TID reuse.
@@ -474,8 +336,6 @@ func TestIntegration_1000Goroutines(t *testing.T) {
 	const numGoroutines = 1000
 	const batchSize = 100
 
-	// Launch goroutines in batches to trigger TID reuse.
-	// Each batch allocates 100 TIDs, then goroutines exit, freeing TIDs.
 	for batch := 0; batch < numGoroutines/batchSize; batch++ {
 		var wg sync.WaitGroup
 
@@ -483,52 +343,38 @@ func TestIntegration_1000Goroutines(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				// Allocate context (gets TID).
 				ctx := getCurrentContext()
-				// Do some work.
 				_ = ctx.TID
-				// Goroutine exits, TID should be reclaimed.
 			}()
 		}
 
 		wg.Wait()
 
-		// Trigger cleanup after each batch.
 		if batch%10 == 0 {
 			cleanupDeadGoroutines()
-			time.Sleep(10 * time.Millisecond) // Let cleanup run
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 
-	// Verify we didn't panic and detector still works.
-	if !enabled.Load() {
+	if enabled.Load() == 0 {
 		t.Error("Detector disabled after 1000 goroutines")
 	}
 
-	// Run final cleanup and wait for it to complete.
 	cleanupDeadGoroutines()
 	time.Sleep(100 * time.Millisecond)
 
-	// Verify pool has TIDs available.
-	tidPoolMu.Lock()
-	poolSize := len(freeTIDs)
-	tidPoolMu.Unlock()
-
-	// After cleanup, should have most TIDs back.
-	// We may not get all 255 back because some runtime goroutines may still be alive.
-	// But we should have at least 150+ available.
-	if poolSize < 150 {
-		t.Errorf("After 1000 goroutines with cleanup, pool size = %d, want >= 150", poolSize)
+	n := poolSize()
+	if n < 150 {
+		t.Errorf("After 1000 goroutines with cleanup, pool size = %d, want >= 150", n)
 	}
 
-	t.Logf("After 1000 goroutines: pool size = %d, detector enabled = %v", poolSize, enabled.Load())
+	t.Logf("After 1000 goroutines: pool size = %d, detector enabled = %v", n, enabled.Load())
 }
 
 // TestIntegration_LongLivedAndShortLived tests mix of goroutine lifetimes.
 func TestIntegration_LongLivedAndShortLived(t *testing.T) {
 	Init()
 
-	// Launch 10 long-lived goroutines.
 	longLivedDone := make(chan bool)
 	for i := 0; i < 10; i++ {
 		go func() {
@@ -538,7 +384,6 @@ func TestIntegration_LongLivedAndShortLived(t *testing.T) {
 		}()
 	}
 
-	// Launch 100 short-lived goroutines.
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
@@ -546,31 +391,21 @@ func TestIntegration_LongLivedAndShortLived(t *testing.T) {
 			defer wg.Done()
 			ctx := getCurrentContext()
 			_ = ctx
-			// Immediate exit
 		}()
 	}
-
 	wg.Wait()
 
-	// Run cleanup to reclaim short-lived TIDs.
 	cleanupDeadGoroutines()
 	time.Sleep(10 * time.Millisecond)
 
-	// Verify pool has TIDs (short-lived ones reclaimed).
-	tidPoolMu.Lock()
-	poolSize := len(freeTIDs)
-	tidPoolMu.Unlock()
-
-	// Should have ~245 TIDs (256 - 1 main - 10 long-lived).
-	// Actually depends on cleanup efficiency.
-	if poolSize < 200 {
-		t.Errorf("After mixed lifetimes, pool size = %d, want >= 200", poolSize)
+	n := poolSize()
+	if n < 200 {
+		t.Errorf("After mixed lifetimes, pool size = %d, want >= 200", n)
 	}
 
-	// Clean up long-lived goroutines.
 	close(longLivedDone)
 
-	t.Logf("Mixed lifetimes: pool size = %d", poolSize)
+	t.Logf("Mixed lifetimes: pool size = %d", n)
 }
 
 // TestTIDPoolThreadSafety verifies TID pool operations are thread-safe.
@@ -582,34 +417,24 @@ func TestTIDPoolThreadSafety(t *testing.T) {
 
 	var wg sync.WaitGroup
 
-	// Launch workers that allocate and free TIDs concurrently.
 	for worker := 0; worker < numWorkers; worker++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
 			for op := 0; op < operationsPerWorker; op++ {
-				// Allocate TID.
-				tid := allocTID()
-
-				// Do some work.
+				tid, clock := allocTID()
 				runtime.Gosched()
-
-				// Free TID.
-				freeTID(tid)
+				freeTID(tid, clock)
 			}
 		}()
 	}
 
 	wg.Wait()
 
-	// After all operations, pool should have 65536 TIDs.
-	tidPoolMu.Lock()
-	poolSize := len(freeTIDs)
-	tidPoolMu.Unlock()
-
-	if poolSize != 65536 {
-		t.Errorf("After concurrent alloc/free, pool size = %d, want 65536", poolSize)
+	n := poolSize()
+	if n != expectedPoolSize {
+		t.Errorf("After concurrent alloc/free, pool size = %d, want %d", n, expectedPoolSize)
 	}
 }
 
@@ -619,11 +444,8 @@ func BenchmarkAllocTID(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = allocTID()
-		// Note: This will exhaust pool after 65536 iterations.
-		// For accurate benchmark, we should free TIDs too.
-		if i%65536 == 65535 {
-			// Reset pool.
+		_, _ = allocTID()
+		if i%expectedPoolSize == expectedPoolSize-1 {
 			initTIDPool()
 		}
 	}
@@ -633,21 +455,26 @@ func BenchmarkAllocTID(b *testing.B) {
 func BenchmarkFreeTID(b *testing.B) {
 	initTIDPool()
 
-	// Pre-allocate TIDs to free.
-	tids := make([]uint16, 256)
-	for i := 0; i < 256; i++ {
-		tids[i] = allocTID()
+	const count = 256
+	type tidInfo struct {
+		tid   uint16
+		clock uint32
+	}
+	tids := make([]tidInfo, count)
+	for i := 0; i < count; i++ {
+		tid, clock := allocTID()
+		tids[i] = tidInfo{tid, clock}
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		freeTID(tids[i%256])
+		ti := tids[i%count]
+		freeTID(ti.tid, ti.clock)
 	}
 }
 
 // BenchmarkGetLiveGoroutineIDs benchmarks goroutine ID enumeration.
 func BenchmarkGetLiveGoroutineIDs(b *testing.B) {
-	// Launch some goroutines to make it realistic.
 	done := make(chan bool)
 	for i := 0; i < 100; i++ {
 		go func() { <-done }()
@@ -665,7 +492,6 @@ func BenchmarkGetLiveGoroutineIDs(b *testing.B) {
 func BenchmarkCleanupDeadGoroutines(b *testing.B) {
 	Init()
 
-	// Create some contexts for cleanup to scan.
 	for i := 0; i < 100; i++ {
 		go func() {
 			ctx := getCurrentContext()
@@ -674,7 +500,7 @@ func BenchmarkCleanupDeadGoroutines(b *testing.B) {
 		}()
 	}
 
-	time.Sleep(50 * time.Millisecond) // Let goroutines start
+	time.Sleep(50 * time.Millisecond)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

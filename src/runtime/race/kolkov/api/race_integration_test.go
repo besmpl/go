@@ -274,7 +274,7 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	// Phase 1: Initialize
 	Init()
 
-	if !enabled.Load() {
+	if enabled.Load() == 0 {
 		t.Fatal("Init() did not enable detector")
 	}
 
@@ -325,7 +325,7 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	}
 
 	// Verify detector is disabled after Fini
-	if enabled.Load() {
+	if enabled.Load() != 0 {
 		t.Error("Detector should be disabled after Fini()")
 	}
 
@@ -482,7 +482,7 @@ func TestIntegration_RepeatedInitFini(t *testing.T) {
 		}
 
 		// Verify detector is disabled after Fini
-		if enabled.Load() {
+		if enabled.Load() != 0 {
 			t.Errorf("Cycle %d: Detector not disabled after Fini", cycle)
 		}
 	}

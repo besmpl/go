@@ -467,7 +467,7 @@ func BenchmarkFullStack_RaceReadWithPC(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		// Inline what raceread does to measure full cost.
-		if enabled.Load() {
+		if enabled.Load() != 0 {
 			ctx := getCurrentContext()
 			_ = getcallerpc()
 			det.OnRead(addr, ctx, 0)
@@ -488,7 +488,7 @@ func BenchmarkFullStack_RaceWriteWithPC(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		if enabled.Load() {
+		if enabled.Load() != 0 {
 			ctx := getCurrentContext()
 			_ = getcallerpc()
 			det.OnWrite(addr, ctx, 0)

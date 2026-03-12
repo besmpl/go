@@ -79,7 +79,7 @@ func BenchmarkComparison_ContextAllocation(b *testing.B) {
 		b.ReportAllocs()
 
 		for i := 0; i < b.N; i++ {
-			_ = allocTID()
+			_, _ = allocTID()
 			// Note: Not freeing to measure allocation only
 		}
 	})
@@ -158,7 +158,7 @@ func BenchmarkComparison_ContextLookup(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			// Phase 1: Slow GID extraction + map lookup
 			gid := getGoroutineIDSlow()
-			_, _ = contexts.Load(gid)
+			_, _ = contextsMap.Load(gid)
 		}
 	})
 
@@ -332,7 +332,7 @@ func BenchmarkComparison_FirstContextCreation(b *testing.B) {
 			gid := getGoroutineIDSlow()
 			tid := uint16(nextTID.Add(1) % 256)
 			ctx := goroutine.Alloc(tid)
-			contexts.Store(gid, ctx)
+			contextsMap.Store(gid, ctx)
 			b.StopTimer()
 		}
 	})
@@ -364,7 +364,7 @@ func BenchmarkComparison_CachedContextLookup(b *testing.B) {
 		gid := getGoroutineIDSlow()
 		tid := uint16(0)
 		ctx := goroutine.Alloc(tid)
-		contexts.Store(gid, ctx)
+		contextsMap.Store(gid, ctx)
 
 		b.ResetTimer()
 		b.ReportAllocs()
@@ -372,7 +372,7 @@ func BenchmarkComparison_CachedContextLookup(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			// Phase 1: slow GID + map lookup
 			gid := getGoroutineIDSlow()
-			_, _ = contexts.Load(gid)
+			_, _ = contextsMap.Load(gid)
 		}
 	})
 
@@ -419,16 +419,20 @@ func BenchmarkComparison_TIDAllocation(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
 
-		tids := make([]uint16, 0, b.N)
+		type tidInfo struct {
+			tid   uint16
+			clock uint32
+		}
+		tids := make([]tidInfo, 0, b.N)
 		for i := 0; i < b.N; i++ {
-			tid := allocTID()
-			tids = append(tids, tid)
+			tid, clock := allocTID()
+			tids = append(tids, tidInfo{tid, clock})
 		}
 
 		// Free TIDs to cleanup
 		b.StopTimer()
-		for _, tid := range tids {
-			freeTID(tid)
+		for _, ti := range tids {
+			freeTID(ti.tid, ti.clock)
 		}
 	})
 }
