@@ -985,6 +985,47 @@ func racereleasemergeCtx(addr, racectx uintptr) {
 	det.OnReleaseMerge(addr, ctx)
 }
 
+// === Same-Epoch Fast Path (T22 optimization) ===
+// These functions check if a memory access can skip the full detector path.
+// Called from runtime BEFORE systemstack() to avoid ~60ns closure+stack-switch
+// overhead for ~65% of accesses (same-epoch hits).
+//
+// Same-epoch read: if the write epoch's TID+clock matches this goroutine's
+// current epoch, then this goroutine was the last writer at the same logical
+// time. No other goroutine could have written since, so no read-write race.
+//
+// Same-epoch write: additionally requires no concurrent readers (readerState==0),
+// because a concurrent read from another goroutine could race with this write.
+
+//go:linkname raceSameEpochRead
+//go:nosplit
+func raceSameEpochRead(addr, racectx uintptr) bool {
+	ctx := (*goroutine.RaceContext)(unsafe.Pointer(racectx))
+	vs := det.ShadowGet(addr)
+	if vs == nil {
+		return false // First access, need full path to create VarState.
+	}
+	// Same-epoch check: the write epoch stored in shadow matches this
+	// goroutine's current epoch exactly (same TID AND same clock).
+	// This means the goroutine was the last writer and its clock hasn't
+	// advanced since. No race is possible.
+	return vs.W.Load() == uint64(ctx.Epoch)
+}
+
+//go:linkname raceSameEpochWrite
+//go:nosplit
+func raceSameEpochWrite(addr, racectx uintptr) bool {
+	ctx := (*goroutine.RaceContext)(unsafe.Pointer(racectx))
+	vs := det.ShadowGet(addr)
+	if vs == nil {
+		return false // First access, need full path to create VarState.
+	}
+	// Same-epoch write check: write epoch matches AND no concurrent readers.
+	// If there are readers from other goroutines, we must do the full check
+	// to detect write-read races.
+	return vs.W.Load() == uint64(ctx.Epoch) && vs.GetReaderCount() == 0
+}
+
 // === g.racectx Slow Path: creates context, returns pointer for caching ===
 // Called on first access per goroutine. Returns context pointer as uintptr
 // so runtime can cache it in g.racectx for subsequent fast-path calls.

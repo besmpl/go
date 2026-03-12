@@ -237,6 +237,11 @@ func racereadpc(addr unsafe.Pointer, callpc, pc uintptr) {
 	racectx := gp.racectx
 	gp.raceignore++
 	if racectx > 1 {
+		// T22: Same-epoch fast path.
+		if kolkovSameEpochRead(uintptr(addr), racectx) {
+			gp.raceignore--
+			return
+		}
 		systemstack(func() {
 			kolkovOnReadCtx(uintptr(addr), pc, racectx)
 		})
@@ -272,6 +277,11 @@ func racewritepc(addr unsafe.Pointer, callpc, pc uintptr) {
 	racectx := gp.racectx
 	gp.raceignore++
 	if racectx > 1 {
+		// T22: Same-epoch fast path.
+		if kolkovSameEpochWrite(uintptr(addr), racectx) {
+			gp.raceignore--
+			return
+		}
 		systemstack(func() {
 			kolkovOnWriteCtx(uintptr(addr), pc, racectx)
 		})
@@ -804,7 +814,14 @@ func raceread(addr uintptr) {
 	racectx := gp.racectx
 	gp.raceignore++
 	if racectx > 1 {
-		// Fast path: context cached in g.racectx
+		// T22: Same-epoch fast path — skip systemstack for ~65% of reads.
+		// If the shadow cell's write epoch matches this goroutine's epoch,
+		// no other goroutine has written since our last check. No race possible.
+		if kolkovSameEpochRead(addr, racectx) {
+			gp.raceignore--
+			return
+		}
+		// Full path: context cached in g.racectx
 		systemstack(func() {
 			kolkovOnReadCtx(addr, pc, racectx)
 		})
@@ -843,6 +860,13 @@ func racewrite(addr uintptr) {
 	racectx := gp.racectx
 	gp.raceignore++
 	if racectx > 1 {
+		// T22: Same-epoch fast path — skip systemstack for ~65% of writes.
+		// If the shadow cell's write epoch matches AND no concurrent readers,
+		// no race is possible. Skip the expensive systemstack call.
+		if kolkovSameEpochWrite(addr, racectx) {
+			gp.raceignore--
+			return
+		}
 		systemstack(func() {
 			kolkovOnWriteCtx(addr, pc, racectx)
 		})
@@ -880,6 +904,11 @@ func racereadrange(addr, size uintptr) {
 	racectx := gp.racectx
 	gp.raceignore++
 	if racectx > 1 {
+		// T22: Same-epoch fast path.
+		if kolkovSameEpochRead(addr, racectx) {
+			gp.raceignore--
+			return
+		}
 		systemstack(func() {
 			// Track base address for now. Full range tracking is T11.
 			kolkovOnReadCtx(addr, pc, racectx)
@@ -918,6 +947,11 @@ func racewriterange(addr, size uintptr) {
 	racectx := gp.racectx
 	gp.raceignore++
 	if racectx > 1 {
+		// T22: Same-epoch fast path.
+		if kolkovSameEpochWrite(addr, racectx) {
+			gp.raceignore--
+			return
+		}
 		systemstack(func() {
 			// Track base address for now. Full range tracking is T11.
 			kolkovOnWriteCtx(addr, pc, racectx)
@@ -954,6 +988,11 @@ func racereadrangepc1(addr, size, pc uintptr) {
 	racectx := gp.racectx
 	gp.raceignore++
 	if racectx > 1 {
+		// T22: Same-epoch fast path.
+		if kolkovSameEpochRead(addr, racectx) {
+			gp.raceignore--
+			return
+		}
 		systemstack(func() {
 			kolkovOnReadCtx(addr, pc, racectx)
 		})
@@ -989,6 +1028,11 @@ func racewriterangepc1(addr, size, pc uintptr) {
 	racectx := gp.racectx
 	gp.raceignore++
 	if racectx > 1 {
+		// T22: Same-epoch fast path.
+		if kolkovSameEpochWrite(addr, racectx) {
+			gp.raceignore--
+			return
+		}
 		systemstack(func() {
 			kolkovOnWriteCtx(addr, pc, racectx)
 		})

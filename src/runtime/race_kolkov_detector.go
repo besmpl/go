@@ -175,6 +175,14 @@ func kolkovOnReleaseCtx(addr, racectx uintptr)
 //go:linkname kolkovOnReleaseMergeCtx runtime/race/kolkov/api.racereleasemergeCtx
 func kolkovOnReleaseMergeCtx(addr, racectx uintptr)
 
+// Same-epoch fast path: check if systemstack can be skipped (T22 optimization).
+
+//go:linkname kolkovSameEpochRead runtime/race/kolkov/api.raceSameEpochRead
+func kolkovSameEpochRead(addr, racectx uintptr) bool
+
+//go:linkname kolkovSameEpochWrite runtime/race/kolkov/api.raceSameEpochWrite
+func kolkovSameEpochWrite(addr, racectx uintptr) bool
+
 // Slow path: creates context, performs operation, returns pointer for caching in g.racectx.
 
 //go:linkname kolkovOnReadSlow runtime/race/kolkov/api.racereadSlow

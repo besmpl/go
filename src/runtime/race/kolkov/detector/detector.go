@@ -1318,6 +1318,17 @@ func (d *Detector) OnWaitGroupWaitAfter(wg uintptr, ctx *goroutine.RaceContext) 
 	ctx.IncrementClock()
 }
 
+// ShadowGet returns the VarState for addr without creating it.
+// Returns nil if the address has never been accessed.
+//
+// This is used by the same-epoch fast path in the runtime to check
+// whether a systemstack call can be skipped. Read-only, no allocation.
+//
+//go:nosplit
+func (d *Detector) ShadowGet(addr uintptr) *shadowmem.VarState {
+	return d.shadowMemory.Get(addr)
+}
+
 // ClearShadowRange clears shadow memory for the given address range.
 // Called during memory allocation/free to prevent false positives from
 // stale shadow state when the allocator reuses addresses.
