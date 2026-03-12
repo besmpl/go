@@ -128,55 +128,6 @@ type DetectorOptions struct {
 	SampleRate uint64
 }
 
-// PromotionStats tracks adaptive representation statistics (Phase 3).
-//
-// All fields use atomic.Uint64 for lock-free hot-path updates.
-// This eliminates ~25ns per OnRead/OnWrite by removing mutex acquisition
-// from the statistics tracking path.
-//
-// Use LoadSnapshot() to get a consistent plain-value copy for reporting.
-//
-// In production, we expect:
-//   - 90%+ fast path reads (unpromoted)
-//   - <1% promotions (rare concurrent reads)
-//   - High promotion success rate
-type PromotionStats struct {
-	TotalReads    atomic.Uint64 // Total read operations.
-	TotalWrites   atomic.Uint64 // Total write operations.
-	Promotions    atomic.Uint64 // Epoch → VectorClock promotions.
-	Demotions     atomic.Uint64 // VectorClock → Epoch demotions (on write).
-	FastPathReads atomic.Uint64 // Reads using Epoch (fast).
-	SlowPathReads atomic.Uint64 // Reads using VectorClock (slow).
-	PromotedVars  atomic.Uint64 // Current number of promoted variables.
-}
-
-// PromotionStatsSnapshot is a plain-value snapshot of PromotionStats
-// for reporting and testing. Returned by PromotionStats.LoadSnapshot()
-// and Detector.GetPromotionStats().
-type PromotionStatsSnapshot struct {
-	TotalReads    uint64
-	TotalWrites   uint64
-	Promotions    uint64
-	Demotions     uint64
-	FastPathReads uint64
-	SlowPathReads uint64
-	PromotedVars  uint64
-}
-
-// LoadSnapshot returns a point-in-time snapshot of the atomic counters.
-// The snapshot is not strictly consistent across fields (each Load is independent),
-// but this is acceptable for diagnostic statistics.
-func (s *PromotionStats) LoadSnapshot() PromotionStatsSnapshot {
-	return PromotionStatsSnapshot{
-		TotalReads:    s.TotalReads.Load(),
-		TotalWrites:   s.TotalWrites.Load(),
-		Promotions:    s.Promotions.Load(),
-		Demotions:     s.Demotions.Load(),
-		FastPathReads: s.FastPathReads.Load(),
-		SlowPathReads: s.SlowPathReads.Load(),
-		PromotedVars:  s.PromotedVars.Load(),
-	}
-}
 
 // Detector implements the core FastTrack race detection algorithm.
 //
@@ -215,9 +166,6 @@ type Detector struct {
 	// This prevents duplicate reports for the same race location.
 	// Added in Phase 5 Task 5.3.
 	reportedRaces reportedRacesMap
-
-	// stats tracks adaptive representation statistics (Phase 3).
-	stats PromotionStats
 
 	// operationCount tracks total operations for periodic overflow checks (v0.2.0 Task 5).
 	// Incremented on every OnWrite/OnRead call. When it reaches overflowCheckInterval,
@@ -621,16 +569,7 @@ func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext, pc uintptr)
 	// Step 8: Clear read tracking and DEMOTE back to fast path.
 	// Write dominates all previous reads, so we reset read state.
 	// This is a key optimization: variables with alternating read/write stay in fast path.
-	wasPromoted := vs.IsPromoted()
 	vs.Demote()
-	if wasPromoted {
-		// Track demotion statistics (lock-free atomic updates).
-		d.stats.Demotions.Add(1)
-		d.stats.PromotedVars.Add(-1) // atomic decrement
-	}
-
-	// Track write statistics (lock-free atomic update).
-	d.stats.TotalWrites.Add(1)
 
 	// Step 9: Increment logical clock to advance time.
 	// This must be done AFTER updating shadow memory to maintain
@@ -725,9 +664,6 @@ func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) 
 	//nolint:nestif // FastTrack adaptive algorithm requires nested conditions for performance
 	if !vs.IsPromoted() {
 		// FAST PATH: Single reader (common case, 90%+ of reads).
-		// Lock-free atomic updates for statistics.
-		d.stats.TotalReads.Add(1)
-		d.stats.FastPathReads.Add(1)
 
 		// [FT READ SAME EPOCH] Fast path optimization.
 		// If we're reading from the same location in the same epoch, no race possible.
@@ -759,9 +695,6 @@ func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) 
 
 			// CONCURRENT READS DETECTED - PROMOTE!
 			vs.PromoteToReadClock(ctx.C)
-			// Lock-free atomic updates for statistics.
-			d.stats.Promotions.Add(1)
-			d.stats.PromotedVars.Add(1)
 			ctx.IncrementClock()
 			return
 		}
@@ -773,10 +706,6 @@ func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) 
 	}
 
 	// SLOW PATH: Multiple readers (already promoted, 0.1% of reads).
-	// Lock-free atomic updates for statistics.
-	d.stats.TotalReads.Add(1)
-	d.stats.SlowPathReads.Add(1)
-
 	vs.GetReadClock().Join(ctx.C)
 
 	// Lazy stack capture for read-shared variables (v0.3.0 Performance).
@@ -1426,34 +1355,6 @@ func (d *Detector) Reset() {
 	// Clear reported races map (Phase 5 Task 5.3).
 	d.reportedRaces.reset()
 
-	// Reset promotion statistics (atomic stores to zero).
-	d.stats.TotalReads.Store(0)
-	d.stats.TotalWrites.Store(0)
-	d.stats.Promotions.Store(0)
-	d.stats.Demotions.Store(0)
-	d.stats.FastPathReads.Store(0)
-	d.stats.SlowPathReads.Store(0)
-	d.stats.PromotedVars.Store(0)
-}
-
-// GetPromotionStats returns a point-in-time snapshot of the current promotion statistics.
-//
-// This provides insight into the adaptive VarState optimization effectiveness:
-//   - Fast path percentage: FastPathReads / TotalReads (expect >90%)
-//   - Promotion rate: Promotions / TotalReads (expect <1%)
-//   - Promoted variables: PromotedVars (should be small)
-//
-// Thread Safety: Safe for concurrent calls (lock-free atomic loads).
-//
-// Returns:
-//   - PromotionStatsSnapshot: Point-in-time snapshot of statistics
-//
-// Example usage:
-//
-//	stats := detector.GetPromotionStats()
-//	fastPathRate := float64(stats.FastPathReads) / float64(stats.TotalReads) * 100
-func (d *Detector) GetPromotionStats() PromotionStatsSnapshot {
-	return d.stats.LoadSnapshot()
 }
 
 // IsSamplingEnabled returns true if sampling is enabled (v0.3.0).
