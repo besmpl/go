@@ -597,6 +597,96 @@ func raceGoSetChildID(childGoid int64) {
 	spawnContextsMu.unlock()
 }
 
+// raceGoSetChildIDWithCtx associates the most recently created spawn context
+// with the actual child goroutine goid AND eagerly creates the child's
+// RaceContext. Returns the context pointer as uintptr for direct caching
+// in newg.racectx.
+//
+// T13 optimization: By creating the context here (during goroutine creation),
+// we eliminate the first-access slow path that would otherwise run on the
+// child's first raceread/racewrite. The context is stored in both:
+//   - contextsMap (as *goroutine.RaceContext — visible to GC, dual reference)
+//   - g.racectx (as uintptr — invisible to GC, fast path access)
+//
+// This is safe because contextsMap keeps the context alive until raceGoEnd
+// removes it. The GC sees the *RaceContext in contextsMap and won't collect it.
+//
+//go:linkname raceGoSetChildIDWithCtx
+func raceGoSetChildIDWithCtx(childGoid int64) uintptr {
+	if enabled.Load() == 0 {
+		return 0
+	}
+
+	// Step 1: Associate spawn context with childGoid (same as raceGoSetChildID).
+	var parentClock *vectorclock.VectorClock
+	spawnContextsMu.lock()
+	for i := len(spawnContextsSlice) - 1; i >= 0; i-- {
+		info := spawnContextsSlice[i]
+		if info.consumed.Load() == 0 && info.childGoid == 0 {
+			info.childGoid = childGoid
+			// Consume the spawn context immediately — the child won't need
+			// findAndConsumeSpawnContext since we create its context here.
+			if info.consumed.CompareAndSwap(0, 1) {
+				parentClock = info.parentClock
+			}
+			break
+		}
+	}
+	spawnContextsMu.unlock()
+
+	// Step 2: Eagerly create the child's RaceContext.
+	tid, startClock := allocTID()
+
+	var ctx *goroutine.RaceContext
+	if parentClock != nil {
+		ctx = goroutine.AllocWithParentClock(tid, parentClock, startClock)
+	} else {
+		ctx = goroutine.AllocWithStartClock(tid, startClock)
+	}
+
+	// Step 3: Store in contextsMap for GC safety (dual reference).
+	contextsMap.Store(childGoid, ctx)
+
+	// Track TID → GID mapping for cleanup.
+	tidToGIDMap.Store(tid, childGoid)
+
+	return uintptr(unsafe.Pointer(ctx))
+}
+
+// raceInitMainCtx pre-creates the main goroutine's (goid=1) RaceContext.
+// Called during raceinit to eliminate the first-access slow path for main.
+//
+// The main goroutine is special: it has goid=1 and no parent spawn context.
+// Returns the context pointer as uintptr for caching in g.racectx.
+//
+//go:linkname raceInitMainCtx
+func raceInitMainCtx() uintptr {
+	if apiInitCalled.Load() == 0 {
+		ensureInitialized()
+	}
+	if enabled.Load() == 0 {
+		return 0
+	}
+
+	// Check if main goroutine context already exists (shouldn't, but be safe).
+	var mainGoid int64 = 1
+	if ctx, ok := contextsMap.Load(mainGoid); ok {
+		return uintptr(unsafe.Pointer(ctx))
+	}
+
+	// Allocate TID and create context for main goroutine.
+	tid, startClock := allocTID()
+	ctx := goroutine.AllocWithStartClock(tid, startClock)
+
+	// Store in contextsMap for GC safety (dual reference).
+	contextsMap.Store(mainGoid, ctx)
+
+	// Track TID → GID mapping.
+	tidToGIDMap.Store(tid, mainGoid)
+
+	return uintptr(unsafe.Pointer(ctx))
+}
+
 // racegoend is called when a goroutine terminates.
 //
 // This function cleans up resources associated with the goroutine:

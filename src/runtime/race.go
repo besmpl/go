@@ -562,8 +562,10 @@ func racegostart(pc uintptr) uintptr {
 }
 
 //go:nosplit
-func racegosetchildid(childGoid uint64) {
-	// TSAN: not needed, racectx already handles child identification
+func racegosetchildid(childGoid uint64) uintptr {
+	// TSAN: not needed, racectx already handles child identification.
+	// Return 0 so proc.go keeps the racectx from racegostart.
+	return 0
 }
 
 //go:nosplit

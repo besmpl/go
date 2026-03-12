@@ -141,6 +141,13 @@ func kolkovApiOnReleaseMergeForGoroutine(addr uintptr, goid int64)
 //go:linkname kolkovApiGoSetChildID runtime/race/kolkov/api.raceGoSetChildID
 func kolkovApiGoSetChildID(childGoid int64)
 
+// T13: Eager context creation during goroutine spawn.
+//go:linkname kolkovApiGoSetChildIDWithCtx runtime/race/kolkov/api.raceGoSetChildIDWithCtx
+func kolkovApiGoSetChildIDWithCtx(childGoid int64) uintptr
+
+//go:linkname kolkovApiInitMainCtx runtime/race/kolkov/api.raceInitMainCtx
+func kolkovApiInitMainCtx() uintptr
+
 //go:linkname kolkovApiClearShadow runtime/race/kolkov/api.raceClearShadow
 func kolkovApiClearShadow(addr, size uintptr)
 

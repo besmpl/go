@@ -5413,7 +5413,12 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr, parked bool, waitreaso
 	// Set up race context.
 	if raceenabled {
 		newg.racectx = racegostart(callerpc)
-		racegosetchildid(newg.goid)
+		// T13: racegosetchildid eagerly creates the child's RaceContext
+		// and returns its pointer for caching in newg.racectx.
+		// This eliminates the first-access slow path (contextsMap lookup).
+		if ctx := racegosetchildid(newg.goid); ctx != 0 {
+			newg.racectx = ctx
+		}
 		newg.raceignore = 0
 		if newg.labels != nil {
 			// See note in proflabel.go on labelSync's role in synchronizing

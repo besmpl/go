@@ -307,10 +307,15 @@ func raceinit() (gctx, pctx uintptr) {
 	// Initialize global detector state
 	raceKolkovInit()
 
-	// Return non-zero sentinel values so that runtime stores them in
-	// g.racectx and p.racectx. raceacquirectx checks "if racectx == 0 { return }"
-	// so returning 0 would cause the main goroutine to be silently skipped.
-	gctx = 1
+	// T13: Pre-create the main goroutine's (goid=1) RaceContext eagerly.
+	// This eliminates the first-access slow path for the main goroutine.
+	// The context is stored in contextsMap (GC safety) and returned as uintptr
+	// for caching in g.racectx.
+	gctx = kolkovApiInitMainCtx()
+	if gctx == 0 {
+		// Fallback: return sentinel if context creation failed.
+		gctx = 1
+	}
 	pctx = 1
 
 	return
@@ -437,20 +442,28 @@ func racegostart(pc uintptr) uintptr {
 // racegosetchildid associates the most recently created spawn context with
 // the actual child goroutine goid. Called by proc.go right after racegostart.
 //
+// T13 optimization: Also eagerly creates the child's RaceContext and returns
+// its pointer as uintptr for direct caching in newg.racectx. This eliminates
+// the first-access slow path (contextsMap lookup) for every new goroutine.
+// The context is stored in both contextsMap (for GC safety) and g.racectx
+// (as uintptr for fast path access).
+//
 //go:nosplit
-func racegosetchildid(childGoid uint64) {
+func racegosetchildid(childGoid uint64) uintptr {
 	gp := getg()
 	if gp.m != nil && gp.m.curg != nil {
 		gp = gp.m.curg
 	}
 	if gp.raceignore != 0 {
-		return
+		return 0
 	}
+	var ctx uintptr
 	gp.raceignore++
 	systemstack(func() {
-		kolkovApiGoSetChildID(int64(childGoid))
+		ctx = kolkovApiGoSetChildIDWithCtx(int64(childGoid))
 	})
 	gp.raceignore--
+	return ctx
 }
 
 // racegoend notifies the race detector that the current goroutine is ending.
