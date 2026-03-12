@@ -640,6 +640,8 @@ func raceGoSetChildIDWithCtx(childGoid int64) uintptr {
 	var ctx *goroutine.RaceContext
 	if parentClock != nil {
 		ctx = goroutine.AllocWithParentClock(tid, parentClock, startClock)
+		// Release the spawn clock clone back to pool (data already copied).
+		parentClock.Release()
 	} else {
 		ctx = goroutine.AllocWithStartClock(tid, startClock)
 	}
@@ -810,6 +812,15 @@ func findAndConsumeSpawnContext() *vectorclock.VectorClock {
 	for _, info := range spawnContextsSlice {
 		if info.consumed.Load() == 0 && nowNs-info.createdAtNs <= spawnContextTTLNs {
 			validContexts = append(validContexts, info)
+		} else if info.parentClock != nil && info != nil {
+			// Release expired/consumed spawn clocks back to pool.
+			// The consumed ones whose clock was used have already been released
+			// by the consumer (raceGoSetChildIDWithCtx / getCurrentContext).
+			// This handles expired contexts that were never consumed.
+			if info.consumed.Load() == 0 {
+				info.parentClock.Release()
+			}
+			info.parentClock = nil
 		}
 	}
 	spawnContextsSlice = validContexts
@@ -1474,6 +1485,8 @@ func getCurrentContext() *goroutine.RaceContext {
 	if parentClock != nil {
 		// GoStart path: inherit parent's clock with recycling-safe startClock.
 		ctx = goroutine.AllocWithParentClock(tid, parentClock, startClock)
+		// Release the spawn clock clone back to pool (data already copied).
+		parentClock.Release()
 	} else {
 		// Legacy path: fresh clock with recycling-safe startClock.
 		ctx = goroutine.AllocWithStartClock(tid, startClock)

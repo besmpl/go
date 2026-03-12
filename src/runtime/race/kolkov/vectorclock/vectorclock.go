@@ -11,7 +11,7 @@
 // Performance targets: Join < 500ns, LessOrEqual < 300ns, zero allocations.
 package vectorclock
 
-// No external imports - runtime-compatible.
+import iatomic "internal/runtime/atomic"
 
 const (
 	// MaxThreads is the maximum number of concurrent threads (goroutines) supported.
@@ -31,9 +31,54 @@ const (
 	MaxThreads = 1024
 )
 
-// NOTE: sync.Pool is not available in runtime context.
-// VectorClock pooling is disabled for runtime integration.
-// Future optimization: implement freelist using runtime primitives.
+// vcPool is a simple free-list for VectorClock reuse.
+// Eliminates ~4KB heap allocation per goroutine start/clone.
+//
+// Thread Safety: Protected by CAS-based spinlock (poolLock).
+// Capacity: poolCap limits the pool to prevent unbounded memory growth.
+var (
+	poolSlice []*VectorClock
+	poolLock  iatomic.Uint32
+	poolCap   = 256 // Max pooled VectorClocks (256 * 4KB = 1MB max pool)
+)
+
+// poolGet retrieves a VectorClock from the pool or allocates a new one.
+// The returned VectorClock is guaranteed to be in zero state.
+func poolGet() *VectorClock {
+	// Spin-lock acquire.
+	for !poolLock.CompareAndSwap(0, 1) {
+		// Spin.
+	}
+	var vc *VectorClock
+	if n := len(poolSlice); n > 0 {
+		vc = poolSlice[n-1]
+		poolSlice[n-1] = nil // Clear reference for GC.
+		poolSlice = poolSlice[:n-1]
+	}
+	poolLock.Store(0) // Release.
+
+	if vc != nil {
+		return vc
+	}
+	return &VectorClock{}
+}
+
+// poolPut returns a VectorClock to the pool after resetting it.
+// If the pool is full, the VectorClock is dropped (GC'd).
+func poolPut(vc *VectorClock) {
+	if vc == nil {
+		return
+	}
+	vc.Reset()
+
+	for !poolLock.CompareAndSwap(0, 1) {
+		// Spin.
+	}
+	if len(poolSlice) < poolCap {
+		poolSlice = append(poolSlice, vc)
+	}
+	poolLock.Store(0)
+}
 
 // VectorClock represents logical time across multiple threads.
 //
@@ -65,26 +110,26 @@ func New() *VectorClock {
 	return &VectorClock{}
 }
 
-// NewFromPool allocates a new VectorClock.
+// NewFromPool retrieves a zero-state VectorClock from the pool.
+// Falls back to heap allocation if the pool is empty.
 //
-// NOTE: In runtime context, sync.Pool is not available, so this just allocates.
-// The returned VectorClock is guaranteed to be in zero state.
+// The caller MUST call Release() when the VectorClock is no longer needed
+// to return it to the pool for reuse.
 //
 // Example:
 //
 //	vc := vectorclock.NewFromPool()
-//	defer vc.Release()  // No-op in runtime context
+//	defer vc.Release()
 //	vc.Set(tid, clock)
 func NewFromPool() *VectorClock {
-	return &VectorClock{}
+	return poolGet()
 }
 
-// Release is a no-op in runtime context (sync.Pool not available).
-//
-// Kept for API compatibility. After Release(), the VectorClock
-// will be garbage collected when no longer referenced.
+// Release returns the VectorClock to the pool for reuse.
+// The VectorClock is reset to zero state before pooling.
+// After Release(), the caller MUST NOT use the VectorClock.
 func (vc *VectorClock) Release() {
-	// No-op: sync.Pool not available in runtime context.
+	poolPut(vc)
 }
 
 // Reset clears the VectorClock to zero state.
@@ -116,7 +161,8 @@ func (vc *VectorClock) Reset() {
 //
 // Returns a pointer to the new copy to avoid copying on return.
 func (vc *VectorClock) Clone() *VectorClock {
-	clone := &VectorClock{maxTID: vc.maxTID}
+	clone := poolGet()
+	clone.maxTID = vc.maxTID
 	// Only copy up to maxTID+1 elements for efficiency.
 	// Use uint32 loop counter to avoid uint16 overflow at maxTID=65535.
 	for i := uint32(0); i <= uint32(vc.maxTID); i++ {
