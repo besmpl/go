@@ -145,9 +145,6 @@ func kolkovApiGoSetChildID(childGoid int64)
 //go:linkname kolkovApiGoSetChildIDWithCtx runtime/race/kolkov/api.raceGoSetChildIDWithCtx
 func kolkovApiGoSetChildIDWithCtx(childGoid int64) uintptr
 
-//go:linkname kolkovApiInitMainCtx runtime/race/kolkov/api.raceInitMainCtx
-func kolkovApiInitMainCtx() uintptr
-
 //go:linkname kolkovApiClearShadow runtime/race/kolkov/api.raceClearShadow
 func kolkovApiClearShadow(addr, size uintptr)
 

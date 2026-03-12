@@ -307,15 +307,12 @@ func raceinit() (gctx, pctx uintptr) {
 	// Initialize global detector state
 	raceKolkovInit()
 
-	// T13: Pre-create the main goroutine's (goid=1) RaceContext eagerly.
-	// This eliminates the first-access slow path for the main goroutine.
-	// The context is stored in contextsMap (GC safety) and returned as uintptr
-	// for caching in g.racectx.
-	gctx = kolkovApiInitMainCtx()
-	if gctx == 0 {
-		// Fallback: return sentinel if context creation failed.
-		gctx = 1
-	}
+	// Main goroutine context: use sentinel (1) during raceinit.
+	// The allocator isn't ready yet during schedinit, so we can't create
+	// the RaceContext here. The main goroutine's context will be lazily
+	// created on its first raceread/racewrite (slow path).
+	// Child goroutines get eager context via racegosetchildid (T13).
+	gctx = 1
 	pctx = 1
 
 	return
