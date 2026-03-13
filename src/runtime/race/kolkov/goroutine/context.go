@@ -78,8 +78,13 @@ func Alloc(tid uint16) *RaceContext {
 
 // IncrementClock advances the logical clock for this goroutine.
 //
-// This is called on every memory access by this goroutine to represent
-// forward progress in logical time. It performs two atomic updates:
+// Per FastTrack (PLDI 2009, Section 3.2), the logical clock is incremented
+// ONLY at synchronization events (acquire, release, fork, join), NOT on
+// every memory access. This is critical for the same-epoch fast path:
+// consecutive accesses within the same sync-free region share the same
+// epoch, enabling O(1) same-epoch checks that skip the full detector.
+//
+// It performs two updates:
 //  1. Increments C[TID] in the vector clock
 //  2. Updates the cached Epoch to reflect the new C[TID] value
 //
@@ -88,7 +93,6 @@ func Alloc(tid uint16) *RaceContext {
 //	Epoch == epoch.NewEpoch(TID, C[TID])
 //
 // Performance: Target <200ns/op (VectorClock.Increment + Epoch creation).
-// This is on the hot path - called millions of times during execution.
 //
 // Example:
 //

@@ -375,7 +375,6 @@ func captureCallerPC() uintptr {
 //  9. [SMARTTRACK] Track ownership: First writer claims, second writer promotes to shared
 //
 // 10. Clear read tracking and DEMOTE (write dominates all previous reads)
-// 11. Increment logical clock: ctx.IncrementClock()
 //
 // Phase 3 Adaptive Optimization: Write clears read state and demotes back to fast path.
 // This means variables with alternating read/write patterns stay in fast path.
@@ -457,7 +456,6 @@ func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext, pc uintptr)
 				} else {
 					vs.SetWritePC(captureCallerPC()) // fallback for tests
 				}
-				ctx.IncrementClock()
 				return
 			}
 			// Time-travel detected: prev write at later clock than current write.
@@ -474,7 +472,6 @@ func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext, pc uintptr)
 			} else {
 				vs.SetWritePC(captureCallerPC()) // fallback for tests
 			}
-			ctx.IncrementClock()
 			return
 		}
 	}
@@ -498,7 +495,6 @@ func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext, pc uintptr)
 				} else {
 					vs.SetWritePC(captureCallerPC()) // fallback for tests
 				}
-				ctx.IncrementClock()
 				return
 			}
 			// There was a previous read - must check for read-write race below.
@@ -571,10 +567,10 @@ func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext, pc uintptr)
 	// This is a key optimization: variables with alternating read/write stay in fast path.
 	vs.Demote()
 
-	// Step 9: Increment logical clock to advance time.
-	// This must be done AFTER updating shadow memory to maintain
-	// the happens-before invariant.
-	ctx.IncrementClock()
+	// NOTE: Clock is NOT incremented on memory accesses per FastTrack (PLDI 2009, Section 3.2).
+	// Logical clocks advance only at synchronization events (acquire, release, fork, join).
+	// This is critical for the same-epoch fast path: consecutive accesses within the same
+	// sync-free region share the same epoch, enabling O(1) same-epoch checks.
 }
 
 // OnRead handles read access to memory at the given address.
@@ -598,7 +594,6 @@ func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext, pc uintptr)
 //     - If same TID: update epoch, return
 //     - If happens-before: replace epoch, return
 //     - Otherwise: PROMOTE to VectorClock
-//  7. Increment logical clock
 //
 // Phase 3 Adaptive Optimization: Most reads (90%+) use epoch-only fast path.
 // Only concurrent reads from different threads trigger promotion to VectorClock.
@@ -646,7 +641,6 @@ func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) 
 		// Reading own writes - FAST PATH (skip HB check!)
 		// This is safe because a thread's writes always happen-before its own reads.
 		vs.SetReadEpoch(currentEpoch)
-		ctx.IncrementClock()
 		return
 	}
 
@@ -681,7 +675,6 @@ func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) 
 			if existingTID == currentTID {
 				// Same reader thread - just update clock.
 				vs.SetReadEpoch(currentEpoch)
-				ctx.IncrementClock()
 				return
 			}
 
@@ -689,19 +682,16 @@ func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) 
 			if existingReadEpoch.HappensBefore(ctx.C) {
 				// Sequential reads (happens-before) - replace epoch.
 				vs.SetReadEpoch(currentEpoch)
-				ctx.IncrementClock()
 				return
 			}
 
 			// CONCURRENT READS DETECTED - PROMOTE!
 			vs.PromoteToReadClock(ctx.C)
-			ctx.IncrementClock()
 			return
 		}
 
 		// No previous read - just set epoch.
 		vs.SetReadEpoch(currentEpoch)
-		ctx.IncrementClock()
 		return
 	}
 
@@ -717,7 +707,10 @@ func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) 
 		vs.SetReadPC(captureCallerPC()) // fallback for tests
 	}
 
-	ctx.IncrementClock()
+	// NOTE: Clock is NOT incremented on memory accesses per FastTrack (PLDI 2009, Section 3.2).
+	// Logical clocks advance only at synchronization events (acquire, release, fork, join).
+	// This is critical for the same-epoch fast path: consecutive accesses within the same
+	// sync-free region share the same epoch, enabling O(1) same-epoch checks.
 }
 
 // happensBeforeWrite checks if a write epoch happened-before the current context.
@@ -1327,6 +1320,13 @@ func (d *Detector) OnWaitGroupWaitAfter(wg uintptr, ctx *goroutine.RaceContext) 
 //go:nosplit
 func (d *Detector) ShadowGet(addr uintptr) *shadowmem.VarState {
 	return d.shadowMemory.Get(addr)
+}
+
+// GetShadow returns the shadow memory implementation.
+// This allows callers to cache a concrete type reference for direct method
+// calls, avoiding interface dispatch overhead on the hot path.
+func (d *Detector) GetShadow() shadowmem.Shadow {
+	return d.shadowMemory
 }
 
 // ClearShadowRange clears shadow memory for the given address range.

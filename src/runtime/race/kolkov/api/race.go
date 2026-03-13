@@ -26,6 +26,7 @@ import (
 
 	"runtime/race/kolkov/detector"
 	"runtime/race/kolkov/goroutine"
+	"runtime/race/kolkov/shadowmem"
 	"runtime/race/kolkov/vectorclock"
 )
 
@@ -123,6 +124,11 @@ var (
 	// det is the global detector instance.
 	// All race detection flows through this single instance.
 	det *detector.Detector
+
+	// shadow is the cached concrete shadow memory for the same-epoch fast path.
+	// Stored as concrete *PageTableShadow to avoid interface dispatch (~5-10ns)
+	// on every same-epoch check. Set once during initialization.
+	shadow *shadowmem.PageTableShadow
 
 	// === TID Pool Management with Clock Bumping (Phase 2 Task 2.2) ===
 	// TID reuse pool supporting unlimited goroutines with safe recycling.
@@ -324,6 +330,11 @@ func ensureInitialized() {
 	}
 
 	det = detector.NewDetector()
+
+	// Cache concrete shadow memory reference for the same-epoch fast path.
+	// Type-assert once here to avoid interface dispatch on every access.
+	shadow = det.GetShadow().(*shadowmem.PageTableShadow)
+
 	enabled.Store(1) // 1 = enabled
 
 	// Initialize TID pool - CRITICAL for proper race detection!
@@ -1001,14 +1012,19 @@ func racereleasemergeCtx(addr, racectx uintptr) {
 //go:nosplit
 func raceSameEpochRead(addr, racectx uintptr) bool {
 	ctx := (*goroutine.RaceContext)(unsafe.Pointer(racectx))
-	vs := det.ShadowGet(addr)
+	// Use cached concrete *PageTableShadow to avoid interface dispatch (~5-10ns).
+	// shadow is set once during initialization and never changes.
+	vs := shadow.Get(addr)
 	if vs == nil {
 		return false // First access, need full path to create VarState.
 	}
 	// Same-epoch check: the write epoch stored in shadow matches this
 	// goroutine's current epoch exactly (same TID AND same clock).
-	// This means the goroutine was the last writer and its clock hasn't
-	// advanced since. No race is possible.
+	//
+	// Per FastTrack (PLDI 2009), the clock only advances at synchronization
+	// events, so consecutive accesses within the same sync-free region share
+	// the same epoch. This makes the same-epoch check effective for ~65% of
+	// reads (and ~71% of writes), avoiding the full detector path entirely.
 	return vs.W.Load() == uint64(ctx.Epoch)
 }
 
@@ -1016,7 +1032,8 @@ func raceSameEpochRead(addr, racectx uintptr) bool {
 //go:nosplit
 func raceSameEpochWrite(addr, racectx uintptr) bool {
 	ctx := (*goroutine.RaceContext)(unsafe.Pointer(racectx))
-	vs := det.ShadowGet(addr)
+	// Use cached concrete *PageTableShadow to avoid interface dispatch (~5-10ns).
+	vs := shadow.Get(addr)
 	if vs == nil {
 		return false // First access, need full path to create VarState.
 	}
@@ -2117,6 +2134,7 @@ func Init() {
 	// Create a fresh detector instance.
 	// Note: Sampling configuration is disabled in runtime context (no os.Getenv).
 	det = detector.NewDetector()
+	shadow = det.GetShadow().(*shadowmem.PageTableShadow)
 
 	// Clear any existing goroutine contexts.
 	contextsMap.Reset()
