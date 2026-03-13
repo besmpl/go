@@ -130,6 +130,12 @@ var (
 	// on every same-epoch check. Set once during initialization.
 	shadow *shadowmem.PageTableShadow
 
+	// raceShadowPtr is the uintptr address of *PageTableShadow for runtime inline access.
+	// T26: Exported via go:linkname to race_kolkov.go so the fast path can do
+	// shadow lookup via raw pointer math, eliminating the go:linkname CALL overhead.
+	// Set once during ensureInitialized(), immutable afterwards.
+	raceShadowPtr uintptr
+
 	// === TID Pool Management with Clock Bumping (Phase 2 Task 2.2) ===
 	// TID reuse pool supporting unlimited goroutines with safe recycling.
 	// When a TID is freed, we record the max clock it reached.
@@ -334,6 +340,9 @@ func ensureInitialized() {
 	// Cache concrete shadow memory reference for the same-epoch fast path.
 	// Type-assert once here to avoid interface dispatch on every access.
 	shadow = det.GetShadow().(*shadowmem.PageTableShadow)
+
+	// T26: Export shadow pointer for runtime inline access (raw pointer math).
+	raceShadowPtr = uintptr(unsafe.Pointer(shadow))
 
 	enabled.Store(1) // 1 = enabled
 

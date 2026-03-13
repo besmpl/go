@@ -17,6 +17,79 @@ import (
 	"unsafe"
 )
 
+// T26: Inline same-epoch fast path constants and functions.
+// These replace the go:linkname CALL to kolkovSameEpochRead/Write,
+// eliminating ~12ns cross-package call overhead per memory access.
+//
+// PageTableShadow layout (from shadowmem/shadow_pagetable.go):
+//   offset 0:  base (atomic.Uintptr, 8 bytes)
+//   offset 8:  pages[0] (65536 * atomic.Pointer[shadowPage], each 8 bytes)
+//
+// shadowPage layout:
+//   offset 0:  slots[0] (262144 * atomic.Pointer[VarState], each 8 bytes)
+//
+// VarState layout (from shadowmem/varstate.go):
+//   offset 0:  W (atomic.Uint64, 8 bytes) — write epoch
+//   offset 40: readerState (atomic.Uint32, 4 bytes) — reader count
+//
+// RaceContext layout (from goroutine/context.go):
+//   offset 16: Epoch (uint64)
+const (
+	ptL1Shift         = 21
+	ptL2Mask          = 0x3FFFF // (1<<18) - 1
+	ptTotalCoverage   = uintptr(65536) << 21 // 128GB
+	ptPagesOffset     = 8                     // offset of pages[0] in PageTableShadow
+	vsWOffset         = 0                     // offset of W in VarState
+	vsReaderOffset    = 40                    // offset of readerState in VarState
+	ctxEpochOffset    = 16                    // offset of Epoch in RaceContext
+)
+
+// raceInlineSameEpochRead checks if the last write to addr was by this goroutine
+// at the same epoch. If true, no race is possible and we can skip the full detector.
+// T26: Inlined version of kolkovSameEpochRead — no CALL, pure pointer math.
+// Kept compact (< 80 inlining cost) so the compiler inlines it into raceread.
+//
+//go:nosplit
+func raceInlineSameEpochRead(addr, racectx uintptr) bool {
+	shadowPtr := kolkovShadowPtr
+	if shadowPtr == 0 {
+		return false
+	}
+	offset := (addr &^ 7) - *(*uintptr)(unsafe.Pointer(shadowPtr))
+	if offset >= ptTotalCoverage {
+		return false
+	}
+	pagePtr := *(*uintptr)(unsafe.Pointer(shadowPtr + ptPagesOffset + (offset>>ptL1Shift)*8))
+	if pagePtr == 0 {
+		return false
+	}
+	vsPtr := *(*uintptr)(unsafe.Pointer(pagePtr + ((offset>>3)&ptL2Mask)*8))
+	return vsPtr != 0 && *(*uint64)(unsafe.Pointer(vsPtr)) == *(*uint64)(unsafe.Pointer(racectx+ctxEpochOffset))
+}
+
+// raceInlineSameEpochWrite checks same-epoch AND no concurrent readers.
+// T26: Inlined version of kolkovSameEpochWrite.
+//
+//go:nosplit
+func raceInlineSameEpochWrite(addr, racectx uintptr) bool {
+	shadowPtr := kolkovShadowPtr
+	if shadowPtr == 0 {
+		return false
+	}
+	offset := (addr &^ 7) - *(*uintptr)(unsafe.Pointer(shadowPtr))
+	if offset >= ptTotalCoverage {
+		return false
+	}
+	pagePtr := *(*uintptr)(unsafe.Pointer(shadowPtr + ptPagesOffset + (offset>>ptL1Shift)*8))
+	if pagePtr == 0 {
+		return false
+	}
+	vsPtr := *(*uintptr)(unsafe.Pointer(pagePtr + ((offset>>3)&ptL2Mask)*8))
+	return vsPtr != 0 &&
+		*(*uint64)(unsafe.Pointer(vsPtr)) == *(*uint64)(unsafe.Pointer(racectx+ctxEpochOffset)) &&
+		*(*uint32)(unsafe.Pointer(vsPtr+vsReaderOffset)) == 0
+}
+
 // Public race detection API, present when built with -race and CGO_ENABLED=0.
 
 // RaceRead records a read of the memory location addr by the current goroutine.
@@ -238,7 +311,7 @@ func racereadpc(addr unsafe.Pointer, callpc, pc uintptr) {
 	gp.raceignore++
 	if racectx > 1 {
 		// T22: Same-epoch fast path.
-		if kolkovSameEpochRead(uintptr(addr), racectx) {
+		if raceInlineSameEpochRead(uintptr(addr), racectx) {
 			gp.raceignore--
 			return
 		}
@@ -278,7 +351,7 @@ func racewritepc(addr unsafe.Pointer, callpc, pc uintptr) {
 	gp.raceignore++
 	if racectx > 1 {
 		// T22: Same-epoch fast path.
-		if kolkovSameEpochWrite(uintptr(addr), racectx) {
+		if raceInlineSameEpochWrite(uintptr(addr), racectx) {
 			gp.raceignore--
 			return
 		}
@@ -817,7 +890,7 @@ func raceread(addr uintptr) {
 		// T22: Same-epoch fast path — skip systemstack for ~65% of reads.
 		// If the shadow cell's write epoch matches this goroutine's epoch,
 		// no other goroutine has written since our last check. No race possible.
-		if kolkovSameEpochRead(addr, racectx) {
+		if raceInlineSameEpochRead(addr, racectx) {
 			gp.raceignore--
 			return
 		}
@@ -863,7 +936,7 @@ func racewrite(addr uintptr) {
 		// T22: Same-epoch fast path — skip systemstack for ~65% of writes.
 		// If the shadow cell's write epoch matches AND no concurrent readers,
 		// no race is possible. Skip the expensive systemstack call.
-		if kolkovSameEpochWrite(addr, racectx) {
+		if raceInlineSameEpochWrite(addr, racectx) {
 			gp.raceignore--
 			return
 		}
@@ -905,7 +978,7 @@ func racereadrange(addr, size uintptr) {
 	gp.raceignore++
 	if racectx > 1 {
 		// T22: Same-epoch fast path.
-		if kolkovSameEpochRead(addr, racectx) {
+		if raceInlineSameEpochRead(addr, racectx) {
 			gp.raceignore--
 			return
 		}
@@ -948,7 +1021,7 @@ func racewriterange(addr, size uintptr) {
 	gp.raceignore++
 	if racectx > 1 {
 		// T22: Same-epoch fast path.
-		if kolkovSameEpochWrite(addr, racectx) {
+		if raceInlineSameEpochWrite(addr, racectx) {
 			gp.raceignore--
 			return
 		}
@@ -989,7 +1062,7 @@ func racereadrangepc1(addr, size, pc uintptr) {
 	gp.raceignore++
 	if racectx > 1 {
 		// T22: Same-epoch fast path.
-		if kolkovSameEpochRead(addr, racectx) {
+		if raceInlineSameEpochRead(addr, racectx) {
 			gp.raceignore--
 			return
 		}
@@ -1029,7 +1102,7 @@ func racewriterangepc1(addr, size, pc uintptr) {
 	gp.raceignore++
 	if racectx > 1 {
 		// T22: Same-epoch fast path.
-		if kolkovSameEpochWrite(addr, racectx) {
+		if raceInlineSameEpochWrite(addr, racectx) {
 			gp.raceignore--
 			return
 		}
