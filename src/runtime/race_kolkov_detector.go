@@ -175,23 +175,12 @@ func kolkovOnReleaseCtx(addr, racectx uintptr)
 //go:linkname kolkovOnReleaseMergeCtx runtime/race/kolkov/api.racereleasemergeCtx
 func kolkovOnReleaseMergeCtx(addr, racectx uintptr)
 
-// T26: Shadow pointer for inline fast path in runtime.
-// This is a uintptr pointing to the *PageTableShadow struct.
-// Layout: offset 0 = base (atomic.Uintptr), offset 8 = pages array start.
-// Set once during detector initialization, immutable afterwards.
+// T26: Shadow pointer getter for inline fast path in runtime.
+// Returns uintptr pointing to the *PageTableShadow struct.
+// Called once during raceinit to cache the value in kolkovShadowPtr (race_kolkov.go).
 //
-//go:linkname kolkovShadowPtr runtime/race/kolkov/api.raceShadowPtr
-var kolkovShadowPtr uintptr
-
-// Same-epoch fast path: old go:linkname functions kept for reference.
-// T26: These are being replaced by inline pointer math in race_kolkov.go,
-// but kept for fallback on non-amd64/arm64 platforms or debug builds.
-
-//go:linkname kolkovSameEpochRead runtime/race/kolkov/api.raceSameEpochRead
-func kolkovSameEpochRead(addr, racectx uintptr) bool
-
-//go:linkname kolkovSameEpochWrite runtime/race/kolkov/api.raceSameEpochWrite
-func kolkovSameEpochWrite(addr, racectx uintptr) bool
+//go:linkname kolkovGetShadowPtr runtime/race/kolkov/api.raceGetShadowPtr
+func kolkovGetShadowPtr() uintptr
 
 // Slow path: creates context, performs operation, returns pointer for caching in g.racectx.
 

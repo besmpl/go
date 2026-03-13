@@ -130,11 +130,6 @@ var (
 	// on every same-epoch check. Set once during initialization.
 	shadow *shadowmem.PageTableShadow
 
-	// raceShadowPtr is the uintptr address of *PageTableShadow for runtime inline access.
-	// T26: Exported via go:linkname to race_kolkov.go so the fast path can do
-	// shadow lookup via raw pointer math, eliminating the go:linkname CALL overhead.
-	// Set once during ensureInitialized(), immutable afterwards.
-	raceShadowPtr uintptr
 
 	// === TID Pool Management with Clock Bumping (Phase 2 Task 2.2) ===
 	// TID reuse pool supporting unlimited goroutines with safe recycling.
@@ -340,9 +335,6 @@ func ensureInitialized() {
 	// Cache concrete shadow memory reference for the same-epoch fast path.
 	// Type-assert once here to avoid interface dispatch on every access.
 	shadow = det.GetShadow().(*shadowmem.PageTableShadow)
-
-	// T26: Export shadow pointer for runtime inline access (raw pointer math).
-	raceShadowPtr = uintptr(unsafe.Pointer(shadow))
 
 	enabled.Store(1) // 1 = enabled
 
@@ -1010,6 +1002,15 @@ func racereleasemergeCtx(addr, racectx uintptr) {
 // Called from runtime BEFORE systemstack() to avoid ~60ns closure+stack-switch
 // overhead for ~65% of accesses (same-epoch hits).
 //
+// T26: raceGetShadowPtr returns the uintptr address of *PageTableShadow.
+// Called once from runtime.raceinit to cache the value for inline fast path.
+//
+//go:linkname raceGetShadowPtr
+//go:nosplit
+func raceGetShadowPtr() uintptr {
+	return uintptr(unsafe.Pointer(shadow))
+}
+
 // Same-epoch read: if the write epoch's TID+clock matches this goroutine's
 // current epoch, then this goroutine was the last writer at the same logical
 // time. No other goroutine could have written since, so no read-write race.

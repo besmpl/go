@@ -90,6 +90,21 @@ func raceInlineSameEpochWrite(addr, racectx uintptr) bool {
 		*(*uint32)(unsafe.Pointer(vsPtr+vsReaderOffset)) == 0
 }
 
+// kolkovShadowPtr is the runtime-local cached shadow pointer for T26 inline fast path.
+// Set lazily on first slow-path exit when detector is initialized.
+// Immutable after first set (never changes once shadow is created).
+var kolkovShadowPtr uintptr
+
+// kolkovCacheShadowPtr caches the shadow pointer if not yet cached.
+// Called from slow path exits after detector initialization is complete.
+//
+//go:nosplit
+func kolkovCacheShadowPtr() {
+	if kolkovShadowPtr == 0 {
+		kolkovShadowPtr = kolkovGetShadowPtr()
+	}
+}
+
 // Public race detection API, present when built with -race and CGO_ENABLED=0.
 
 // RaceRead records a read of the memory location addr by the current goroutine.
@@ -325,6 +340,7 @@ func racereadpc(addr unsafe.Pointer, callpc, pc uintptr) {
 		})
 		if newCtx > 1 {
 			gp.racectx = newCtx
+			kolkovCacheShadowPtr()
 		}
 	}
 	gp.raceignore--
@@ -365,6 +381,7 @@ func racewritepc(addr unsafe.Pointer, callpc, pc uintptr) {
 		})
 		if newCtx > 1 {
 			gp.racectx = newCtx
+			kolkovCacheShadowPtr()
 		}
 	}
 	gp.raceignore--
@@ -646,6 +663,7 @@ func raceacquire(addr unsafe.Pointer) {
 		})
 		if newCtx > 1 {
 			gp.racectx = newCtx
+			kolkovCacheShadowPtr()
 		}
 	}
 	gp.raceignore--
@@ -906,6 +924,7 @@ func raceread(addr uintptr) {
 		})
 		if newCtx > 1 {
 			gp.racectx = newCtx
+			kolkovCacheShadowPtr()
 		}
 	}
 	gp.raceignore--
@@ -950,6 +969,7 @@ func racewrite(addr uintptr) {
 		})
 		if newCtx > 1 {
 			gp.racectx = newCtx
+			kolkovCacheShadowPtr()
 		}
 	}
 	gp.raceignore--
@@ -993,6 +1013,7 @@ func racereadrange(addr, size uintptr) {
 		})
 		if newCtx > 1 {
 			gp.racectx = newCtx
+			kolkovCacheShadowPtr()
 		}
 	}
 	gp.raceignore--
@@ -1036,6 +1057,7 @@ func racewriterange(addr, size uintptr) {
 		})
 		if newCtx > 1 {
 			gp.racectx = newCtx
+			kolkovCacheShadowPtr()
 		}
 	}
 	gp.raceignore--
@@ -1076,6 +1098,7 @@ func racereadrangepc1(addr, size, pc uintptr) {
 		})
 		if newCtx > 1 {
 			gp.racectx = newCtx
+			kolkovCacheShadowPtr()
 		}
 	}
 	gp.raceignore--
@@ -1116,6 +1139,7 @@ func racewriterangepc1(addr, size, pc uintptr) {
 		})
 		if newCtx > 1 {
 			gp.racectx = newCtx
+			kolkovCacheShadowPtr()
 		}
 	}
 	gp.raceignore--
