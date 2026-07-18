@@ -120,3 +120,33 @@ func TestPragcgo(t *testing.T) {
 
 	}
 }
+
+func TestPragnativeexport(t *testing.T) {
+	tests := []struct {
+		in   string
+		want [][]string
+	}{
+		{
+			in:   `go:nativeexport local`,
+			want: [][]string{{`native_export`, `local`}},
+		},
+		{
+			in:   `go:nativeexport local remote`,
+			want: [][]string{{`native_export`, `local`, `remote`}},
+		},
+	}
+
+	for _, tt := range tests {
+		var p noder
+		p.err = make(chan syntax.Error, 1)
+		p.pragnativeexport(syntax.Pos{}, tt.in)
+		select {
+		case err := <-p.err:
+			t.Errorf("pragnativeexport(%q) reported %v", tt.in, err)
+		default:
+		}
+		if !reflect.DeepEqual(p.pragcgobuf, tt.want) {
+			t.Errorf("pragnativeexport(%q) = %q; want %q", tt.in, p.pragcgobuf, tt.want)
+		}
+	}
+}

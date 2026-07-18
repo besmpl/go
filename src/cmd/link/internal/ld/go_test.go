@@ -15,6 +15,17 @@ import (
 	"cmd/internal/objabi"
 )
 
+func TestLoadCgoRecordsNativeExportEarly(t *testing.T) {
+	ctxt := new(Link)
+	loadcgo(ctxt, "test.o", "test", `[["native_export","local"]]`)
+	if !ctxt.nativeExports {
+		t.Fatal("loadcgo did not record native-export mode before external-link setup")
+	}
+	if len(ctxt.cgodata) != 1 {
+		t.Fatalf("loadcgo recorded %d directive groups; want 1", len(ctxt.cgodata))
+	}
+}
+
 func TestDedupLibraries(t *testing.T) {
 	ctxt := &Link{}
 	ctxt.Target.HeadType = objabi.Hlinux

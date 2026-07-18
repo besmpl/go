@@ -163,7 +163,7 @@ func sigInstallGoHandler(sig uint32) bool {
 		}
 	}
 
-	if (GOOS == "linux" || GOOS == "android") && !iscgo && sig == sigPerThreadSyscall {
+	if (GOOS == "linux" || GOOS == "android") && !iscgo && !isnativeexport && sig == sigPerThreadSyscall {
 		// sigPerThreadSyscall is the same signal used by glibc for
 		// per-thread syscalls on Linux. We use it for the same purpose
 		// in non-cgo binaries.
@@ -399,7 +399,7 @@ func preemptM(mp *m) {
 func sigFetchG(c *sigctxt) *g {
 	switch GOARCH {
 	case "arm", "arm64", "loong64", "ppc64", "ppc64le", "riscv64", "s390x":
-		if !iscgo && inVDSOPage(c.sigpc()) {
+		if !iscgo && !isnativeexport && inVDSOPage(c.sigpc()) {
 			// When using cgo, we save the g on TLS and load it from there
 			// in sigtramp. Just use that.
 			// Otherwise, before making a VDSO call we save the g to the
@@ -1336,7 +1336,7 @@ func minitSignalStack() {
 	mp := getg().m
 	var st stackt
 	sigaltstack(nil, &st)
-	if st.ss_flags&_SS_DISABLE != 0 || !iscgo {
+	if st.ss_flags&_SS_DISABLE != 0 || (!iscgo && !isnativeexport) {
 		signalstack(&mp.gsignal.stack)
 		mp.newSigstack = true
 	} else {

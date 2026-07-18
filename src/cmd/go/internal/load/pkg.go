@@ -2691,9 +2691,12 @@ func LinkerDeps(s *modload.Loader, p *Package) ([]string, error) {
 	// External linking mode forces an import of runtime/cgo.
 	if what := externalLinkingReason(s, p); what != "" && cfg.BuildContext.Compiler != "gccgo" {
 		if !cfg.BuildContext.CgoEnabled {
-			return nil, fmt.Errorf("%s requires external (cgo) linking, but cgo is not enabled", what)
+			if cfg.BuildBuildmode != "c-shared" || !cgoFreeCSharedSupported(cfg.Goos, cfg.Goarch) {
+				return nil, fmt.Errorf("%s requires external (cgo) linking, but cgo is not enabled", what)
+			}
+		} else {
+			deps = append(deps, "runtime/cgo")
 		}
-		deps = append(deps, "runtime/cgo")
 	}
 	// On ARM with GOARM=5, it forces an import of math, for soft floating point.
 	if cfg.Goarch == "arm" {
@@ -2717,6 +2720,10 @@ func LinkerDeps(s *modload.Loader, p *Package) ([]string, error) {
 	}
 
 	return deps, nil
+}
+
+func cgoFreeCSharedSupported(goos, goarch string) bool {
+	return goos == "android" && goarch == "arm64"
 }
 
 // externalLinkingReason reports the reason external linking is required

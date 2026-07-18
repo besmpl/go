@@ -278,6 +278,13 @@ func (p *noder) pragma(pos syntax.Pos, blankLine bool, text string, old syntax.P
 			}
 		}
 
+	case text == "go:nativeexport", strings.HasPrefix(text, "go:nativeexport "):
+		if buildcfg.GOOS != "android" || buildcfg.GOARCH != "arm64" {
+			p.error(syntax.Error{Pos: pos, Msg: "//go:nativeexport is only supported on android/arm64"})
+			break
+		}
+		p.pragnativeexport(pos, text)
+
 	case strings.HasPrefix(text, "go:linkname "), strings.HasPrefix(text, "go:linknamestd "):
 		f := strings.Fields(text)
 		if !(2 <= len(f) && len(f) <= 3) {

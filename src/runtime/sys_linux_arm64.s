@@ -275,6 +275,8 @@ noswitch:
 	// We won't get a nested signal.
 	MOVBU	runtime·iscgo(SB), R22
 	CBNZ	R22, nosaveg
+	MOVBU	runtime·isnativeexport(SB), R22
+	CBNZ	R22, nosaveg
 	MOVD	m_gsignal(R21), R22          // g.m.gsignal
 	CBZ	R22, nosaveg
 	CMP	g, R22
@@ -365,6 +367,8 @@ noswitch:
 	// Also don't save g if we are already on the signal stack.
 	// We won't get a nested signal.
 	MOVBU	runtime·iscgo(SB), R22
+	CBNZ	R22, nosaveg
+	MOVBU	runtime·isnativeexport(SB), R22
 	CBNZ	R22, nosaveg
 	MOVD	m_gsignal(R21), R22          // g.m.gsignal
 	CBZ	R22, nosaveg
@@ -466,8 +470,12 @@ TEXT runtime·sigtramp(SB),NOSPLIT|TOPFRAME,$176
 	// first save R0, because runtime·load_g will clobber it
 	MOVW	R0, 8(RSP)
 	MOVBU	runtime·iscgo(SB), R0
-	CBZ	R0, 2(PC)
+	CBNZ	R0, loadg
+	MOVBU	runtime·isnativeexport(SB), R0
+	CBZ	R0, noloadg
+loadg:
 	BL	runtime·load_g(SB)
+noloadg:
 
 	// Restore signum to R0.
 	MOVW	8(RSP), R0
@@ -670,11 +678,32 @@ TEXT runtime·futex(SB),NOSPLIT|NOFRAME,$0
 TEXT runtime·clone(SB),NOSPLIT|NOFRAME,$0
 	MOVW	flags+0(FP), R0
 	MOVD	stk+8(FP), R1
+	MOVD	ZR, R2
+	MOVD	ZR, R3
+	MOVD	ZR, R4
 
 	// Copy mp, gp, fn off parent stack for use by child.
 	MOVD	mp+16(FP), R10
 	MOVD	gp+24(FP), R11
 	MOVD	fn+32(FP), R12
+
+#ifdef GOOS_android
+	// Native-export builds need a per-thread g slot, but their Go-owned
+	// threads are created with clone rather than cgo's pthread creator.
+	// Point TPIDR_EL0 at storage owned by the new M so Go threads don't
+	// inherit and overwrite the Android loader thread's Bionic TLS.
+	MOVBU	runtime·isnativeexport(SB), R13
+	CBZ	R13, clone_no_tls
+	CBZ	R10, clone_no_tls
+	CBZ	R11, clone_no_tls
+	MOVD	R10, R3
+	ADD	$m_tls, R3
+	MOVD	runtime·tls_g(SB), R13
+	SUB	R13, R3, R3
+	MOVD	$0x00080000, R13 // CLONE_SETTLS
+	ORR	R13, R0, R0
+clone_no_tls:
+#endif
 
 	MOVD	R10, -8(R1)
 	MOVD	R11, -16(R1)
@@ -721,6 +750,7 @@ good:
 	// In child, set up new stack
 	MOVD	R10, g_m(R11)
 	MOVD	R11, g
+	BL	runtime·save_g(SB)
 	//CALL	runtime·stackcheck(SB)
 
 nog:
@@ -820,6 +850,8 @@ TEXT runtime·vgetrandom1<ABIInternal>(SB),NOSPLIT,$16-48
 	MOVD	R9, RSP
 
 	MOVBU	runtime·iscgo(SB), R9
+	CBNZ	R9, nosaveg
+	MOVBU	runtime·isnativeexport(SB), R9
 	CBNZ	R9, nosaveg
 	MOVD	m_gsignal(R21), R9
 	CBZ	R9, nosaveg

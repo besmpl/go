@@ -143,6 +143,22 @@ func (p *noder) pragcgo(pos syntax.Pos, text string) {
 	p.pragcgobuf = append(p.pragcgobuf, f)
 }
 
+// pragnativeexport records an existing native-ABI assembly symbol for export.
+// The linker interprets this separately from cgo directives so user code does
+// not need access to the privileged //go:cgo_* directive family.
+func (p *noder) pragnativeexport(pos syntax.Pos, text string) {
+	f := pragmaFields(text)
+	switch {
+	case len(f) == 2 && !isQuoted(f[1]):
+	case len(f) == 3 && !isQuoted(f[1]) && !isQuoted(f[2]):
+	default:
+		p.error(syntax.Error{Pos: pos, Msg: "usage: //go:nativeexport local [remote]"})
+		return
+	}
+	f[0] = "native_export"
+	p.pragcgobuf = append(p.pragcgobuf, f)
+}
+
 // pragmaFields is similar to strings.FieldsFunc(s, isSpace)
 // but does not split when inside double quoted regions and always
 // splits before the start and after the end of a double quoted region.

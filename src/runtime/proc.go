@@ -225,6 +225,13 @@ func main() {
 	}
 
 	mainInitDoneChan = make(chan bool)
+	if isnativeexport {
+		// A callback running on an Android-owned thread may need to create
+		// another M. Publish readiness only after both the spare callback M
+		// and the known-good template thread are available.
+		startTemplateThread()
+		atomic.Store(&nativeExportReady, 1)
+	}
 	if iscgo {
 		if _cgo_pthread_key_created == nil {
 			throw("_cgo_pthread_key_created missing")
@@ -1043,7 +1050,7 @@ func mcommoninit(mp *m, id int64) {
 	unlock(&sched.lock)
 
 	// Allocate memory to hold a cgo traceback if the cgo call crashes.
-	if iscgo || GOOS == "solaris" || GOOS == "illumos" || GOOS == "windows" {
+	if iscgo || isnativeexport || GOOS == "solaris" || GOOS == "illumos" || GOOS == "windows" {
 		mp.cgoCallers = new(cgoCallers)
 	}
 	mProfStackInit(mp)
@@ -1965,7 +1972,7 @@ func mstartm0() {
 	// Create an extra M for callbacks on threads not created by Go.
 	// An extra M is also needed on Windows for callbacks created by
 	// syscall.NewCallback. See issue #6751 for details.
-	if (iscgo || GOOS == "windows") && !cgoHasExtraM {
+	if (iscgo || isnativeexport || GOOS == "windows") && !cgoHasExtraM {
 		cgoHasExtraM = true
 		newextram()
 	}
@@ -2278,13 +2285,15 @@ type cgothreadstart struct {
 // Allocate a new m unassociated with any thread.
 // Can use p for allocation context if needed.
 // fn is recorded as the new m's m.mstartfn.
-// id is optional pre-allocated m ID. Omit by passing -1.
+// id is optional pre-allocated m ID. Omit by passing -1. useOSStack is true
+// when the M will attach to a stack supplied by a foreign OS thread rather
+// than being started on a stack allocated here.
 //
 // This function is allowed to have write barriers even if the caller
 // isn't because it borrows pp.
 //
 //go:yeswritebarrierrec
-func allocm(pp *p, fn func(), id int64) *m {
+func allocm(pp *p, fn func(), id int64, useOSStack bool) *m {
 	allocmLock.rlock()
 
 	// The caller owns pp, but we may borrow (i.e., acquirep) it. We must
@@ -2343,9 +2352,11 @@ func allocm(pp *p, fn func(), id int64) *m {
 	mp.mstartfn = fn
 	mcommoninit(mp, id)
 
-	// In case of cgo or Solaris or illumos or Darwin, pthread_create will make us a stack.
+	// In case of cgo, Solaris, illumos, or Darwin, pthread_create will
+	// provide the stack. Native-export builds still create ordinary Go
+	// threads with clone; only their callback M runs on a foreign stack.
 	// Windows and Plan 9 will layout sched stack on OS stack.
-	if iscgo || mStackIsSystemAllocated() {
+	if iscgo || useOSStack || mStackIsSystemAllocated() {
 		mp.g0 = malg(-1)
 	} else {
 		mp.g0 = malg(16384 * sys.StackGuardMultiplier)
@@ -2401,7 +2412,7 @@ func allocm(pp *p, fn func(), id int64) *m {
 //
 //go:nosplit
 func needm(signal bool) {
-	if (iscgo || GOOS == "windows") && !cgoHasExtraM {
+	if (iscgo || isnativeexport || GOOS == "windows") && !cgoHasExtraM {
 		// Can happen if C/C++ code calls Go from a global ctor.
 		// Can also happen on Windows if a global ctor uses a
 		// callback created by syscall.NewCallback. See issue #6751
@@ -2526,7 +2537,7 @@ func oneNewExtraM() {
 	// The sched.pc will never be returned to, but setting it to
 	// goexit makes clear to the traceback routines where
 	// the goroutine stack ends.
-	mp := allocm(nil, nil, -1)
+	mp := allocm(nil, nil, -1, true)
 	gp := malg(4096)
 	gp.sched.pc = abi.FuncPCABI0(goexit) + sys.PCQuantum
 	gp.sched.sp = gp.stack.hi
@@ -2885,7 +2896,7 @@ func newm(fn func(), pp *p, id int64) {
 	// start.
 	acquirem()
 
-	mp := allocm(pp, fn, id)
+	mp := allocm(pp, fn, id, false)
 	mp.nextp.set(pp)
 	mp.sigmask = initSigmask
 	if gp := getg(); gp != nil && gp.m != nil && (gp.m.lockedExt != 0 || gp.m.incgo) && GOOS != "plan9" {

@@ -31,6 +31,13 @@ func sysAllocOS(n uintptr, vmaName string) unsafe.Pointer {
 		}
 		return nil
 	}
+	if isnativeexport && getg() == nil {
+		// A cgo-free shared library reaches this path from newosproc0
+		// before rt0_go has installed a G. VMA naming is best-effort and
+		// setVMAName has an ordinary Go stack check, so defer decoration
+		// until runtime initialization is running on a valid G.
+		return p
+	}
 	setVMAName(p, n, vmaName)
 	return p
 }

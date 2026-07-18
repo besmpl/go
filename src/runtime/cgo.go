@@ -51,6 +51,17 @@ var (
 //go:linkname iscgo
 var iscgo bool
 
+// isnativeexport is set by the linker when an Android/arm64 c-shared build
+// contains a //go:nativeexport directive. It enables only the runtime pieces
+// needed for native threads to enter Go; unlike iscgo, it does not require any
+// runtime/cgo hooks.
+var isnativeexport bool
+
+// nativeExportReady is published after the callback M pool, initialization
+// channel, and template thread are ready. Native-ABI trampolines acquire-load
+// this value before entering cgocallback.
+var nativeExportReady uint32
+
 // set_crosscall2 is set by the runtime/cgo package
 // set_crosscall2 should be an internal detail,
 // but widely used packages access it using linkname.
@@ -63,8 +74,9 @@ var iscgo bool
 //go:linkname set_crosscall2
 var set_crosscall2 func()
 
-// cgoHasExtraM is set on startup when an extra M is created for cgo.
-// The extra M must be created before any C/C++ code calls cgocallback.
+// cgoHasExtraM is set on startup when an extra M is created for cgo or a
+// native export. The extra M must be created before foreign code calls
+// cgocallback.
 var cgoHasExtraM bool
 
 // cgoUse is called by cgo-generated code (using go:linkname to get at

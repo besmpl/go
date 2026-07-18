@@ -13,7 +13,10 @@ TEXT runtime·load_g(SB),NOSPLIT,$0
 #ifndef GOOS_openbsd
 #ifndef GOOS_windows
 	MOVB	runtime·iscgo(SB), R0
+	CBNZ	R0, loadg
+	MOVB	runtime·isnativeexport(SB), R0
 	CBZ	R0, nocgo
+loadg:
 #endif
 #endif
 #endif
@@ -34,7 +37,10 @@ TEXT runtime·save_g(SB),NOSPLIT,$0
 #ifndef GOOS_openbsd
 #ifndef GOOS_windows
 	MOVB	runtime·iscgo(SB), R0
+	CBNZ	R0, saveg
+	MOVB	runtime·isnativeexport(SB), R0
 	CBZ	R0, nocgo
+saveg:
 #endif
 #endif
 #endif

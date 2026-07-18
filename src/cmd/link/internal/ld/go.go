@@ -16,6 +16,7 @@ import (
 	"debug/elf"
 	"encoding/json"
 	"fmt"
+	"internal/buildcfg"
 	"io"
 	"os"
 	"sort"
@@ -91,6 +92,13 @@ func loadcgo(ctxt *Link, file string, pkg string, p string) {
 		nerrors++
 		return
 	}
+	for _, directive := range directives {
+		if len(directive) > 0 && directive[0] == "native_export" {
+			// This must be known before loadcgodirectives: external-link
+			// setup otherwise tries to inject runtime/cgo for TLS support.
+			ctxt.nativeExports = true
+		}
+	}
 
 	// Record the directives. We'll process them later after Symbols are created.
 	ctxt.cgodata = append(ctxt.cgodata, cgodata{file, pkg, directives})
@@ -102,6 +110,22 @@ func setCgoAttr(ctxt *Link, file string, pkg string, directives [][]string, host
 	l := ctxt.loader
 	for _, f := range directives {
 		switch f[0] {
+		case "native_export":
+			if len(f) < 2 || len(f) > 3 {
+				break
+			}
+			if ctxt.BuildMode != BuildModeCShared || buildcfg.GOOS != "android" || ctxt.Arch.Family != sys.ARM64 {
+				fmt.Fprintf(os.Stderr, "%s: %s: native exports require -buildmode=c-shared on android/arm64\n", os.Args[0], file)
+				nerrors++
+				return
+			}
+			ctxt.nativeExports = true
+			for _, kind := range []string{"cgo_export_static", "cgo_export_dynamic"} {
+				export := append([]string{kind}, f[1:]...)
+				setCgoAttr(ctxt, file, pkg, [][]string{export}, hostObjSyms)
+			}
+			continue
+
 		case "cgo_import_dynamic":
 			if len(f) < 2 || len(f) > 4 {
 				break

@@ -80,3 +80,20 @@ func TestIsVersionElement(t *testing.T) {
 		}
 	}
 }
+
+func TestCgoFreeCSharedSupported(t *testing.T) {
+	tests := []struct {
+		goos, goarch string
+		want         bool
+	}{
+		{goos: "android", goarch: "arm64", want: true},
+		{goos: "android", goarch: "amd64", want: false},
+		{goos: "linux", goarch: "arm64", want: false},
+	}
+
+	for _, tt := range tests {
+		if got := cgoFreeCSharedSupported(tt.goos, tt.goarch); got != tt.want {
+			t.Errorf("cgoFreeCSharedSupported(%q, %q) = %v; want %v", tt.goos, tt.goarch, got, tt.want)
+		}
+	}
+}

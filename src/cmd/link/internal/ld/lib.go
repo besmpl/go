@@ -584,7 +584,7 @@ func (ctxt *Link) loadlib() {
 	// We now have enough information to determine the link mode.
 	determineLinkMode(ctxt)
 
-	if ctxt.LinkMode == LinkExternal && !iscgo && !(buildcfg.GOOS == "darwin" && ctxt.BuildMode != BuildModePlugin && ctxt.Arch.Family == sys.AMD64) {
+	if ctxt.LinkMode == LinkExternal && !iscgo && !ctxt.nativeExports && !(buildcfg.GOOS == "darwin" && ctxt.BuildMode != BuildModePlugin && ctxt.Arch.Family == sys.AMD64) {
 		// This indicates a user requested -linkmode=external.
 		// The startup code uses an import of runtime/cgo to decide
 		// whether to initialize the TLS.  So give it one. This could
@@ -805,6 +805,13 @@ func (ctxt *Link) loadcgodirectives() {
 // Set up flags and special symbols depending on the platform build mode.
 // This version works with loader.Loader.
 func (ctxt *Link) linksetup() {
+	if ctxt.nativeExports {
+		symIdx := ctxt.loader.LookupOrCreateSym("runtime.isnativeexport", 0)
+		sb := ctxt.loader.MakeSymbolUpdater(symIdx)
+		sb.SetType(sym.SNOPTRDATA)
+		sb.AddUint8(1)
+	}
+
 	switch ctxt.BuildMode {
 	case BuildModeCShared, BuildModePlugin:
 		symIdx := ctxt.loader.LookupOrCreateSym("runtime.islibrary", 0)

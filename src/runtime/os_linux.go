@@ -209,7 +209,15 @@ func newosproc0(stacksize uintptr, fn unsafe.Pointer) {
 		writeErrStr(failallocatestack)
 		exit(1)
 	}
-	ret := clone(cloneFlags, unsafe.Pointer(uintptr(stack)+stacksize), nil, nil, fn)
+	var mp, gp unsafe.Pointer
+	if isnativeexport {
+		// The bootstrap thread needs private TLS before rt0_go calls
+		// save_g. Without cgo's pthread creator, a raw clone would
+		// otherwise inherit the Android loader thread's Bionic TLS.
+		mp = unsafe.Pointer(&m0)
+		gp = unsafe.Pointer(&g0)
+	}
+	ret := clone(cloneFlags, unsafe.Pointer(uintptr(stack)+stacksize), mp, gp, fn)
 	if ret < 0 {
 		writeErrStr(failthreadcreate)
 		exit(1)
@@ -735,9 +743,10 @@ var perThreadSyscall perThreadSyscallArgs
 //go:linkname syscall_runtime_doAllThreadsSyscall syscall.runtime_doAllThreadsSyscall
 //go:uintptrescapes
 func syscall_runtime_doAllThreadsSyscall(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2, err uintptr) {
-	if iscgo {
-		// In cgo, we are not aware of threads created in C, so this approach will not work.
-		panic("doAllThreadsSyscall not supported with cgo enabled")
+	if iscgo || isnativeexport {
+		// With cgo or native exports, we are not aware of all threads created
+		// by foreign code, so this approach will not work.
+		panic("doAllThreadsSyscall not supported with foreign threads enabled")
 	}
 
 	// STW to guarantee that user goroutines see an atomic change to thread
