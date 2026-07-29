@@ -24,7 +24,7 @@ func TestRuntimeFastPathABI(t *testing.T) {
 	var slot shadowSlot
 	var externalCell externalBlockCell
 	var externalBlock externalShadowBlock
-	var externalSlots externalSlotTable
+	var blockSlots blockSlotTable
 	var state VarState
 	var ctx raceg.RaceContext
 
@@ -36,8 +36,8 @@ func TestRuntimeFastPathABI(t *testing.T) {
 		{"PageTableShadow.base", unsafe.Offsetof(pt.base), 0},
 		{"PageTableShadow.pages", unsafe.Offsetof(pt.pages), 8},
 		{"PageTableShadow.external", unsafe.Offsetof(pt.external), 524296},
-		{"shadowPage.slots", unsafe.Offsetof(page.slots), 0},
-		{"shadowPage.blocks", unsafe.Offsetof(page.blocks), 2097152},
+		{"shadowPage.slotTables", unsafe.Offsetof(page.slotTables), 0},
+		{"shadowPage.blocks", unsafe.Offsetof(page.blocks), 4096},
 		{"rangeBlock.mu", unsafe.Offsetof(block.mu), 0},
 		{"rangeBlock.state", unsafe.Offsetof(block.state), 8},
 		{"rangeBlock.compact", unsafe.Offsetof(block.compact), 16},
@@ -47,7 +47,7 @@ func TestRuntimeFastPathABI(t *testing.T) {
 		{"externalBlockCell.block", unsafe.Offsetof(externalCell.block), 16},
 		{"externalShadowBlock.slots", unsafe.Offsetof(externalBlock.slots), 0},
 		{"externalShadowBlock.history", unsafe.Offsetof(externalBlock.history), 8},
-		{"externalSlotTable.slots", unsafe.Offsetof(externalSlots.slots), 0},
+		{"blockSlotTable.slots", unsafe.Offsetof(blockSlots.slots), 0},
 		{"shadowSlot.states", unsafe.Offsetof(slot.states), 0},
 		{"VarState.W", unsafe.Offsetof(state.W), 0},
 		{"VarState.readEpoch0", unsafe.Offsetof(state.readEpoch0), 32},
@@ -79,6 +79,9 @@ func TestRuntimeFastPathABI(t *testing.T) {
 	if got := unsafe.Sizeof(block); got != 24 {
 		t.Errorf("runtime/race_kolkov.go ABI dependency rangeBlock size=%d, want 24", got)
 	}
+	if got := unsafe.Sizeof(page); got != 16384 {
+		t.Errorf("runtime/race_kolkov.go ABI dependency shadowPage size=%d, want 16384", got)
+	}
 	if got := unsafe.Sizeof(pt); got != 1048584 {
 		t.Errorf("runtime/race_kolkov.go ABI dependency PageTableShadow size=%d, want 1048584", got)
 	}
@@ -88,8 +91,8 @@ func TestRuntimeFastPathABI(t *testing.T) {
 	if got := unsafe.Sizeof(externalCell); got != 48 {
 		t.Errorf("runtime/race_kolkov.go ABI dependency externalBlockCell size=%d, want 48", got)
 	}
-	if got := unsafe.Sizeof(externalSlots); got != 4096 {
-		t.Errorf("runtime/race_kolkov.go ABI dependency externalSlotTable size=%d, want 4096", got)
+	if got := unsafe.Sizeof(blockSlots); got != 4096 {
+		t.Errorf("runtime/race_kolkov.go ABI dependency blockSlotTable size=%d, want 4096", got)
 	}
 	if raceg.ReadCacheSlots != 4 || unsafe.Sizeof(ctx.ReadCache) != 4*unsafe.Sizeof(uintptr(0)) {
 		t.Errorf("runtime/race_kolkov.go read-cache ABI changed: slots=%d size=%d", raceg.ReadCacheSlots, unsafe.Sizeof(ctx.ReadCache))
@@ -161,7 +164,7 @@ func mirroredRuntimeExternalState(pt *PageTableShadow, addr uintptr) (state *Var
 		cellPtr := unsafe.Pointer(cell)
 		if *(*uintptr)(cellPtr) == blockBase {
 			wordIdx := (addr >> 3) & runtimeExternalWordMask
-			slots := (*atomic.Pointer[externalSlotTable])(unsafe.Add(cellPtr, runtimeExternalCellSlotsOffset)).Load()
+			slots := (*atomic.Pointer[blockSlotTable])(unsafe.Add(cellPtr, runtimeExternalCellSlotsOffset)).Load()
 			if slots != nil {
 				slot := (*atomic.Pointer[shadowSlot])(unsafe.Add(unsafe.Pointer(slots), wordIdx*8)).Load()
 				if slot != nil {
@@ -186,22 +189,26 @@ func mirroredRuntimeExternalState(pt *PageTableShadow, addr uintptr) (state *Var
 // changes the private layout without updating the other.
 func mirroredRuntimePrimaryState(page *shadowPage, pageOffset uintptr) *VarState {
 	const (
-		runtimeSlotsOffset      = uintptr(0)
-		runtimeBlocksOffset     = uintptr(2097152)
+		runtimeSlotTablesOffset = uintptr(0)
+		runtimeBlocksOffset     = uintptr(4096)
 		runtimeBlockShift       = 12
 		runtimeBlockMask        = uintptr(511)
+		runtimeBlockWordMask    = uintptr(511)
 		runtimeBlockSize        = uintptr(24)
 		runtimeBlockStateOffset = uintptr(8)
 		runtimeBlockCompactOff  = uintptr(16)
 	)
 
 	pagePtr := unsafe.Pointer(page)
-	wordIdx := (pageOffset >> 3) & l2Mask
-	slot := (*atomic.Pointer[shadowSlot])(unsafe.Add(pagePtr, runtimeSlotsOffset+wordIdx*8)).Load()
-	if slot != nil {
-		return (*atomic.Pointer[VarState])(unsafe.Add(unsafe.Pointer(slot), (pageOffset&7)*8)).Load()
-	}
 	blockIdx := (pageOffset >> runtimeBlockShift) & runtimeBlockMask
+	table := (*atomic.Pointer[blockSlotTable])(unsafe.Add(pagePtr, runtimeSlotTablesOffset+blockIdx*8)).Load()
+	if table != nil {
+		wordIdx := (pageOffset >> 3) & runtimeBlockWordMask
+		slot := (*atomic.Pointer[shadowSlot])(unsafe.Add(unsafe.Pointer(table), wordIdx*8)).Load()
+		if slot != nil {
+			return (*atomic.Pointer[VarState])(unsafe.Add(unsafe.Pointer(slot), (pageOffset&7)*8)).Load()
+		}
+	}
 	blockPtr := unsafe.Add(pagePtr, runtimeBlocksOffset+blockIdx*runtimeBlockSize)
 	if compact := (*atomic.Pointer[compactGroups])(unsafe.Add(blockPtr, runtimeBlockCompactOff)).Load(); compact != nil {
 		if compact.active.Load() != 0 {

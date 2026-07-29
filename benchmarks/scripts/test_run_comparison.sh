@@ -34,8 +34,141 @@ count=10
 benchtime=1s
 benchtime_seconds=${seconds}
 max_raceread_ratio=${maximum}
+rss_count=10
+rss_benchtime=3s
 EOF
     FIXTURE="${fixture}"
+}
+
+test_rss_summarizer() {
+    local dir output expected
+
+    case_number=$(( case_number + 1 ))
+    dir="${TMP_ROOT}/case-${case_number}"
+    mkdir -p "${dir}"
+    printf '100\n200\n300\n' > "${dir}/rss-baseline-kb.txt"
+    printf '110\n180\n330\n' > "${dir}/rss-tsan-kb.txt"
+    printf '90\n250\n310\n' > "${dir}/rss-purego-kb.txt"
+    output="$(bash "${HARNESS}" --summarize-rss "${dir}" 3)"
+    expected="$(cat <<'EOF'
+rss_samples=3
+rss_workload=BenchmarkMemoryConcurrent/g16
+rss_benchtime=3s
+baseline_median_kb=200
+tsan_median_kb=180
+purego_median_kb=250
+tsan_minus_baseline_median_kb=10
+purego_minus_baseline_median_kb=10
+purego_minus_tsan_median_kb=-20
+EOF
+)"
+    [[ "${output}" == "${expected}" ]] || {
+        echo 'odd RSS summary did not contain the exact keys and medians' >&2
+        printf '%s\n' "${output}" >&2
+        exit 1
+    }
+    [[ "$(cat "${dir}/rss-tsan-minus-baseline-kb.txt")" == $'10\n-20\n30' ]]
+    [[ "$(cat "${dir}/rss-purego-minus-baseline-kb.txt")" == $'-10\n50\n10' ]]
+    [[ "$(cat "${dir}/rss-purego-minus-tsan-kb.txt")" == $'-20\n70\n-20' ]]
+
+    case_number=$(( case_number + 1 ))
+    dir="${TMP_ROOT}/case-${case_number}"
+    mkdir -p "${dir}"
+    printf '10\n20\n30\n40\n' > "${dir}/rss-baseline-kb.txt"
+    printf '5\n25\n35\n55\n' > "${dir}/rss-tsan-kb.txt"
+    printf '20\n15\n50\n45\n' > "${dir}/rss-purego-kb.txt"
+    output="$(bash "${HARNESS}" --summarize-rss "${dir}" 4)"
+    expected="$(cat <<'EOF'
+rss_samples=4
+rss_workload=BenchmarkMemoryConcurrent/g16
+rss_benchtime=3s
+baseline_median_kb=25
+tsan_median_kb=30
+purego_median_kb=32.5
+tsan_minus_baseline_median_kb=5
+purego_minus_baseline_median_kb=7.5
+purego_minus_tsan_median_kb=2.5
+EOF
+)"
+    [[ "${output}" == "${expected}" ]] || {
+        echo 'even RSS summary did not contain the exact keys and medians' >&2
+        printf '%s\n' "${output}" >&2
+        exit 1
+    }
+    for invalid_count in 0 3.0 text; do
+        if output="$(bash "${HARNESS}" --summarize-rss "${dir}" "${invalid_count}" 2>&1)"; then
+            echo "RSS summarizer accepted invalid COUNT=${invalid_count}" >&2
+            exit 1
+        fi
+        grep -F 'RSS sample count must be a positive integer' <<<"${output}" >/dev/null
+    done
+    if output="$(bash "${HARNESS}" --summarize-rss "${dir}" 4 --count 10 2>&1)"; then
+        echo 'RSS summarizer accepted a run option' >&2
+        exit 1
+    fi
+    grep -F 'run options cannot be combined with --summarize-rss' <<<"${output}" >/dev/null
+}
+
+expect_invalid_rss_summary() {
+    local kind="$1" output dir
+
+    case_number=$(( case_number + 1 ))
+    dir="${TMP_ROOT}/case-${case_number}"
+    mkdir -p "${dir}"
+    printf '10\n20\n30\n' > "${dir}/rss-baseline-kb.txt"
+    printf '11\n21\n31\n' > "${dir}/rss-tsan-kb.txt"
+    printf '12\n22\n32\n' > "${dir}/rss-purego-kb.txt"
+    case "${kind}" in
+        wrong-count) printf '11\n21\n' > "${dir}/rss-tsan-kb.txt" ;;
+        zero) printf '0\n20\n30\n' > "${dir}/rss-baseline-kb.txt" ;;
+        decimal) printf '10\n20.5\n30\n' > "${dir}/rss-baseline-kb.txt" ;;
+        malformed) printf '10 extra\n20\n30\n' > "${dir}/rss-baseline-kb.txt" ;;
+        missing) rm "${dir}/rss-purego-kb.txt" ;;
+        *) echo "unknown invalid RSS fixture: ${kind}" >&2; exit 1 ;;
+    esac
+    if output="$(bash "${HARNESS}" --summarize-rss "${dir}" 3 2>&1)"; then
+        echo "RSS summarizer accepted ${kind} input" >&2
+        exit 1
+    fi
+    [[ "${output}" == ERROR:* ]] || {
+        echo "RSS summarizer produced no fail-closed diagnostic for ${kind}" >&2
+        printf '%s\n' "${output}" >&2
+        exit 1
+    }
+    for file in rss-tsan-minus-baseline-kb.txt rss-purego-minus-baseline-kb.txt rss-purego-minus-tsan-kb.txt; do
+        [[ ! -e "${dir}/${file}" ]] || {
+            echo "RSS summarizer wrote ${file} for invalid ${kind} input" >&2
+            exit 1
+        }
+    done
+}
+
+expect_invalid_rss_metadata() {
+    local field="$1" value="$2" diagnostic="$3" fixture output metadata
+
+    make_fixture 1 1
+    fixture="${FIXTURE}"
+    metadata="${fixture}/benchmarks/results/release-contract.txt"
+    if [[ "${value}" == __missing__ ]]; then
+        sed "/^${field}=/d" "${metadata}" > "${metadata}.new"
+    else
+        sed "s/^${field}=.*/${field}=${value}/" "${metadata}" > "${metadata}.new"
+    fi
+    mv "${metadata}.new" "${metadata}"
+    if output="$(bash "${fixture}/benchmarks/run_comparison.sh" --validate-release-contract "${metadata}" 2>&1)"; then
+        echo "validator accepted invalid ${field}=${value}" >&2
+        exit 1
+    fi
+    grep -F "${diagnostic}" <<<"${output}" >/dev/null || {
+        echo "wrong ${field} validator diagnostic for ${value}:" >&2
+        echo "${output}" >&2
+        exit 1
+    }
+    if output="$(bash "${fixture}/benchmarks/run_comparison.sh" --save invalid 2>&1)"; then
+        echo "save accepted invalid ${field}=${value}" >&2
+        exit 1
+    fi
+    grep -F "${diagnostic}" <<<"${output}" >/dev/null
 }
 
 expect_invalid_metadata() {
@@ -313,6 +446,19 @@ for value in '' 1junk 1=junk NaN Inf + - +1 -1 . .5 1. 1e0 ' 1' '1 '; do
     expect_invalid_metadata benchtime_seconds "${value}"
     expect_invalid_metadata max_raceread_ratio "${value}"
 done
+
+test_rss_summarizer
+for kind in wrong-count zero decimal malformed missing; do
+    expect_invalid_rss_summary "${kind}"
+done
+expect_invalid_rss_metadata rss_count 0 'release evidence has rss_count=0; want at least 10'
+expect_invalid_rss_metadata rss_count 9 'release evidence has rss_count=9; want at least 10'
+expect_invalid_rss_metadata rss_count 10.0 'release evidence has rss_count=10.0; want at least 10'
+expect_invalid_rss_metadata rss_count 11 'release evidence has rss_count=11; want count=10'
+expect_invalid_rss_metadata rss_count __missing__ 'release evidence has rss_count=missing; want at least 10'
+expect_invalid_rss_metadata rss_benchtime 2s 'release evidence has rss_benchtime=2s; want exactly 3s'
+expect_invalid_rss_metadata rss_benchtime 3.0 'release evidence has rss_benchtime=3.0; want exactly 3s'
+expect_invalid_rss_metadata rss_benchtime __missing__ 'release evidence has rss_benchtime=missing; want exactly 3s'
 
 expect_invalid_benchmark unit widgets/op
 for value in NaN Inf text 0 -1; do

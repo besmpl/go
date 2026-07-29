@@ -14,8 +14,8 @@ const (
 	// 65536 entries * 8 bytes = 512KB fixed overhead.
 	l1Size = 65536
 
-	// l2Size is the number of materialized word-slot pointers per L2 page.
-	// Each page covers 2MiB of application memory.
+	// l2Size is the number of aligned application words represented by an L2
+	// page. Each page covers 2MiB of application memory.
 	l2Size = 1 << 18
 
 	l1Shift = 21
@@ -39,17 +39,17 @@ const (
 	externalBlockMask    = externalBlockBuckets - 1
 )
 
-// shadowPage covers 2MiB of application memory. slots must remain first:
-// runtime/race_kolkov.go directly loads this ABI-mirrored pointer array.
+// shadowPage covers 2MiB of application memory. slotTables must remain first:
+// runtime/race_kolkov.go directly loads this ABI-mirrored pointer directory.
 type shadowPage struct {
-	slots  [l2Size]atomic.Pointer[shadowSlot]
-	blocks [rangeBlocksPerPage]rangeBlock
+	slotTables [rangeBlocksPerPage]atomic.Pointer[blockSlotTable]
+	blocks     [rangeBlocksPerPage]rangeBlock
 }
 
-// externalSlotTable is allocated only after a sparse block materializes its
-// first word. Compact/default-only range blocks need history but no 4KiB slot
-// pointer plane, which is the common generated-code range shape.
-type externalSlotTable struct {
+// blockSlotTable is allocated only after a primary or external block
+// materializes its first word. Compact/default-only range blocks need history
+// but no 4KiB slot pointer plane, which is the common generated-code shape.
+type blockSlotTable struct {
 	slots [rangeBlockWords]atomic.Pointer[shadowSlot]
 }
 
@@ -57,7 +57,7 @@ type externalSlotTable struct {
 // page block. Its 4KiB word-slot plane is lazy so one distant compact range
 // commits only the small directory cell and exact block history.
 type externalShadowBlock struct {
-	slots   atomic.Pointer[externalSlotTable]
+	slots   atomic.Pointer[blockSlotTable]
 	history rangeBlock
 }
 
@@ -68,25 +68,21 @@ type externalBlockCell struct {
 }
 
 type blockView struct {
-	history       *rangeBlock
-	slots         []atomic.Pointer[shadowSlot]
-	externalSlots *atomic.Pointer[externalSlotTable]
+	slotTableOwner *atomic.Pointer[blockSlotTable]
+	history        *rangeBlock
 }
 
-// slotTable returns the primary page slice or the lazily published sparse
-// table. create is used only while materializing under the owning block lock;
-// lookup and allocator clear keep an absent table allocation-free.
+// slotTable returns the lazily published per-block word-slot table. create is
+// used only while materializing under the owning block lock; lookup, compact,
+// default, and allocator-clear paths keep an absent table allocation-free.
 func (view blockView) slotTable(create bool) []atomic.Pointer[shadowSlot] {
-	if view.slots != nil {
-		return view.slots
-	}
-	table := view.externalSlots.Load()
+	table := view.slotTableOwner.Load()
 	if table == nil && create {
-		candidate := new(externalSlotTable)
-		if view.externalSlots.CompareAndSwap(nil, candidate) {
+		candidate := new(blockSlotTable)
+		if view.slotTableOwner.CompareAndSwap(nil, candidate) {
 			table = candidate
 		} else {
-			table = view.externalSlots.Load()
+			table = view.slotTableOwner.Load()
 		}
 	}
 	if table == nil {
@@ -207,17 +203,16 @@ func (pt *PageTableShadow) blockFor(addr uintptr, create bool) (blockView, bool)
 			return blockView{}, false
 		}
 		blockIdx := wordIdx / rangeBlockWords
-		first := blockIdx * rangeBlockWords
 		return blockView{
-			history: &page.blocks[blockIdx],
-			slots:   page.slots[first : first+rangeBlockWords],
+			slotTableOwner: &page.slotTables[blockIdx],
+			history:        &page.blocks[blockIdx],
 		}, true
 	}
 	block := pt.externalBlock(addr, create)
 	if block == nil {
 		return blockView{}, false
 	}
-	return blockView{history: &block.history, externalSlots: &block.slots}, true
+	return blockView{slotTableOwner: &block.slots, history: &block.history}, true
 }
 
 // materializeSlotLocked publishes one complete word override while holding the

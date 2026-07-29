@@ -92,6 +92,13 @@ while [[ $# -gt 0 ]]; do
 			ACTION_ARG1="$2"
 			shift 2
 			;;
+		--summarize-rss)
+			require_args "$1" 2 "$(( $# - 1 ))"
+			select_action summarize-rss
+			ACTION_ARG1="$2"
+			ACTION_ARG2="$3"
+			shift 3
+			;;
 		--build-toolchain)
 			require_args "$1" 1 "$(( $# - 1 ))"
 			select_action build-toolchain
@@ -126,6 +133,8 @@ Baseline management (cannot be combined with run options):
 Evidence validation (cannot be combined with run options):
   --validate-release-contract FILE
                               Validate release-contract metadata and exit
+  --summarize-rss DIR COUNT   Validate COUNT matched RSS samples in DIR, write
+                              paired-delta files, and print key=value medians
   --build-toolchain PATH      Run a fresh CGO_ENABLED=0 src/make.bash and, only
                               after it succeeds, attest this fork's PATH.
                               GOROOT_BOOTSTRAP or BOOTSTRAP_GO may select the
@@ -405,6 +414,104 @@ compare_manifests() {
     fi
 }
 
+validate_rss_values() {
+    local input="$1" expected="$2"
+    [[ -f "${input}" && -r "${input}" ]] || fail "RSS sample input is missing or unreadable: ${input}"
+    awk -v expected="${expected}" '
+        NF != 1 || $1 !~ /^[1-9][0-9]*$/ { bad = 1 }
+        END { exit bad || NR != expected }
+    ' "${input}" || fail "${input} must contain exactly ${expected} single-field positive integer KiB rows"
+}
+
+rss_median() {
+    local input="$1" expected="$2" kind="$3" sorted result
+    case "${kind}" in
+        positive)
+            awk -v expected="${expected}" '
+                NF != 1 || $1 !~ /^[1-9][0-9]*$/ { bad = 1 }
+                END { exit bad || NR != expected }
+            ' "${input}" || return 1
+            ;;
+        signed)
+            awk -v expected="${expected}" '
+                NF != 1 || $1 !~ /^-?[0-9]+$/ { bad = 1 }
+                END { exit bad || NR != expected }
+            ' "${input}" || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    sorted="$(mktemp "${TMPDIR:-/tmp}/race-rss-median.XXXXXX")" || return 1
+    if ! LC_ALL=C sort -n "${input}" > "${sorted}"; then
+        rm -f "${sorted}"
+        return 1
+    fi
+    if ! result="$(awk -v n="${expected}" '
+        NR == int((n + 1) / 2) { left = $1 }
+        NR == int((n + 2) / 2) { right = $1 }
+        END {
+            if (NR != n || left == "" || right == "") exit 1
+            printf "%.17g\n", (left + right) / 2
+        }
+    ' "${sorted}")"; then
+        rm -f "${sorted}"
+        return 1
+    fi
+    rm -f "${sorted}" || return 1
+    printf '%s\n' "${result}"
+}
+
+summarize_rss() {
+    local dir="$1" count="$2" config input tmp
+    local baseline_median tsan_median purego_median
+    local tsan_baseline_median purego_baseline_median purego_tsan_median
+    [[ "${count}" =~ ^[1-9][0-9]*$ ]] || fail "RSS sample count must be a positive integer: ${count}"
+    [[ -d "${dir}" ]] || fail "RSS results directory does not exist: ${dir}"
+    for config in baseline tsan purego; do
+        input="${dir}/rss-${config}-kb.txt"
+        validate_rss_values "${input}" "${count}"
+    done
+
+    tmp="$(mktemp -d "${dir}/.rss-summary.XXXXXX")" || fail "could not create temporary RSS summary directory"
+    if ! paste "${dir}/rss-baseline-kb.txt" "${dir}/rss-tsan-kb.txt" "${dir}/rss-purego-kb.txt" | awk \
+        -v tsan_baseline="${tmp}/rss-tsan-minus-baseline-kb.txt" \
+        -v purego_baseline="${tmp}/rss-purego-minus-baseline-kb.txt" \
+        -v purego_tsan="${tmp}/rss-purego-minus-tsan-kb.txt" '
+            NF != 3 { bad = 1; next }
+            {
+                print $2 - $1 > tsan_baseline
+                print $3 - $1 > purego_baseline
+                print $3 - $2 > purego_tsan
+            }
+            END { if (bad) exit 1 }
+        '; then
+        rm -rf "${tmp}"
+        fail "could not create matched RSS deltas"
+    fi
+
+    baseline_median="$(rss_median "${dir}/rss-baseline-kb.txt" "${count}" positive)" || { rm -rf "${tmp}"; fail "could not compute baseline RSS median"; }
+    tsan_median="$(rss_median "${dir}/rss-tsan-kb.txt" "${count}" positive)" || { rm -rf "${tmp}"; fail "could not compute TSAN RSS median"; }
+    purego_median="$(rss_median "${dir}/rss-purego-kb.txt" "${count}" positive)" || { rm -rf "${tmp}"; fail "could not compute PureGo RSS median"; }
+    tsan_baseline_median="$(rss_median "${tmp}/rss-tsan-minus-baseline-kb.txt" "${count}" signed)" || { rm -rf "${tmp}"; fail "could not compute TSAN-minus-baseline RSS median"; }
+    purego_baseline_median="$(rss_median "${tmp}/rss-purego-minus-baseline-kb.txt" "${count}" signed)" || { rm -rf "${tmp}"; fail "could not compute PureGo-minus-baseline RSS median"; }
+    purego_tsan_median="$(rss_median "${tmp}/rss-purego-minus-tsan-kb.txt" "${count}" signed)" || { rm -rf "${tmp}"; fail "could not compute PureGo-minus-TSAN RSS median"; }
+
+    for input in rss-tsan-minus-baseline-kb.txt rss-purego-minus-baseline-kb.txt rss-purego-minus-tsan-kb.txt; do
+        mv "${tmp}/${input}" "${dir}/${input}" || { rm -rf "${tmp}"; fail "could not install ${input}"; }
+    done
+    rmdir "${tmp}" || fail "could not clean up temporary RSS summary directory"
+
+    printf '%s\n' \
+        "rss_samples=${count}" \
+        'rss_workload=BenchmarkMemoryConcurrent/g16' \
+        'rss_benchtime=3s' \
+        "baseline_median_kb=${baseline_median}" \
+        "tsan_median_kb=${tsan_median}" \
+        "purego_median_kb=${purego_median}" \
+        "tsan_minus_baseline_median_kb=${tsan_baseline_median}" \
+        "purego_minus_baseline_median_kb=${purego_baseline_median}" \
+        "purego_minus_tsan_median_kb=${purego_tsan_median}"
+}
+
 require_benchstat() {
     command -v benchstat >/dev/null 2>&1 || fail "benchstat not found; install golang.org/x/perf/cmd/benchstat"
 }
@@ -414,12 +521,14 @@ validate_name() {
 }
 
 validate_release_metadata() {
-    local file="$1" mode count seconds maximum
+    local file="$1" mode count seconds maximum rss_count rss_benchtime
     [[ -s "${file}" ]] || fail "release evidence metadata is missing: ${file}"
     mode="$(awk -F= '$1 == "mode" { print substr($0, length($1) + 2) }' "${file}")"
     count="$(awk -F= '$1 == "count" { print substr($0, length($1) + 2) }' "${file}")"
     seconds="$(awk -F= '$1 == "benchtime_seconds" { print substr($0, length($1) + 2) }' "${file}")"
     maximum="$(awk -F= '$1 == "max_raceread_ratio" { print substr($0, length($1) + 2) }' "${file}")"
+    rss_count="$(awk -F= '$1 == "rss_count" { print substr($0, length($1) + 2) }' "${file}")"
+    rss_benchtime="$(awk -F= '$1 == "rss_benchtime" { print substr($0, length($1) + 2) }' "${file}")"
     [[ "${mode}" == release ]] || fail "evidence mode is ${mode:-missing}, not release"
     if [[ ! "${count}" =~ ^[1-9][0-9]*$ ]] || (( count < 10 )); then
         fail "release evidence has count=${count:-missing}; want at least 10"
@@ -428,6 +537,11 @@ validate_release_metadata() {
     awk -v value="${seconds}" 'BEGIN { exit !(value >= 1) }' || fail "release evidence has benchtime_seconds=${seconds:-missing}; want at least 1"
     [[ "${maximum}" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "release evidence has invalid max_raceread_ratio=${maximum:-missing}; want a finite decimal"
     awk -v value="${maximum}" 'BEGIN { exit !(value > 0 && value <= 1) }' || fail "release evidence has max_raceread_ratio=${maximum:-missing}; want (0,1]"
+    if [[ ! "${rss_count}" =~ ^[1-9][0-9]*$ ]] || (( rss_count < 10 )); then
+        fail "release evidence has rss_count=${rss_count:-missing}; want at least 10"
+    fi
+    [[ "${rss_count}" == "${count}" ]] || fail "release evidence has rss_count=${rss_count}; want count=${count}"
+    [[ "${rss_benchtime}" == 3s ]] || fail "release evidence has rss_benchtime=${rss_benchtime:-missing}; want exactly 3s"
 }
 
 if [[ "${ACTION}" != run && "${RUN_OPTIONS}" == true ]]; then
@@ -448,6 +562,10 @@ case "${ACTION}" in
 		;;
 	validate-release-contract)
 		validate_release_metadata "${ACTION_ARG1}"
+		exit 0
+		;;
+	summarize-rss)
+		summarize_rss "${ACTION_ARG1}" "${ACTION_ARG2}"
 		exit 0
 		;;
 	list)
@@ -613,6 +731,8 @@ fi
     echo "benchtime=${BENCHTIME}"
     echo "benchtime_seconds=${BENCHTIME_SECONDS}"
     echo "max_raceread_ratio=${MAX_RACEREAD_RATIO}"
+    echo "rss_count=${COUNT}"
+    echo "rss_benchtime=3s"
 } > "${RESULTS_DIR}/release-contract.txt"
 
 BASELINE_BIN="${RESULTS_DIR}/benchmark-baseline.test"
@@ -843,34 +963,69 @@ grep -Eq '^[[:space:]]*(Benchmark)?RaceRead(-[0-9]+)?[[:space:]]' "${RESULTS_DIR
 grep -Eq '^[[:space:]]*(Benchmark)?RaceRead(-[0-9]+)?[[:space:]]' "${RESULTS_DIR}/benchstat_all.txt" || fail "all-configuration benchstat output is incomplete"
 
 measure_peak_rss() {
-    local label="$1" binary="$2" stdout_file time_file peak_kb peak_mb
-    stdout_file="${RESULTS_DIR}/rss-${label}.stdout"
-    time_file="${RESULTS_DIR}/rss-${label}.time"
+    local label="$1" binary="$2" sample="$3" stdout_file time_file manifest peak_kb
+    local aggregate_stdout aggregate_time sample_file
+    stdout_file="${RESULTS_DIR}/raw/${label}/rss-${sample}.stdout"
+    time_file="${RESULTS_DIR}/raw/${label}/rss-${sample}.time"
+    manifest="${stdout_file}.samples"
+    aggregate_stdout="${RESULTS_DIR}/rss-${label}.stdout"
+    aggregate_time="${RESULTS_DIR}/rss-${label}.time"
+    sample_file="${RESULTS_DIR}/rss-${label}-kb.txt"
+    echo "Running ${label} RSS sample ${sample}/${COUNT}..."
+    printf '%s %s\n' "${sample}" "${label}" >> "${RESULTS_DIR}/rss-sample-order.txt"
     if ! GOMAXPROCS="${BENCH_GOMAXPROCS}" "${GNU_TIME_BIN}" -v "${binary}" -test.run='^$' \
         -test.bench='^BenchmarkMemoryConcurrent$/^g16$' -test.benchmem \
         -test.benchtime=3s -test.count=1 -test.timeout=2m \
         > "${stdout_file}" 2> "${time_file}"; then
         cat "${stdout_file}" >&2
         cat "${time_file}" >&2
-        fail "${label} RSS workload failed"
+        fail "${label} RSS sample ${sample} workload failed"
     fi
     if grep -Eq '^FAIL([[:space:]]|$)|^--- FAIL:|WARNING: DATA RACE|fatal error:|runtime: fatal' "${stdout_file}" "${time_file}"; then
         cat "${stdout_file}" >&2
         cat "${time_file}" >&2
-        fail "${label} RSS workload reported a failure"
+        fail "${label} RSS sample ${sample} workload reported a failure"
     fi
-    grep -Eq '^BenchmarkMemoryConcurrent/g16(-[0-9]+)?[[:space:]]' "${stdout_file}" || fail "${label} RSS workload produced no benchmark sample"
-    grep -q '^PASS$' "${stdout_file}" || fail "${label} RSS workload produced no PASS marker"
-    peak_kb="$(awk -F: '/Maximum resident set size \(kbytes\)/ { value=$2; gsub(/[[:space:]]/, "", value); found++ } END { if (found == 1) print value }' "${time_file}")"
-    [[ "${peak_kb}" =~ ^[1-9][0-9]*$ ]] || fail "invalid ${label} peak RSS value: ${peak_kb:-missing}"
-    peak_mb=$(( peak_kb / 1024 ))
-    echo "${label}: ${peak_mb} MB (${peak_kb} KB)" | tee -a "${RESULTS_DIR}/memory_rss.txt"
+    benchmark_manifest "${stdout_file}" 1 "${manifest}" || fail "${label} RSS sample ${sample} benchmark row is invalid"
+    awk 'NR != 1 || $1 !~ /^BenchmarkMemoryConcurrent\/g16(-[0-9]+)?$/ || $2 != 1 { bad = 1 } END { exit bad || NR != 1 }' \
+        "${manifest}" || fail "${label} RSS sample ${sample} did not produce the exact BenchmarkMemoryConcurrent/g16 row"
+    awk '$0 == "PASS" { found++ } END { exit found != 1 }' "${stdout_file}" || fail "${label} RSS sample ${sample} did not produce exactly one PASS marker"
+    peak_kb="$(awk -F: '
+        $1 ~ /^[[:space:]]*Maximum resident set size \(kbytes\)[[:space:]]*$/ {
+            value = $2
+            gsub(/[[:space:]]/, "", value)
+            found++
+        }
+        END { if (found == 1) print value }
+    ' "${time_file}")"
+    [[ "${peak_kb}" =~ ^[1-9][0-9]*$ ]] || fail "invalid ${label} RSS sample ${sample} maximum: ${peak_kb:-missing}"
+    cat "${stdout_file}" >> "${aggregate_stdout}" || fail "could not append ${label} RSS stdout"
+    cat "${time_file}" >> "${aggregate_time}" || fail "could not append ${label} RSS time output"
+    printf '%s\n' "${peak_kb}" >> "${sample_file}" || fail "could not append ${label} RSS sample"
 }
 
-: > "${RESULTS_DIR}/memory_rss.txt"
-measure_peak_rss baseline "${BASELINE_BIN}"
-measure_peak_rss tsan "${TSAN_BIN}"
-measure_peak_rss purego "${PUREGO_BIN}"
+for file in \
+    rss-sample-order.txt \
+    rss-baseline.stdout rss-tsan.stdout rss-purego.stdout \
+    rss-baseline.time rss-tsan.time rss-purego.time \
+    rss-baseline-kb.txt rss-tsan-kb.txt rss-purego-kb.txt \
+    rss-tsan-minus-baseline-kb.txt rss-purego-minus-baseline-kb.txt rss-purego-minus-tsan-kb.txt \
+    memory_rss.txt; do
+    : > "${RESULTS_DIR}/${file}"
+done
+
+for (( sample = 1; sample <= COUNT; sample++ )); do
+    sample_name="$(printf '%03d' "${sample}")"
+    measure_peak_rss baseline "${BASELINE_BIN}" "${sample_name}"
+    if (( sample % 2 == 1 )); then
+        measure_peak_rss tsan "${TSAN_BIN}" "${sample_name}"
+        measure_peak_rss purego "${PUREGO_BIN}" "${sample_name}"
+    else
+        measure_peak_rss purego "${PUREGO_BIN}" "${sample_name}"
+        measure_peak_rss tsan "${TSAN_BIN}" "${sample_name}"
+    fi
+done
+summarize_rss "${RESULTS_DIR}" "${COUNT}" > "${RESULTS_DIR}/memory_rss.txt"
 
 verify_benchmark_binary() {
     local label="$1" binary="$2" expected="$3" actual
@@ -910,7 +1065,7 @@ verify_race_binary_symbols PureGo "${PUREGO_BIN}" purego "${RESULTS_DIR}/symbols
     cat "${RESULTS_DIR}/benchstat_all.txt"
     echo '```'
     echo
-    echo '### Peak RSS (exact prebuilt binaries)'
+    echo '### Repeated peak RSS (exact prebuilt binaries)'
     echo '```'
     cat "${RESULTS_DIR}/memory_rss.txt"
     echo '```'

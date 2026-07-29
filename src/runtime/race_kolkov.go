@@ -126,8 +126,8 @@ func raceKolkovOptionInt32(value string) (int32, bool) {
 //
 // shadowPage layout:
 //
-//	offset 0:  slots[0] (262144 * atomic.Pointer[shadowSlot], each 8 bytes)
-//	offset 2097152:  blocks[0] (512 rangeBlock values, each 24 bytes)
+//	offset 0:     slotTables[0] (512 * atomic.Pointer[blockSlotTable], each 8 bytes)
+//	offset 4096:  blocks[0] (512 rangeBlock values, each 24 bytes)
 //
 // rangeBlock layout:
 //
@@ -143,7 +143,7 @@ func raceKolkovOptionInt32(value string) (int32, bool) {
 //
 //	offset 0:    base (uintptr)
 //	offset 8:    next (*externalBlockCell)
-//	offset 16:   block.slots (*externalSlotTable, 512 slot pointers when present)
+//	offset 16:   block.slots (*blockSlotTable, 512 slot pointers when present)
 //	offset 32:   block.history.state (atomic.Pointer[VarState])
 //	offset 40:   block.history.compact (atomic.Pointer[compactGroups])
 //
@@ -171,14 +171,16 @@ const (
 	ptTotalCoverage = uintptr(ptL1Size) << ptL1Shift // 128 GiB
 	ptPagesOffset   = 8                              // offset of pages[0] in PageTableShadow
 
-	// A shadowPage's materialized slot array is followed by one 24-byte
-	// ordinary-history default for each 4KiB application block. Keep these
-	// values synchronized with shadowmem.shadowPage and shadowmem.rangeBlock;
+	// A shadowPage's 512-entry lazy table directory is followed by one 24-byte
+	// ordinary-history default for each 4KiB application block. Each published
+	// table contains 512 word-slot pointers. Keep these values synchronized with
+	// shadowmem.shadowPage, blockSlotTable, and rangeBlock;
 	// runtime_fastpath_abi_test.go owns the corresponding layout assertions.
 	shadowBlockShift           = 12
 	shadowBlocksPerPage        = 1 << (ptL1Shift - shadowBlockShift)
 	shadowBlockMask            = shadowBlocksPerPage - 1
-	shadowPageBlocksOffset     = (ptL2Mask + 1) * goarch.PtrSize
+	shadowBlockWordMask        = (1 << (shadowBlockShift - 3)) - 1
+	shadowPageBlocksOffset     = 4096
 	shadowRangeBlockSize       = 24
 	shadowRangeBlockStateOff   = 8
 	shadowRangeBlockCompactOff = 16
@@ -287,11 +289,13 @@ func raceShadowState(shadowPtr, addr uintptr) unsafe.Pointer {
 		if pagePtr == nil {
 			return nil
 		}
-		slotPtr := atomic.Loadp(unsafe.Add(pagePtr, ((offset>>3)&ptL2Mask)*goarch.PtrSize))
-		if slotPtr != nil {
-			return atomic.Loadp(unsafe.Add(slotPtr, (offset&7)*goarch.PtrSize))
-		}
 		blockIdx := (offset >> shadowBlockShift) & shadowBlockMask
+		if slotsPtr := atomic.Loadp(unsafe.Add(pagePtr, blockIdx*goarch.PtrSize)); slotsPtr != nil {
+			wordIdx := (offset >> 3) & shadowBlockWordMask
+			if slotPtr := atomic.Loadp(unsafe.Add(slotsPtr, wordIdx*goarch.PtrSize)); slotPtr != nil {
+				return atomic.Loadp(unsafe.Add(slotPtr, (offset&7)*goarch.PtrSize))
+			}
+		}
 		blockPtr := unsafe.Add(pagePtr, shadowPageBlocksOffset+blockIdx*shadowRangeBlockSize)
 		if compactPtr := atomic.Loadp(unsafe.Add(blockPtr, shadowRangeBlockCompactOff)); compactPtr != nil {
 			if atomic.Load((*uint32)(unsafe.Add(compactPtr, shadowCompactActiveOff))) != 0 {
