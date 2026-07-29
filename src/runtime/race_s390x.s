@@ -36,6 +36,18 @@ TEXT	runtime·raceread<ABIInternal>(SB), NOSPLIT, $0-8
 	MOVD	R14, R4
 	JMP	racecalladdr<>(SB)
 
+// func runtime·racereadn(addr, size uintptr)
+// The Pure-Go backend consumes size; TSAN retains scalar semantics.
+TEXT	runtime·racereadn<ABIInternal>(SB), NOSPLIT, $0-16
+	MOVD	$__tsan_read(SB), R1
+#ifndef GOEXPERIMENT_regabiargs
+	MOVD	addr+0(FP), R3
+#else
+	MOVD	R2, R3
+#endif
+	MOVD	R14, R4
+	JMP	racecalladdr<>(SB)
+
 // func runtime·RaceRead(addr uintptr)
 TEXT	runtime·RaceRead(SB), NOSPLIT, $0-8
 	// This needs to be a tail call, because raceread reads caller pc.
@@ -52,6 +64,18 @@ TEXT	runtime·racereadpc(SB), NOSPLIT, $0-24
 // Called from instrumented code.
 TEXT	runtime·racewrite<ABIInternal>(SB), NOSPLIT, $0-8
 	// void __tsan_write(ThreadState *thr, void *addr, void *pc);
+	MOVD	$__tsan_write(SB), R1
+#ifndef GOEXPERIMENT_regabiargs
+	MOVD	addr+0(FP), R3
+#else
+	MOVD	R2, R3
+#endif
+	MOVD	R14, R4
+	JMP	racecalladdr<>(SB)
+
+// func runtime·racewriten(addr, size uintptr)
+// See racereadn above.
+TEXT	runtime·racewriten<ABIInternal>(SB), NOSPLIT, $0-16
 	MOVD	$__tsan_write(SB), R1
 #ifndef GOEXPERIMENT_regabiargs
 	MOVD	addr+0(FP), R3

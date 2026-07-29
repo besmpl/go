@@ -1,16 +1,17 @@
 // Package syncshadow implements shadow memory for synchronization primitives.
 //
-// This package tracks happens-before relationships created by synchronization
-// operations like mutex Lock/Unlock. It is used in Phase 4 of the FastTrack
-// algorithm to eliminate false positives on properly synchronized code.
+// This package tracks happens-before relationships created by the runtime's
+// generic acquire, release, and release-merge operations.
 //
 // Key Concepts:
 //
 // Shadow Memory for Sync Primitives:
-//   - Each sync primitive (mutex, rwmutex, etc.) has a SyncVar in shadow memory
+//   - Each runtime-selected synchronization address has a SyncVar
 //   - SyncVar stores the releaseClock - the vector clock at last Release (Unlock)
 //   - On Acquire (Lock), the thread merges the releaseClock into its own clock
 //   - This establishes the happens-before: Unlock(m) → Lock(m)
+//   - Buffered channels use per-slot addresses; close uses the channel address
+//   - WaitGroup Done uses ReleaseMerge and Wait uses Acquire at one address
 //
 // FastTrack Sync Algorithm:
 //
@@ -38,12 +39,9 @@
 //	mu.Unlock()       // Release: L_mu = C2
 //
 // Performance:
-//   - GetOrCreate: O(1) sync.Map lookup
-//   - Memory: ~1KB per active mutex (VectorClock = 1KB)
-//
-// Phase 4 Implementation:
-//   - Task 4.1: Mutex Acquire/Release tracking (this package)
-//   - Task 4.2: RWMutex support (read/write locks)
-//   - Task 4.3: Channel synchronization
-//   - Task 4.4: Atomic operations
+//   - Existing-address GetOrCreate: lock-free page/segment chain lookup
+//   - First access: one sharded writer lock and lazy state allocation
+//   - ClearRange: indexed by touched pages, with a sparse scan for huge spans
+//   - Memory: state and vector clocks are allocated lazily and retain sparse
+//     storage capacity for reuse
 package syncshadow

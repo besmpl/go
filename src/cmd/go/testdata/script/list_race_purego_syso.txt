@@ -1,0 +1,50 @@
+# Pure-Go race builds must ignore the ThreadSanitizer system object selected
+# by the target's GOOS and GOARCH.
+
+env CGO_ENABLED=0 GOOS=linux
+
+env GOARCH=arm64
+go list -race -f '{{join .SysoFiles " "}}' runtime/race
+! stdout .
+go list -race -f '{{join .IgnoredOtherFiles " "}}' runtime/race
+stdout '(^| )race_linux_arm64\.syso( |$)'
+
+env GOARCH=loong64
+go list -race -f '{{join .SysoFiles " "}}' runtime/race
+! stdout .
+go list -race -f '{{join .IgnoredOtherFiles " "}}' runtime/race
+stdout '(^| )race_linux_loong64\.syso( |$)'
+
+env GOARCH=ppc64le
+go list -race -f '{{join .SysoFiles " "}}' runtime/race
+! stdout .
+go list -race -f '{{join .IgnoredOtherFiles " "}}' runtime/race
+stdout '(^| )race_linux_ppc64le\.syso( |$)'
+
+env GOARCH=riscv64
+go list -race -f '{{join .SysoFiles " "}}' runtime/race
+! stdout .
+go list -race -f '{{join .IgnoredOtherFiles " "}}' runtime/race
+stdout '(^| )race_linux_riscv64\.syso( |$)'
+
+env GOARCH=s390x
+go list -race -f '{{join .SysoFiles " "}}' runtime/race
+! stdout .
+go list -race -f '{{join .IgnoredOtherFiles " "}}' runtime/race
+stdout '(^| )race_linux_s390x\.syso( |$)'
+
+# Enabling cgo must preserve selection of the ThreadSanitizer system object.
+env CGO_ENABLED=1 GOARCH=arm64
+go list -race -f '{{join .SysoFiles " "}}' runtime/race
+stdout '^race_linux_arm64\.syso$'
+
+# Apply the same selection rules to the Darwin system object.
+env CGO_ENABLED=0 GOOS=darwin GOARCH=arm64
+go list -race -f '{{join .SysoFiles " "}}' runtime/race
+! stdout .
+go list -race -f '{{join .IgnoredOtherFiles " "}}' runtime/race
+stdout '(^| )race_darwin_arm64\.syso( |$)'
+
+env CGO_ENABLED=1
+go list -race -f '{{join .SysoFiles " "}}' runtime/race
+stdout '^race_darwin_arm64\.syso$'

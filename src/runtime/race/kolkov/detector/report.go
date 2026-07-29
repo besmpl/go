@@ -19,25 +19,27 @@ func runtimeCallersFramesReport(callers []uintptr) *runtimeFramesReport
 
 type runtimeFramesReport struct{}
 
-type runtimeFrameReport struct {
-	PC        uintptr
-	Func      uintptr // *runtime.Func — opaque, for struct layout alignment
-	Function  string
-	File      string
-	Line      int
-	startLine int
-	Entry     uintptr
-	funcInfo  [2]uintptr // runtime.funcInfo — two pointers (*_func, *moduledata)
-}
+//go:linkname runtimeFramesNextReport runtime.kolkovFramesNext
+func runtimeFramesNextReport(f *runtimeFramesReport) (pc uintptr, function, file string, line int, more bool)
 
-//go:linkname runtimeFramesNextReport runtime.framesNext
-func runtimeFramesNextReport(f *runtimeFramesReport) (frame runtimeFrameReport, more bool)
+type runtimeFrameReport struct {
+	PC       uintptr
+	Function string
+	File     string
+	Line     int
+}
 
 // kolkovIncrementErrors increments the runtime's race error counter.
 // The runtime uses this counter in RaceErrors() to determine exit code 66.
 //
 //go:linkname kolkovIncrementErrors runtime.kolkovIncrementErrors
 func kolkovIncrementErrors()
+
+// kolkovReportDone applies report-time runtime policy only after the complete
+// warning has been emitted (for example, GORACE=halt_on_error=1).
+//
+//go:linkname kolkovReportDone runtime.kolkovReportDone
+func kolkovReportDone()
 
 // Note: printstring and printuint are declared in detector.go via linkname.
 
@@ -175,9 +177,6 @@ const (
 //
 // This structure captures all details needed to report a memory access
 // that participated in a data race.
-//
-// Phase 5 Task 5.1: Basic information (type, address, goroutine ID)
-// Phase 5 Task 5.2: Added stack trace capture.
 type AccessInfo struct {
 	// Type indicates whether this was a Read or Write access.
 	Type AccessType
@@ -193,20 +192,113 @@ type AccessInfo struct {
 	// Contains both clock (timestamp) and TID (goroutine ID).
 	Epoch epoch.Epoch
 
-	// StackTrace contains program counters (PCs) for the call stack.
-	// Captured at the time of the access using runtime.Callers().
-	// Phase 5 Task 5.2: Added for stack trace support.
+	// StackTrace contains a captured call stack or the best available recorded
+	// access PC.
 	StackTrace []uintptr
+
+	// CreationStackTrace contains the recorded go-statement PC for this
+	// goroutine. Goroutine creation is a lifecycle event, so retaining this
+	// metadata does not add work to the memory-access hot path.
+	CreationStackTrace []uintptr
+
+	// CreationRunning reports whether the goroutine was still live when this
+	// report took its lifecycle snapshot.
+	CreationRunning bool
+}
+
+// Keep creation records for all live detector goroutines and a bounded tail of
+// finished goroutines. A conflict can be discovered after its earlier
+// goroutine exits, so dropping metadata immediately at GoEnd would lose the
+// standard "created at" section. Conversely, retaining every process-lifetime
+// TID would grow without bound in goroutine-heavy programs.
+const retiredGoroutineCreationSlots = 4096
+
+type goroutineCreationRecord struct {
+	tid uint32
+	pc  uintptr
+}
+
+type goroutineCreationRegistry struct {
+	mu spinlock
+
+	// active is proportional to live goroutines rather than lifetime history.
+	active map[uint32]uintptr
+
+	// retired is a fixed-size FIFO tail. Eviction can reduce only diagnostic
+	// fidelity for very old finished goroutines; it cannot affect detection.
+	// Reports are rare, so a linear lookup is preferable to a second map and its
+	// stale-entry bookkeeping.
+	retired     [retiredGoroutineCreationSlots]goroutineCreationRecord
+	retiredNext uint32
+}
+
+// RegisterGoroutineCreation records the go statement which created tid. A zero
+// PC has no symbolizable information and is intentionally omitted.
+func (d *Detector) RegisterGoroutineCreation(tid uint32, pc uintptr) {
+	if tid == 0 || pc == 0 {
+		return
+	}
+	registry := &d.goroutineCreations
+	registry.mu.lock()
+	if registry.active == nil {
+		registry.active = make(map[uint32]uintptr)
+	}
+	registry.active[tid] = pc
+	registry.mu.unlock()
+}
+
+// RetireGoroutineCreation moves a live creation record into the bounded
+// finished tail so a later conflict with stale shadow history can still name
+// the goroutine's creation site.
+func (d *Detector) RetireGoroutineCreation(tid uint32) {
+	if tid == 0 {
+		return
+	}
+	registry := &d.goroutineCreations
+	registry.mu.lock()
+	pc, ok := registry.active[tid]
+	if ok {
+		delete(registry.active, tid)
+		slot := registry.retiredNext % retiredGoroutineCreationSlots
+		registry.retired[slot] = goroutineCreationRecord{tid: tid, pc: pc}
+		registry.retiredNext++
+	}
+	registry.mu.unlock()
+}
+
+func (registry *goroutineCreationRegistry) reset() {
+	registry.mu.lock()
+	registry.active = nil
+	registry.retired = [retiredGoroutineCreationSlots]goroutineCreationRecord{}
+	registry.retiredNext = 0
+	registry.mu.unlock()
+}
+
+func (d *Detector) lookupGoroutineCreation(tid uint32) (pc uintptr, running, ok bool) {
+	if tid == 0 {
+		return 0, false, false
+	}
+	registry := &d.goroutineCreations
+	registry.mu.lock()
+	if pc, ok = registry.active[tid]; ok {
+		registry.mu.unlock()
+		return pc, true, true
+	}
+	for i := range registry.retired {
+		record := registry.retired[i]
+		if record.tid == tid {
+			registry.mu.unlock()
+			return record.pc, false, true
+		}
+	}
+	registry.mu.unlock()
+	return 0, false, false
 }
 
 // RaceReport represents a detected data race between two accesses.
 //
 // A race occurs when two goroutines access the same memory location
 // without synchronization, and at least one access is a write.
-//
-// Phase 5 Task 5.1: Basic race information
-// Phase 5 Task 5.2: Added stack traces
-// Phase 5 Task 5.3: Added deduplication key.
 type RaceReport struct {
 	// Current is the most recent access that triggered race detection.
 	Current AccessInfo
@@ -215,9 +307,9 @@ type RaceReport struct {
 	Previous AccessInfo
 
 	// DeduplicationKey uniquely identifies this race location.
-	// Computed as a hash of "{type}:{addr}:{gid1}:{gid2}" where gid1 < gid2.
-	// This is used to prevent duplicate reports for the same race.
-	// Added in Phase 5 Task 5.3.
+	// It combines the race kind, address, lifecycle, and normalized
+	// goroutine/access-site pairs. The bounded deduplication table also keeps
+	// the full fields so a hash collision cannot suppress a distinct report.
 	DeduplicationKey uint64
 }
 
@@ -237,8 +329,6 @@ type RaceReport struct {
 //   - gid1, gid2: Goroutine IDs involved in the race
 //
 // Returns a uint64 hash suitable for use in reportedRacesMap.
-//
-// Phase 5 Task 5.3: Deduplication key generation.
 func generateDeduplicationKey(raceType string, addr uintptr, gid1, gid2 uint32) uint64 {
 	// Sort goroutine IDs to ensure consistent key ordering.
 	// This makes race (G1 vs G2) and race (G2 vs G1) generate the same key.
@@ -274,6 +364,25 @@ func generateDeduplicationKey(raceType string, addr uintptr, gid1, gid2 uint32) 
 	return hash
 }
 
+func lifecycleIDForReport(v interface{}) uint64 {
+	if state, ok := v.(interface{ GetLifecycleID() uint64 }); ok {
+		return state.GetLifecycleID()
+	}
+	return 0
+}
+
+func mixDeduplicationLifecycle(hash, lifecycle uint64) uint64 {
+	const fnvPrime = 1099511628211
+	hash ^= lifecycle
+	return hash * fnvPrime
+}
+
+func mixDeduplicationSite(hash uint64, pc uintptr) uint64 {
+	const fnvPrime = 1099511628211
+	hash ^= uint64(pc)
+	return hash * fnvPrime
+}
+
 // captureStackTrace captures the current call stack.
 //
 // This function uses runtime.Callers() to capture program counters (PCs)
@@ -284,8 +393,6 @@ func generateDeduplicationKey(raceType string, addr uintptr, gid1, gid2 uint32) 
 //
 // Returns a slice of program counters that can be converted to stack frames
 // using runtime.CallersFrames(). Maximum depth is limited to maxStackDepth (32).
-//
-// Phase 5 Task 5.2: Stack trace capture implementation.
 func captureStackTrace(skip int) []uintptr {
 	pcs := make([]uintptr, maxStackDepth)
 	n := runtimeCallersReport(skip, pcs)
@@ -307,8 +414,7 @@ func captureStackTrace(skip int) []uintptr {
 //
 // Returns a formatted string ready for inclusion in race reports.
 //
-// Phase 5 Task 5.2: Stack trace formatting implementation.
-// v0.7.1: Improved handling of single-PC inputs (from lazy stack capture).
+// Single-PC inputs are supported for previously recorded access sites.
 func formatStackTrace(pcs []uintptr) (result string) {
 	// Use defer/recover to catch any panics from corrupted frame data.
 	// This is a safety net - corrupted PCs can cause crashes when formatting.
@@ -349,7 +455,8 @@ func formatStackTraceInner(pcs []uintptr) string {
 	var firstFrame *runtimeFrameReport // Store first frame in case all get filtered
 
 	for {
-		frame, more := runtimeFramesNextReport(frames)
+		pc, function, file, line, more := runtimeFramesNextReport(frames)
+		frame := runtimeFrameReport{PC: pc, Function: function, File: file, Line: line}
 
 		// Skip invalid frames:
 		// - PC == 0: no valid instruction pointer
@@ -361,7 +468,7 @@ func formatStackTraceInner(pcs []uintptr) string {
 			continue
 		}
 
-		// Store first frame as fallback (v0.7.1: show something even if internal)
+		// Store the first frame as a fallback when every frame is internal.
 		if firstFrame == nil {
 			frameCopy := frame
 			firstFrame = &frameCopy
@@ -383,8 +490,8 @@ func formatStackTraceInner(pcs []uintptr) string {
 	}
 
 	if result == "" {
-		// v0.7.1: If all frames were filtered but we had a single PC,
-		// show that frame anyway (better than nothing for debugging)
+		// If all frames were filtered but we had a single PC, show it anyway;
+		// it is likely the recorded user access site.
 		if len(pcs) == 1 && firstFrame != nil {
 			return formatFrame(firstFrame)
 		}
@@ -396,9 +503,7 @@ func formatStackTraceInner(pcs []uintptr) string {
 
 // isInternalStackFrame returns true if the function should be filtered from stack traces.
 //
-// v0.7.2: Expanded filter to cover ALL racedetector internal functions.
-// This fixes Issue #17 where internal frames (reportRaceV2, raceread, RaceRead, etc.)
-// were appearing in stack traces instead of user code.
+// Detector implementation details are filtered from user reports.
 func isInternalStackFrame(funcName string) bool {
 	// Safety check: empty or nil-like function names are internal
 	if len(funcName) == 0 {
@@ -416,9 +521,11 @@ func isInternalStackFrame(funcName string) bool {
 		return false
 	}
 
-	// Filter ALL racedetector internal packages
-	// This catches: internal/race/api, internal/race/detector, etc.
-	if containsStr(funcName, "kolkov/racedetector/internal/") {
+	// Filter the pure-Go detector implementation packages. Runtime callbacks
+	// use this import path even though the public stack should start at the
+	// compiler-instrumented access site.
+	if containsStr(funcName, "runtime/race/kolkov/") ||
+		containsStr(funcName, "kolkov/racedetector/internal/") {
 		return true
 	}
 
@@ -452,16 +559,28 @@ func hexReportShort(n uintptr) string {
 	return string(buf[i:])
 }
 
-// NewRaceReportWithStacks creates a RaceReport with complete stack traces.
+func formatGoroutineCreation(access *AccessInfo) string {
+	if len(access.CreationStackTrace) == 0 {
+		return ""
+	}
+	status := "finished"
+	if access.CreationRunning {
+		status = "running"
+	}
+	return "\nGoroutine " + uitoaReport(uint64(access.GoroutineID)) + " (" + status + ") created at:\n" +
+		formatStackTrace(access.CreationStackTrace)
+}
+
+// NewRaceReportWithStacks creates a RaceReport with the current full stack and
+// the best available previous access location.
 //
-// This is an enhanced version of NewRaceReport that retrieves previous access
-// stack traces from VarState, enabling complete race reports showing BOTH
-// the current and previous access locations.
+// This is an enhanced version of NewRaceReport that retrieves the previous
+// access PC or legacy stack from VarState.
 //
-// Lazy Stack Capture (v0.3.0 Performance):
+// Lazy stack capture:
 // This function is called ONLY when a race is detected (off hot path).
-// It captures full stack traces lazily using stored PC values from VarState.
-// This moves the expensive stack capture (~500ns) from hot path to race reporting.
+// It captures the current stack at report time and uses metadata recorded for
+// the previous access, keeping stack capture off the access hot path.
 //
 // Parameters:
 //   - raceType: One of RaceTypeWriteWrite, RaceTypeReadWrite, RaceTypeWriteRead
@@ -470,10 +589,9 @@ func hexReportShort(n uintptr) string {
 //   - prevEpoch: Epoch of previous conflicting access
 //   - currEpoch: Epoch of current access
 //
-// Returns a fully populated RaceReport with both current and previous stacks.
-//
-// v0.2.0 Task 6: Complete race reports with both stacks.
-// v0.3.0 Performance: Lazy stack capture using stored PC values.
+// Returns a RaceReport with the current full stack and either the stored
+// previous PC, a legacy previous stack, or no previous stack when neither is
+// available.
 //
 //nolint:gocognit // Complex but necessary logic for race report generation
 func NewRaceReportWithStacks(raceType string, addr uintptr, vsInterface interface{}, prevEpoch, currEpoch epoch.Epoch) *RaceReport {
@@ -488,7 +606,7 @@ func NewRaceReportWithStacks(raceType string, addr uintptr, vsInterface interfac
 	// Retrieve previous access stack from VarState.
 	var previousStack []uintptr
 
-	// Type assert to get VarState interface with PC/stack methods (v0.3.0 Performance).
+	// Type assert to get VarState interface with PC/stack methods.
 	// We use interface{} to avoid import cycle with shadowmem package.
 	type pcGetter interface {
 		GetWritePC() uintptr
@@ -503,7 +621,7 @@ func NewRaceReportWithStacks(raceType string, addr uintptr, vsInterface interfac
 		var prevStackHash uint64
 
 		// Determine which PC/stack to retrieve based on race type.
-		if raceType == RaceTypeWriteWrite || raceType == RaceTypeReadWrite {
+		if raceType == RaceTypeWriteWrite || raceType == RaceTypeWriteRead {
 			// Previous access was a write - get write PC.
 			prevPC = vs.GetWritePC()
 			prevStackHash = vs.GetWriteStack() // Legacy fallback
@@ -513,8 +631,7 @@ func NewRaceReportWithStacks(raceType string, addr uintptr, vsInterface interfac
 			prevStackHash = vs.GetReadStack() // Legacy fallback
 		}
 
-		// Lazy stack capture (v0.3.0 Performance):
-		// We store only the caller PC on the hot path (~5ns instead of ~500ns).
+		// The hot path stores only the caller PC rather than capturing a stack.
 		// When a race is detected, we use the stored PC to show at least the function name.
 		if prevPC != 0 {
 			// Use the stored PC to create a minimal stack trace.
@@ -523,8 +640,7 @@ func NewRaceReportWithStacks(raceType string, addr uintptr, vsInterface interfac
 			// For full stack, we'd need to store all frames at access time (~500ns).
 			previousStack = []uintptr{prevPC}
 		} else if prevStackHash != 0 {
-			// Legacy fallback: Use old stack hash if PC not available.
-			// This supports transition period where some accesses may still use old method.
+			// Legacy fallback: use the stack hash if no PC is available.
 			prevStackTrace := stackdepot.GetStack(prevStackHash)
 			if prevStackTrace != nil {
 				// Convert StackTrace to []uintptr.
@@ -549,7 +665,7 @@ func NewRaceReportWithStacks(raceType string, addr uintptr, vsInterface interfac
 			Addr:        addr,
 			GoroutineID: uint32(prevTID),
 			Epoch:       prevEpoch,
-			StackTrace:  previousStack, // ✅ Now has previous stack!
+			StackTrace:  previousStack,
 		},
 	}
 
@@ -570,7 +686,7 @@ func NewRaceReportWithStacks(raceType string, addr uintptr, vsInterface interfac
 		report.Previous.Type = AccessWrite
 	}
 
-	// Generate deduplication key (Phase 5 Task 5.3).
+	// Generate the key used to deduplicate equivalent reports.
 	report.DeduplicationKey = generateDeduplicationKey(
 		raceType,
 		addr,
@@ -594,12 +710,10 @@ func NewRaceReportWithStacks(raceType string, addr uintptr, vsInterface interfac
 //
 // Returns a fully populated RaceReport ready for formatting.
 //
-// Phase 5 Task 5.2: Captures stack trace for current access.
-// Phase 5 Task 5.3: Generates deduplication key.
-// Previous access stack trace is not available (would require storing
-// stack traces in shadow memory, planned for future enhancement).
+// Previous access stack trace is unavailable because this constructor receives
+// no previous-access metadata.
 //
-// Deprecated: Use NewRaceReportWithStacks() instead (v0.2.0 Task 6).
+// Deprecated: Use NewRaceReportWithStacks instead.
 func NewRaceReport(raceType string, addr uintptr, prevEpoch, currEpoch epoch.Epoch) *RaceReport {
 	// Extract goroutine IDs from epochs.
 	currTID, _ := currEpoch.Decode()
@@ -621,8 +735,7 @@ func NewRaceReport(raceType string, addr uintptr, prevEpoch, currEpoch epoch.Epo
 			Addr:        addr,
 			GoroutineID: uint32(prevTID),
 			Epoch:       prevEpoch,
-			// StackTrace not available - previous access happened earlier.
-			// Future enhancement: store stack traces in shadow memory.
+			// StackTrace is unavailable without previous-access metadata.
 			StackTrace: nil,
 		},
 	}
@@ -644,7 +757,7 @@ func NewRaceReport(raceType string, addr uintptr, prevEpoch, currEpoch epoch.Epo
 		report.Previous.Type = AccessWrite
 	}
 
-	// Generate deduplication key (Phase 5 Task 5.3).
+	// Generate the key used to deduplicate equivalent reports.
 	// This uniquely identifies the race location to prevent duplicate reports.
 	report.DeduplicationKey = generateDeduplicationKey(
 		raceType,
@@ -669,12 +782,9 @@ func NewRaceReport(raceType string, addr uintptr, prevEpoch, currEpoch epoch.Epo
 //	      /path/to/file.go:25 +0x5c
 //
 //	Previous write at 0x00c0000180a0 by goroutine 6:
-//	  (previous access stack trace not available - see Task 5.3)
+//	  (previous access stack trace not available)
 //	  [epoch: 5@100]
 //	==================
-//
-// Phase 5 Task 5.1: Basic format with operation types and goroutine IDs
-// Phase 5 Task 5.2: Added stack trace capture. for current access
 //
 // The report is printed directly to stderr using runtime print functions.
 func (r *RaceReport) Print() {
@@ -696,7 +806,7 @@ func (r *RaceReport) Print() {
 		printstring("  (no stack trace captured)\n")
 	}
 
-	// Show epoch for debugging (can be removed in production).
+	// Include the exact detector epoch as a PureGo diagnostic extension.
 	printstring("  [epoch: ")
 	printstring(r.Current.Epoch.String())
 	printstring("]\n\n")
@@ -723,14 +833,17 @@ func (r *RaceReport) Print() {
 	printstring(r.Previous.Epoch.String())
 	printstring("]\n")
 
+	printstring(formatGoroutineCreation(&r.Current))
+	if r.Previous.GoroutineID != r.Current.GoroutineID {
+		printstring(formatGoroutineCreation(&r.Previous))
+	}
+
 	printstring("==================\n")
 }
 
 // String returns a formatted string representation of the race report.
 //
 // Useful for testing and debugging.
-//
-// Phase 5 Task 5.2: Now includes stack traces.
 func (r *RaceReport) String() string {
 	result := "==================\n"
 	result += "WARNING: DATA RACE\n"
@@ -757,61 +870,86 @@ func (r *RaceReport) String() string {
 	}
 	result += "  [epoch: " + r.Previous.Epoch.String() + "]\n"
 
+	result += formatGoroutineCreation(&r.Current)
+	if r.Previous.GoroutineID != r.Current.GoroutineID {
+		result += formatGoroutineCreation(&r.Previous)
+	}
+
 	result += "==================\n"
 	return result
 }
 
-// reportRaceV2 is the new race reporting function that uses RaceReport struct.
+// reportRaceV2 reports a race using the structured RaceReport format.
 //
-// This replaces the MVP reportRace() function with a more structured approach
-// that matches Go's official race detector output format.
-//
-// Deduplication Strategy (Phase 5 Task 5.3):
-// - Generate a unique key for each race location: "{type}:{addr}:{gid1}:{gid2}"
-// - Check if this key has been reported before (using sync.Map)
-// - If yes: silently skip reporting (return early)
-// - If no: report the race and mark this key as reported
+// Deduplication strategy:
+//   - Generate a key from the race kind, address, lifecycle, and normalized
+//     goroutine/access-site pairs
+//   - Check the key and its full collision-resistant fields in a bounded table
+//   - If yes: silently skip reporting (return early)
+//   - If no: report the race and mark this key as reported
 //
 // This prevents spam from the same race occurring multiple times during execution.
 //
-// Stack Traces (v0.2.0 Task 6):
-// - Retrieves previous access stack from VarState
-// - Captures current access stack
-// - Shows BOTH stacks in race report for complete debugging context
+// Stack traces:
+//   - Captures the current stack, or uses an explicit current access PC
+//   - Retrieves the best available previous PC or legacy stack from VarState
 //
 // Parameters:
 //   - raceType: Type of race (RaceTypeWriteWrite, RaceTypeReadWrite, RaceTypeWriteRead)
 //   - addr: Memory address where race occurred
-//   - vs: VarState containing previous access stack hash
+//   - vs: VarState containing previous access PC or legacy stack hash
 //   - prevEpoch: Epoch of previous conflicting access
 //   - currEpoch: Epoch of current access
 //
 // Thread Safety: Uses detector mutex to prevent interleaved output.
-//
-// Phase 5 Task 5.1: ✅ Basic structured reporting
-// Phase 5 Task 5.2: ✅ Stack trace capture for current access
-// Phase 5 Task 5.3: ✅ Deduplication to prevent duplicate reports
-// v0.2.0 Task 6: ✅ Complete race reports with both stacks.
 func (d *Detector) reportRaceV2(raceType string, addr uintptr, vs interface{}, prevEpoch, currEpoch epoch.Epoch) {
-	// Suppress false positives on sync primitive addresses.
-	// Go's sync.Mutex/RWMutex use atomic CAS on their internal fields (e.g., m.state),
-	// which triggers raceread/racewrite. Since Go 1.26's internal/sync.Mutex does NOT
-	// call race.Disable() around its CAS (unlike older versions), the CAS happens
-	// BEFORE race.Acquire. Our detector sees an unsynchronized write because the
-	// goroutine's VectorClock hasn't been updated yet (Acquire hasn't happened).
-	// The actual synchronization is tracked via raceacquire/racerelease on the same
-	// address, so these "races" are false positives.
-	if d.syncShadow != nil && d.syncShadow.HasEntry(addr) {
-		return
-	}
+	d.reportRaceV2PC(raceType, addr, vs, prevEpoch, currEpoch, 0)
+}
 
+// reportRaceV2PC reports a race and uses currentPC as the current access site
+// when supplied by a compiler hook. Unwinding from detector code running on
+// systemstack cannot reliably recover that user frame.
+func (d *Detector) reportRaceV2PC(raceType string, addr uintptr, vs interface{}, prevEpoch, currEpoch epoch.Epoch, currentPC uintptr) {
 	// Create structured race report (this generates the deduplication key).
 	report := NewRaceReportWithStacks(raceType, addr, vs, prevEpoch, currEpoch)
+	if currentPC != 0 {
+		report.Current.StackTrace = []uintptr{currentPC}
+	}
+	if creationPC, running, ok := d.lookupGoroutineCreation(report.Current.GoroutineID); ok {
+		report.Current.CreationStackTrace = []uintptr{creationPC}
+		report.Current.CreationRunning = running
+	}
+	if creationPC, running, ok := d.lookupGoroutineCreation(report.Previous.GoroutineID); ok {
+		report.Previous.CreationStackTrace = []uintptr{creationPC}
+		report.Previous.CreationRunning = running
+	}
 
-	// Phase 5 Task 5.3: Check if this race has already been reported.
 	// Use loadOrStore for atomic check-and-set operation.
 	// Returns true if the key already exists (race already reported).
-	alreadyReported := d.reportedRaces.loadOrStore(report.DeduplicationKey)
+	firstTID := report.Current.GoroutineID
+	secondTID := report.Previous.GoroutineID
+	firstPC := currentPC
+	var secondPC uintptr
+	if len(report.Previous.StackTrace) != 0 {
+		secondPC = report.Previous.StackTrace[0]
+	}
+	if firstTID > secondTID {
+		firstTID, secondTID = secondTID, firstTID
+		firstPC, secondPC = secondPC, firstPC
+	}
+	lifecycle := lifecycleIDForReport(vs)
+	report.DeduplicationKey = mixDeduplicationLifecycle(report.DeduplicationKey, lifecycle)
+	report.DeduplicationKey = mixDeduplicationSite(report.DeduplicationKey, firstPC)
+	report.DeduplicationKey = mixDeduplicationSite(report.DeduplicationKey, secondPC)
+	alreadyReported := d.reportedRaces.loadOrStore(report.DeduplicationKey, reportedRaceKey{
+		raceType:  raceType,
+		addr:      addr,
+		firstTID:  firstTID,
+		secondTID: secondTID,
+		firstPC:   firstPC,
+		secondPC:  secondPC,
+		lifecycle: lifecycle,
+	})
 	if alreadyReported {
 		// This race has already been reported - skip it silently.
 		// We don't increment the race counter for duplicates.
@@ -826,6 +964,9 @@ func (d *Detector) reportRaceV2(raceType string, addr uintptr, vs interface{}, p
 	// Increment race counter for statistics.
 	// Only count unique races (deduplication is applied).
 	d.racesDetected++
+	if d.reportObserver != nil {
+		d.reportObserver(report)
+	}
 
 	// Notify the runtime so RaceErrors() returns the correct count.
 	// The runtime uses this to set exit code 66 when races are found.
@@ -833,4 +974,5 @@ func (d *Detector) reportRaceV2(raceType string, addr uintptr, vs interface{}, p
 
 	// Print to stderr using runtime print functions.
 	report.Print()
+	kolkovReportDone()
 }

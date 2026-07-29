@@ -11,7 +11,7 @@ import (
 // createTestContext creates a RaceContext for testing.
 //
 //nolint:unparam // tid is parameterized for future multi-goroutine tests.
-func createTestContext(tid uint16) *goroutine.RaceContext {
+func createTestContext(tid uint32) *goroutine.RaceContext {
 	return goroutine.Alloc(tid)
 }
 

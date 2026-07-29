@@ -216,6 +216,70 @@ func TestRaceReport_String(t *testing.T) {
 	}
 }
 
+func TestReportIncludesRegisteredGoroutineCreationSites(t *testing.T) {
+	pcs := captureStackTrace(2)
+	if len(pcs) == 0 {
+		t.Fatal("failed to capture creation test PC")
+	}
+	creationPC := pcs[0]
+
+	d := NewDetector()
+	d.RegisterGoroutineCreation(1, creationPC)
+	d.RetireGoroutineCreation(1)
+	d.RegisterGoroutineCreation(2, creationPC)
+	var report *RaceReport
+	d.reportObserver = func(observed *RaceReport) { report = observed }
+	d.reportRaceV2PC(
+		RaceTypeWriteWrite,
+		0x12345678,
+		nil,
+		epoch.NewEpoch(1, 5),
+		epoch.NewEpoch(2, 10),
+		creationPC,
+	)
+	if report == nil {
+		t.Fatal("race report was not observed")
+	}
+
+	output := report.String()
+	for _, want := range []string{
+		"Goroutine 2 (running) created at:\n",
+		"Goroutine 1 (finished) created at:\n",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("report missing %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestRetiredGoroutineCreationsAreBounded(t *testing.T) {
+	d := NewDetector()
+	const activeTID = uint32(retiredGoroutineCreationSlots + 2)
+	d.RegisterGoroutineCreation(activeTID, 0xabcdef)
+	for tid := uint32(1); tid <= retiredGoroutineCreationSlots+1; tid++ {
+		d.RegisterGoroutineCreation(tid, uintptr(0x10000+tid))
+		d.RetireGoroutineCreation(tid)
+	}
+
+	if _, _, ok := d.lookupGoroutineCreation(1); ok {
+		t.Fatal("oldest retired creation record was not evicted")
+	}
+	if pc, running, ok := d.lookupGoroutineCreation(retiredGoroutineCreationSlots + 1); !ok || running || pc == 0 {
+		t.Fatalf("newest retired creation = (%#x, running=%t, ok=%t), want retained and finished", pc, running, ok)
+	}
+	if pc, running, ok := d.lookupGoroutineCreation(activeTID); !ok || !running || pc != 0xabcdef {
+		t.Fatalf("active creation = (%#x, running=%t, ok=%t), want active record", pc, running, ok)
+	}
+
+	d.Reset()
+	if _, _, ok := d.lookupGoroutineCreation(activeTID); ok {
+		t.Fatal("detector reset retained active creation metadata")
+	}
+	if _, _, ok := d.lookupGoroutineCreation(retiredGoroutineCreationSlots + 1); ok {
+		t.Fatal("detector reset retained retired creation metadata")
+	}
+}
+
 // TestDetector_reportRaceV2 tests the new structured race reporting.
 func TestDetector_reportRaceV2(t *testing.T) {
 	d := NewDetector()
@@ -420,6 +484,61 @@ func TestDetector_Deduplication_DuplicateRaceSkipped(t *testing.T) {
 	finalCount := d.RacesDetected()
 	if finalCount != 1 {
 		t.Errorf("After duplicate reportRaceV2, race count = %d, want 1 (duplicate should be skipped)", finalCount)
+	}
+}
+
+func TestDetector_Deduplication_AddressReuseStartsNewLifecycle(t *testing.T) {
+	d := NewDetector()
+	const addr = uintptr(0x2340)
+	prev := epoch.NewEpoch(31, 4)
+	curr := epoch.NewEpoch(32, 7)
+
+	oldState := d.shadowMemory.GetOrCreate(addr)
+	d.reportRaceV2(RaceTypeWriteWrite, addr, oldState, prev, curr)
+	if got := d.RacesDetected(); got != 1 {
+		t.Fatalf("first lifecycle reported %d races, want 1", got)
+	}
+
+	d.ClearShadowRange(addr, 1)
+	freshState := d.shadowMemory.GetOrCreate(addr)
+	if freshState.GetLifecycleID() == oldState.GetLifecycleID() {
+		t.Fatal("ClearShadowRange reused the old report lifecycle")
+	}
+	d.reportRaceV2(RaceTypeWriteWrite, addr, freshState, prev, curr)
+	if got := d.RacesDetected(); got != 2 {
+		t.Fatalf("reused address reported %d races, want 2 independent lifecycles", got)
+	}
+}
+
+func TestReportedRacesMapHashCollisionCannotSuppressDistinctRace(t *testing.T) {
+	var reports reportedRacesMap
+	first := reportedRaceKey{raceType: RaceTypeWriteWrite, addr: 0x1000, firstTID: 1, secondTID: 2, firstPC: 0x101, secondPC: 0x202, lifecycle: 3}
+	second := first
+	second.firstPC = 0x303
+	const forcedHash = uint64(0x55)
+	if reports.loadOrStore(forcedHash, first) {
+		t.Fatal("first key unexpectedly loaded")
+	}
+	if reports.loadOrStore(forcedHash, second) {
+		t.Fatal("distinct full key was suppressed by a forced hash collision")
+	}
+	if !reports.loadOrStore(forcedHash, first) {
+		t.Fatal("identical full key was not deduplicated")
+	}
+}
+
+func TestDetectorDeduplicationDifferentAccessSitesReported(t *testing.T) {
+	d := NewDetector()
+	const addr = uintptr(0x2450)
+	prev := epoch.NewEpoch(61, 4)
+	curr := epoch.NewEpoch(62, 7)
+	firstState := rangeReportState{writePC: 0x1010, lifecycle: 9}
+	secondState := rangeReportState{writePC: 0x3030, lifecycle: 9}
+
+	d.reportRaceV2PC(RaceTypeWriteWrite, addr, firstState, prev, curr, 0x2020)
+	d.reportRaceV2PC(RaceTypeWriteWrite, addr, secondState, prev, curr, 0x4040)
+	if got := d.RacesDetected(); got != 2 {
+		t.Fatalf("same address/TIDs at different sites reported %d races, want 2", got)
 	}
 }
 

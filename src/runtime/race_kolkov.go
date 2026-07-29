@@ -13,95 +13,423 @@ package runtime
 
 import (
 	"internal/abi"
+	"internal/goarch"
+	"internal/runtime/atomic"
 	"internal/runtime/sys"
 	"unsafe"
 )
+
+const raceKolkovDefaultExitCode = int32(66)
+
+var (
+	raceKolkovExitCode    = raceKolkovDefaultExitCode
+	raceKolkovHaltOnError bool
+)
+
+// Runtime init runs after schedinit has captured the process environment and
+// before the pure-Go detector package can observe an instrumented user access.
+// Parse the process-control subset of GORACE here so the access and reporting
+// paths only read immutable scalar state.
+func init() {
+	raceKolkovExitCode, raceKolkovHaltOnError = raceKolkovProcessOptions(gogetenv("GORACE"))
+}
+
+// raceKolkovProcessOptions parses the GORACE options that control process
+// termination. The documented format is a whitespace-separated list of
+// key=value fields. Unknown and malformed fields are ignored, and later valid
+// occurrences override earlier ones, matching the startup flag convention.
+func raceKolkovProcessOptions(options string) (exitCode int32, haltOnError bool) {
+	exitCode = raceKolkovDefaultExitCode
+	for options != "" {
+		for len(options) != 0 && raceKolkovOptionSpace(options[0]) {
+			options = options[1:]
+		}
+		if options == "" {
+			break
+		}
+
+		end := 0
+		for end < len(options) && !raceKolkovOptionSpace(options[end]) {
+			end++
+		}
+		field := options[:end]
+		options = options[end:]
+
+		eq := 0
+		for eq < len(field) && field[eq] != '=' {
+			eq++
+		}
+		if eq == len(field) {
+			continue
+		}
+		value, ok := raceKolkovOptionInt32(field[eq+1:])
+		if !ok {
+			continue
+		}
+		switch field[:eq] {
+		case "exitcode":
+			exitCode = value
+		case "halt_on_error":
+			haltOnError = value != 0
+		}
+	}
+	return
+}
+
+func raceKolkovOptionSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+func raceKolkovOptionInt32(value string) (int32, bool) {
+	if value == "" {
+		return 0, false
+	}
+	negative := false
+	switch value[0] {
+	case '-':
+		negative = true
+		value = value[1:]
+	case '+':
+		value = value[1:]
+	}
+	if value == "" {
+		return 0, false
+	}
+
+	limit := uint64(1<<31 - 1)
+	if negative {
+		limit++
+	}
+	var n uint64
+	for i := 0; i < len(value); i++ {
+		digit := value[i] - '0'
+		if digit > 9 || n > (limit-uint64(digit))/10 {
+			return 0, false
+		}
+		n = n*10 + uint64(digit)
+	}
+	if negative {
+		return int32(-int64(n)), true
+	}
+	return int32(n), true
+}
 
 // T26: Inline same-epoch fast path constants and functions.
 // These replace the go:linkname CALL to kolkovSameEpochRead/Write,
 // eliminating ~12ns cross-package call overhead per memory access.
 //
 // PageTableShadow layout (from shadowmem/shadow_pagetable.go):
-//   offset 0:  base (atomic.Uintptr, 8 bytes)
-//   offset 8:  pages[0] (65536 * atomic.Pointer[shadowPage], each 8 bytes)
+//
+//	offset 0:       base (atomic.Uintptr, 8 bytes)
+//	offset 8:       pages[0] (65536 * atomic.Pointer[shadowPage], each 8 bytes)
+//	offset 524296:  external[0] (65536 atomic.Pointer[externalBlockCell], each 8 bytes)
 //
 // shadowPage layout:
-//   offset 0:  slots[0] (262144 * atomic.Pointer[VarState], each 8 bytes)
+//
+//	offset 0:  slots[0] (262144 * atomic.Pointer[shadowSlot], each 8 bytes)
+//	offset 2097152:  blocks[0] (512 rangeBlock values, each 24 bytes)
+//
+// rangeBlock layout:
+//
+//	offset 0:   mu (spinlock, 4 bytes plus alignment padding)
+//	offset 8:   state (atomic.Pointer[VarState], 8 bytes)
+//	offset 16:  compact (atomic.Pointer[compactGroups], 8 bytes)
+//
+// compactGroups runtime header:
+//
+//	offset 0: active (atomic.Uint32, permanent conservative-lookup gate)
+//
+// externalBlockCell layout:
+//
+//	offset 0:    base (uintptr)
+//	offset 8:    next (*externalBlockCell)
+//	offset 16:   block.slots (*externalSlotTable, 512 slot pointers when present)
+//	offset 32:   block.history.state (atomic.Pointer[VarState])
+//	offset 40:   block.history.compact (atomic.Pointer[compactGroups])
+//
+// shadowSlot layout:
+//
+//	offset 0: states[0] (8 * atomic.Pointer[VarState], each 8 bytes)
 //
 // VarState layout (from shadowmem/varstate.go):
-//   offset 0:  W (atomic.Uint64, 8 bytes) — write epoch
-//   offset 40: readerState (atomic.Uint32, 4 bytes) — reader count
 //
-// RaceContext layout (from goroutine/context.go):
-//   offset 16: Epoch (uint64)
+//	offset 0:  W (atomic.Uint64, 8 bytes) — write epoch
+//	offset 40: readerState (atomic.Uint32, 4 bytes) — reader count
+//
+// RaceContext ABI-sensitive prefix on 64-bit targets (from
+// goroutine/context.go):
+//
+//	offset 4:  ReadCacheInvalidatedClock (atomic.Uint32)
+//	offset 16: Epoch (uint64)
+//	offset 24: ReadCache[0] (4 uintptr entries)
+//	offset 56: ReadCacheStates[0] (4 unsafe.Pointer entries)
+//	offset 88: ReadCacheWidths[0] (4 uint8 entries)
 const (
-	ptL1Shift         = 21
-	ptL2Mask          = 0x3FFFF // (1<<18) - 1
-	ptTotalCoverage   = uintptr(65536) << 21 // 128GB
-	ptPagesOffset     = 8                     // offset of pages[0] in PageTableShadow
-	vsWOffset         = 0                     // offset of W in VarState
-	vsReaderOffset    = 40                    // offset of readerState in VarState
-	ctxEpochOffset    = 16                    // offset of Epoch in RaceContext
+	ptL1Shift       = 21
+	ptL1Size        = 65536
+	ptL2Mask        = 0x3FFFF                        // (1<<18) - 1
+	ptTotalCoverage = uintptr(ptL1Size) << ptL1Shift // 128 GiB
+	ptPagesOffset   = 8                              // offset of pages[0] in PageTableShadow
+
+	// A shadowPage's materialized slot array is followed by one 24-byte
+	// ordinary-history default for each 4KiB application block. Keep these
+	// values synchronized with shadowmem.shadowPage and shadowmem.rangeBlock;
+	// runtime_fastpath_abi_test.go owns the corresponding layout assertions.
+	shadowBlockShift           = 12
+	shadowBlocksPerPage        = 1 << (ptL1Shift - shadowBlockShift)
+	shadowBlockMask            = shadowBlocksPerPage - 1
+	shadowPageBlocksOffset     = (ptL2Mask + 1) * goarch.PtrSize
+	shadowRangeBlockSize       = 24
+	shadowRangeBlockStateOff   = 8
+	shadowRangeBlockCompactOff = 16
+	shadowCompactActiveOff     = 0
+
+	// Sparse out-of-window block directory. The bounded traversal is only
+	// an optimization: longer collision chains take the detector slow path.
+	ptExternalOffset              = ptPagesOffset + ptL1Size*goarch.PtrSize
+	externalBlockBuckets          = 1 << 16
+	externalBlockMask             = externalBlockBuckets - 1
+	externalBlockShift            = 12
+	externalBlockWordMask         = (1 << (externalBlockShift - 3)) - 1
+	externalBlockCellNextOffset   = goarch.PtrSize
+	externalBlockCellSlotsOffset  = 2 * goarch.PtrSize
+	externalBlockHistoryOffset    = externalBlockCellSlotsOffset + goarch.PtrSize
+	externalBlockHistoryStateOff  = externalBlockHistoryOffset + shadowRangeBlockStateOff
+	externalBlockCompactOffset    = externalBlockHistoryOffset + shadowRangeBlockCompactOff
+	externalBlockMaxChainFastPath = 8
+
+	shadowHashMultiplier = uint64(0x9E3779B97F4A7C15)
+
+	vsWOffset                          = 0                  // offset of W in VarState
+	ctxReadCacheInvalidatedClockOffset = 4                  // offset of ReadCacheInvalidatedClock in RaceContext
+	ctxEpochOffset                     = 8 + goarch.PtrSize // TID + marker + C
+	ctxReadCacheOffset                 = ctxEpochOffset + 8 // offset of ReadCache[0] in RaceContext
+	ctxReadCacheSlots                  = 4
+	ctxReadCacheMask                   = ctxReadCacheSlots - 1
+	ctxReadStateOffset                 = ctxReadCacheOffset + ctxReadCacheSlots*goarch.PtrSize
+	ctxReadWidthOffset                 = ctxReadStateOffset + ctxReadCacheSlots*goarch.PtrSize
+	ctxReadWeakWidth                   = uint8(1 << 7)
+
+	// PageTableShadow has this layout only on amd64 and arm64. Other supported
+	// race architectures use a fallback-only stub and must take the slow path.
+	raceInlineShadowSupported = goarch.IsAmd64 | goarch.IsArm64
 )
 
-// raceInlineSameEpochRead checks if the last write to addr was by this goroutine
-// at the same epoch. If true, no race is possible and we can skip the full detector.
-// T26: Inlined version of kolkovSameEpochRead — no CALL, pure pointer math.
-// Kept compact (< 80 inlining cost) so the compiler inlines it into raceread.
+// ReadCache is owned by its RaceContext. Ordinary accesses happen only while
+// that logical goroutine is running; target-g synchronization may advance the
+// context only while the target is parked under the runtime synchronization
+// primitive. A one-way external observation instead atomically publishes the
+// observed source clock in ReadCacheInvalidatedClock; the owner keeps exclusive
+// access to the cache entries. racegoend retires the context, and a newly
+// allocated context is zero-initialized, so cached addresses never cross a
+// context lifetime.
+
+// raceReadCacheEpochValid reports whether no external one-way synchronization
+// has observed the current cache epoch. A marker from an older epoch is harmless:
+// IncrementClock cleared the old entries before publishing the newer epoch.
+// Keeping zero as the common value avoids loading Epoch in programs that have
+// not performed such an observation.
 //
 //go:nosplit
-func raceInlineSameEpochRead(addr, racectx uintptr) bool {
-	shadowPtr := kolkovShadowPtr
-	if shadowPtr == 0 {
-		return false
+func raceReadCacheEpochValid(racectx uintptr) bool {
+	invalidated := atomic.Load((*uint32)(unsafe.Pointer(racectx + ctxReadCacheInvalidatedClockOffset)))
+	if invalidated == 0 {
+		return true
 	}
-	offset := (addr &^ 7) - *(*uintptr)(unsafe.Pointer(shadowPtr))
-	if offset >= ptTotalCoverage {
-		return false
-	}
-	pagePtr := *(*uintptr)(unsafe.Pointer(shadowPtr + ptPagesOffset + (offset>>ptL1Shift)*8))
-	if pagePtr == 0 {
-		return false
-	}
-	vsPtr := *(*uintptr)(unsafe.Pointer(pagePtr + ((offset>>3)&ptL2Mask)*8))
-	return vsPtr != 0 && *(*uint64)(unsafe.Pointer(vsPtr)) == *(*uint64)(unsafe.Pointer(racectx+ctxEpochOffset))
+	currentEpoch := atomic.Load64((*uint64)(unsafe.Pointer(racectx + ctxEpochOffset)))
+	return uint32(currentEpoch) > invalidated
 }
 
-// raceInlineSameEpochWrite checks same-epoch AND no concurrent readers.
-// T26: Inlined version of kolkovSameEpochWrite.
+// raceExternalBlockCell returns the exact sparse directory cell used outside
+// the primary window. The bounded walk is inlineable into racereadSlowPath;
+// missing or unusually long chains take the sound detector slow path.
 //
 //go:nosplit
-func raceInlineSameEpochWrite(addr, racectx uintptr) bool {
-	shadowPtr := kolkovShadowPtr
-	if shadowPtr == 0 {
-		return false
+func raceExternalBlockCell(shadowPtr, blockBase uintptr) unsafe.Pointer {
+	hash := (uint64(blockBase) * shadowHashMultiplier) >> 48
+	bucket := uintptr(hash) & externalBlockMask
+	cellPtr := atomic.Loadp(unsafe.Pointer(shadowPtr + ptExternalOffset + bucket*goarch.PtrSize))
+	for i := 0; i < externalBlockMaxChainFastPath; i++ {
+		if cellPtr == nil || *(*uintptr)(cellPtr) == blockBase {
+			return cellPtr
+		}
+		cellPtr = atomic.Loadp(unsafe.Add(cellPtr, externalBlockCellNextOffset))
 	}
-	offset := (addr &^ 7) - *(*uintptr)(unsafe.Pointer(shadowPtr))
-	if offset >= ptTotalCoverage {
-		return false
-	}
-	pagePtr := *(*uintptr)(unsafe.Pointer(shadowPtr + ptPagesOffset + (offset>>ptL1Shift)*8))
-	if pagePtr == 0 {
-		return false
-	}
-	vsPtr := *(*uintptr)(unsafe.Pointer(pagePtr + ((offset>>3)&ptL2Mask)*8))
-	return vsPtr != 0 &&
-		*(*uint64)(unsafe.Pointer(vsPtr)) == *(*uint64)(unsafe.Pointer(racectx+ctxEpochOffset)) &&
-		*(*uint32)(unsafe.Pointer(vsPtr+vsReaderOffset)) == 0
+	return nil
 }
 
-// kolkovShadowPtr is the runtime-local cached shadow pointer for T26 inline fast path.
-// Set lazily on first slow-path exit when detector is initialized.
-// Immutable after first set (never changes once shadow is created).
-var kolkovShadowPtr uintptr
+// raceShadowState resolves the authoritative exact-address VarState mirrored
+// by PageTableShadow. A materialized word is authoritative even when its lane
+// is nil. For an unmaterialized word, an active compact header forces a
+// conservative detector miss; a hot word promoted out of compact regains exact
+// pointer lookup because slot precedence is checked first. Headers are eagerly
+// installed before block defaults so allocator clear never allocates, but their
+// active word remains zero until the first membership/tombstone publication;
+// such default-only blocks retain this fast path.
+//
+// The returned pointer is a snapshot. Runtime read shortcuts use the mapping
+// load itself as their linearization point: ClearRange drains detector
+// publishers before replacing the mapping, and cached pointers remain
+// GC-visible in RaceContext, so pointer equality cannot suffer an allocator ABA.
+//
+//go:nosplit
+func raceShadowState(shadowPtr, addr uintptr) unsafe.Pointer {
+	if raceInlineShadowSupported == 0 || shadowPtr == 0 {
+		return nil
+	}
+	base := atomic.LoadAcquintptr((*uintptr)(unsafe.Pointer(shadowPtr)))
+	if base == 0 {
+		return nil
+	}
+	offset := addr - base
+	if offset < ptTotalCoverage {
+		pagePtr := atomic.Loadp(unsafe.Pointer(shadowPtr + ptPagesOffset + (offset>>ptL1Shift)*goarch.PtrSize))
+		if pagePtr == nil {
+			return nil
+		}
+		slotPtr := atomic.Loadp(unsafe.Add(pagePtr, ((offset>>3)&ptL2Mask)*goarch.PtrSize))
+		if slotPtr != nil {
+			return atomic.Loadp(unsafe.Add(slotPtr, (offset&7)*goarch.PtrSize))
+		}
+		blockIdx := (offset >> shadowBlockShift) & shadowBlockMask
+		blockPtr := unsafe.Add(pagePtr, shadowPageBlocksOffset+blockIdx*shadowRangeBlockSize)
+		if compactPtr := atomic.Loadp(unsafe.Add(blockPtr, shadowRangeBlockCompactOff)); compactPtr != nil {
+			if atomic.Load((*uint32)(unsafe.Add(compactPtr, shadowCompactActiveOff))) != 0 {
+				return nil
+			}
+		}
+		return atomic.Loadp(unsafe.Add(blockPtr, shadowRangeBlockStateOff))
+	}
+
+	blockBase := addr &^ (uintptr(1)<<externalBlockShift - 1)
+	cellPtr := raceExternalBlockCell(shadowPtr, blockBase)
+	if cellPtr == nil {
+		return nil
+	}
+	wordIdx := (addr >> 3) & externalBlockWordMask
+	if slotsPtr := atomic.Loadp(unsafe.Add(cellPtr, externalBlockCellSlotsOffset)); slotsPtr != nil {
+		slotPtr := atomic.Loadp(unsafe.Add(slotsPtr, wordIdx*goarch.PtrSize))
+		if slotPtr != nil {
+			return atomic.Loadp(unsafe.Add(slotPtr, (addr&7)*goarch.PtrSize))
+		}
+	}
+	if compactPtr := atomic.Loadp(unsafe.Add(cellPtr, externalBlockCompactOffset)); compactPtr != nil {
+		if atomic.Load((*uint32)(unsafe.Add(compactPtr, shadowCompactActiveOff))) != 0 {
+			return nil
+		}
+	}
+	return atomic.Loadp(unsafe.Add(cellPtr, externalBlockHistoryStateOff))
+}
+
+// raceFirstModuleStaticData reports whether addr belongs to mutable static
+// storage in the executable's first module. These sections live for the
+// process lifetime, so an exact redundant-read cache entry cannot be revived
+// by allocator reuse. Keep the section checks separate: their order and
+// contiguity are not guaranteed, in particular with external linking.
+//
+// Limiting this shortcut to firstmoduledata deliberately leaves plugin globals
+// on the exact shadow-state revalidation path.
+//
+//go:nosplit
+func raceFirstModuleStaticData(addr uintptr) bool {
+	datap := &firstmoduledata
+	return datap.noptrdata <= addr && addr < datap.enoptrdata ||
+		datap.data <= addr && addr < datap.edata ||
+		datap.bss <= addr && addr < datap.ebss ||
+		datap.noptrbss <= addr && addr < datap.enoptrbss
+}
+
+// raceFirstModuleStaticDataRange is the compiler-scalar counterpart of
+// raceFirstModuleStaticData. It is reached only after racereadn matches an
+// exact cache entry published by the validated detector path, and racereadn
+// supplies only the compiler's exact 2-, 4-, or 8-byte scalar widths. The
+// range is therefore known to be non-empty and non-wrapping. Both endpoints
+// must belong to the same mutable static section; adjacency between linker
+// sections is not a lifetime guarantee.
+//
+//go:nosplit
+func raceFirstModuleStaticDataRange(addr, size uintptr) bool {
+	last := addr + size - 1
+	datap := &firstmoduledata
+	return datap.noptrdata <= addr && last < datap.enoptrdata ||
+		datap.data <= addr && last < datap.edata ||
+		datap.bss <= addr && last < datap.ebss ||
+		datap.noptrbss <= addr && last < datap.enoptrbss
+}
+
+// raceClearReadCache invalidates per-context redundant-read elimination before
+// a write can bypass the detector's full path.
+//
+//go:nosplit
+func raceClearReadCache(racectx uintptr) {
+	if racectx > 1 {
+		*(*[ctxReadCacheSlots]uintptr)(unsafe.Pointer(racectx + ctxReadCacheOffset)) = [ctxReadCacheSlots]uintptr{}
+		for i := uintptr(0); i < ctxReadCacheSlots; i++ {
+			atomicstorep(unsafe.Pointer(racectx+ctxReadStateOffset+i*goarch.PtrSize), nil)
+		}
+		*(*[ctxReadCacheSlots]uint8)(unsafe.Pointer(racectx + ctxReadWidthOffset)) = [ctxReadCacheSlots]uint8{}
+	}
+}
+
+// raceInvalidateReadCache removes the exact address written by a scalar hook.
+// Other slots remain represented and can still eliminate redundant reads.
+//
+//go:nosplit
+func raceInvalidateReadCache(racectx, addr uintptr) {
+	raceInvalidateReadCacheRange(racectx, addr, 1)
+}
+
+// raceAccessRangeValid validates a half-open range without forming a wrapping
+// end address.
+//
+//go:nosplit
+func raceAccessRangeValid(addr, size uintptr) bool {
+	return size != 0 && size-1 <= ^uintptr(0)-addr
+}
+
+// raceInvalidateReadCacheRange removes only exact cached reads covered by a
+// range write. Unrelated cache entries remain valid.
+//
+//go:nosplit
+func raceInvalidateReadCacheRange(racectx, addr, size uintptr) {
+	if racectx <= 1 || !raceAccessRangeValid(addr, size) {
+		return
+	}
+	cache := (*[ctxReadCacheSlots]uintptr)(unsafe.Pointer(racectx + ctxReadCacheOffset))
+	widths := (*[ctxReadCacheSlots]uint8)(unsafe.Pointer(racectx + ctxReadWidthOffset))
+	for i := range cache {
+		cached := cache[i]
+		width := uintptr(widths[i] &^ ctxReadWeakWidth)
+		if cached != 0 && width != 0 && raceRangesOverlap(cached, width, addr, size) {
+			cache[i] = 0
+			stateSlot := unsafe.Pointer(racectx + ctxReadStateOffset + uintptr(i)*goarch.PtrSize)
+			atomicstorep(stateSlot, nil)
+			widths[i] = 0
+		}
+	}
+}
+
+// raceRangesOverlap reports whether two validated, non-empty half-open ranges
+// overlap without forming either end address.
+//
+//go:nosplit
+func raceRangesOverlap(first, firstSize, second, secondSize uintptr) bool {
+	if first <= second {
+		return second-first < firstSize
+	}
+	return first-second < secondSize
+}
+
+// kolkovShadowPtr is the runtime-local, GC-visible shadow pointer for T26's
+// inline fast paths. The API's runtime instance initializes its shadow once;
+// tests that replace the API detector do not run through these hooks.
+var kolkovShadowPtr atomic.UnsafePointer
 
 // kolkovCacheShadowPtr caches the shadow pointer if not yet cached.
 // Called from slow path exits after detector initialization is complete.
-//
-//go:nosplit
 func kolkovCacheShadowPtr() {
-	if kolkovShadowPtr == 0 {
-		kolkovShadowPtr = kolkovGetShadowPtr()
+	if kolkovShadowPtr.Load() == nil {
+		kolkovShadowPtr.Store(unsafe.Pointer(kolkovGetShadowPtr()))
 	}
 }
 
@@ -118,7 +446,8 @@ func RaceRead(addr unsafe.Pointer) {
 //go:linkname race_Read internal/race.Read
 //go:nosplit
 func race_Read(addr unsafe.Pointer) {
-	RaceRead(addr)
+	pc := sys.GetCallerPC()
+	racereadpc(addr, pc, pc)
 }
 
 // RaceWrite records a write to the memory location addr by the current goroutine.
@@ -140,6 +469,9 @@ func race_Write(addr unsafe.Pointer) {
 //
 //go:nosplit
 func RaceReadRange(addr unsafe.Pointer, len int) {
+	if len <= 0 {
+		return
+	}
 	racereadrange(uintptr(addr), uintptr(len))
 }
 
@@ -154,6 +486,9 @@ func race_ReadRange(addr unsafe.Pointer, len int) {
 //
 //go:nosplit
 func RaceWriteRange(addr unsafe.Pointer, len int) {
+	if len <= 0 {
+		return
+	}
 	racewriterange(uintptr(addr), uintptr(len))
 }
 
@@ -235,7 +570,6 @@ func race_ReleaseMerge(addr unsafe.Pointer) {
 func RaceDisable() {
 	gp := getg()
 	gp.raceignore++
-	// TODO: Notify the detector to ignore synchronization events
 }
 
 //go:linkname race_Disable internal/race.Disable
@@ -250,7 +584,6 @@ func race_Disable() {
 func RaceEnable() {
 	gp := getg()
 	gp.raceignore--
-	// TODO: Notify the detector to resume synchronization tracking
 }
 
 //go:linkname race_Enable internal/race.Enable
@@ -265,13 +598,18 @@ const raceenabled = true
 
 // raceReadObjectPC records a read of an object by the current goroutine.
 // For composite objects (array, struct), it reads the entire object.
-// For non-composite objects, it reads just the first byte.
+// Atomic-sized scalar objects use their exact width so ObjectPC callers cannot
+// hide partial overlaps with atomic operations.
 func raceReadObjectPC(t *_type, addr unsafe.Pointer, callerpc, pc uintptr) {
 	kind := t.Kind()
 	if kind == abi.Array || kind == abi.Struct {
 		// for composite objects we have to read every address
 		// because a write might happen to any subobject.
 		racereadrangepc(addr, t.Size_, callerpc, pc)
+	} else if t.Size_ == 2 || t.Size_ == 4 || t.Size_ == 8 {
+		// Keep ordinary scalar history anchored at its start address while exposing
+		// its physical width to the mixed ordinary/atomic sidecar.
+		racereadnpc(addr, t.Size_, pc)
 	} else {
 		// for non-composite objects we can read just the start
 		// address, as any write must write the first byte.
@@ -286,13 +624,17 @@ func race_ReadObjectPC(t *abi.Type, addr unsafe.Pointer, callerpc, pc uintptr) {
 
 // raceWriteObjectPC records a write of an object by the current goroutine.
 // For composite objects (array, struct), it writes the entire object.
-// For non-composite objects, it writes just the first byte.
+// Atomic-sized scalar objects use their exact width.
 func raceWriteObjectPC(t *_type, addr unsafe.Pointer, callerpc, pc uintptr) {
 	kind := t.Kind()
 	if kind == abi.Array || kind == abi.Struct {
 		// for composite objects we have to write every address
 		// because a write might happen to any subobject.
 		racewriterangepc(addr, t.Size_, callerpc, pc)
+	} else if t.Size_ == 2 || t.Size_ == 4 || t.Size_ == 8 {
+		// Keep ordinary scalar history anchored at its start address while exposing
+		// its physical width to the mixed ordinary/atomic sidecar.
+		racewritenpc(uintptr(addr), t.Size_, pc)
 	} else {
 		// for non-composite objects we can write just the start
 		// address, as any write must write the first byte.
@@ -319,17 +661,12 @@ func racereadpc(addr unsafe.Pointer, callpc, pc uintptr) {
 		// re-enters the detector, causing cascading false positives.
 		return
 	}
-	if gp.raceignore != 0 {
+	if gp.raceguard != 0 {
 		return
 	}
 	racectx := gp.racectx
-	gp.raceignore++
+	gp.raceguard++
 	if racectx > 1 {
-		// T22: Same-epoch fast path.
-		if raceInlineSameEpochRead(uintptr(addr), racectx) {
-			gp.raceignore--
-			return
-		}
 		systemstack(func() {
 			kolkovOnReadCtx(uintptr(addr), pc, racectx)
 		})
@@ -343,7 +680,7 @@ func racereadpc(addr unsafe.Pointer, callpc, pc uintptr) {
 			kolkovCacheShadowPtr()
 		}
 	}
-	gp.raceignore--
+	gp.raceguard--
 }
 
 // racewritepc records a write of the memory location addr with explicit PC values.
@@ -360,17 +697,13 @@ func racewritepc(addr unsafe.Pointer, callpc, pc uintptr) {
 		// re-enters the detector, causing cascading false positives.
 		return
 	}
-	if gp.raceignore != 0 {
+	if gp.raceguard != 0 {
 		return
 	}
 	racectx := gp.racectx
-	gp.raceignore++
+	raceInvalidateReadCache(racectx, uintptr(addr))
+	gp.raceguard++
 	if racectx > 1 {
-		// T22: Same-epoch fast path.
-		if raceInlineSameEpochWrite(uintptr(addr), racectx) {
-			gp.raceignore--
-			return
-		}
 		systemstack(func() {
 			kolkovOnWriteCtx(uintptr(addr), pc, racectx)
 		})
@@ -384,7 +717,7 @@ func racewritepc(addr unsafe.Pointer, callpc, pc uintptr) {
 			kolkovCacheShadowPtr()
 		}
 	}
-	gp.raceignore--
+	gp.raceguard--
 }
 
 //go:linkname race_ReadPC internal/race.ReadPC
@@ -418,22 +751,28 @@ func raceinit() (gctx, pctx uintptr) {
 	return
 }
 
-// racefini finalizes the race detector and prints any detected races.
+// racefini finalizes the race detector. Race reports are printed when detected.
 //
 //go:nosplit
 func racefini() {
 	// racefini() can only be called once to avoid races.
 	lock(&raceFiniLock)
 
-	// TODO: Print race report and cleanup
+	// runtime.main and os_beforeExit require racefini not to return. Match the
+	// standard race detector's configured exit status when any race was reported.
 	raceKolkovFini()
+	if kolkovRaceErrors() != 0 {
+		exit(raceKolkovExitCode)
+	}
+	exit(0)
 }
 
 // raceproccreate creates a new processor context.
 //
 //go:nosplit
 func raceproccreate() uintptr {
-	// TODO: Create a new processor context for the pure-Go detector
+	// FastTrack state belongs to logical goroutine contexts. The pure-Go
+	// backend has no per-P detector state to allocate.
 	return 0
 }
 
@@ -441,25 +780,26 @@ func raceproccreate() uintptr {
 //
 //go:nosplit
 func raceprocdestroy(ctx uintptr) {
-	// TODO: Destroy the processor context
+	// raceproccreate returns no backend-owned resource.
 }
 
 // racemapshadow maps shadow memory for the given memory range.
 //
 //go:nosplit
 func racemapshadow(addr unsafe.Pointer, size uintptr) {
-	// TODO: Map shadow memory for the address range
-	// This is called when the heap grows or new data segments are mapped
+	// The pure-Go shadow allocates address-indexed pages lazily. Unlike TSAN's
+	// fixed shadow mapping, heap growth needs no eager map operation.
 }
 
 // racemalloc notifies the race detector of a memory allocation.
 // Clears shadow memory for the allocated range to prevent false positives
 // from stale access history when the allocator reuses addresses.
 //
-// Uses raceignore to skip clearing during detector execution.
-// This avoids massive overhead from clearing shadow for every detector-internal
-// allocation (VarState, VectorClock, etc.). The trade-off: GC sweep during
-// detector execution may leave stale entries (rare edge case).
+// Uses raceguard to skip clearing detector-private allocations. Detector work
+// runs on g0 while the instrumented user stack is suspended, so a suppressed
+// allocation must never become user-visible memory. Every user heap allocation
+// and every new or reused goroutine stack still reaches this hook unguarded and
+// clears any history from the preceding address lifetime.
 //
 //go:nosplit
 func racemalloc(p unsafe.Pointer, sz uintptr) {
@@ -467,21 +807,22 @@ func racemalloc(p unsafe.Pointer, sz uintptr) {
 	if gp.m != nil && gp.m.curg != nil {
 		gp = gp.m.curg
 	}
-	if gp.raceignore != 0 {
+	if gp.raceguard != 0 {
 		return
 	}
-	gp.raceignore++
+	raceClearReadCache(gp.racectx)
+	gp.raceguard++
 	systemstack(func() {
 		kolkovApiClearShadow(uintptr(p), sz)
 	})
-	gp.raceignore--
+	gp.raceguard--
 }
 
 // racefree notifies the race detector of a memory free.
 // Clears shadow memory for the freed range to prevent false positives
 // when the allocator reuses the same addresses for new objects.
 //
-// Uses raceignore to skip clearing during detector execution.
+// Uses raceguard only for detector-private lifetimes; see racemalloc.
 //
 //go:nosplit
 func racefree(p unsafe.Pointer, sz uintptr) {
@@ -489,14 +830,15 @@ func racefree(p unsafe.Pointer, sz uintptr) {
 	if gp.m != nil && gp.m.curg != nil {
 		gp = gp.m.curg
 	}
-	if gp.raceignore != 0 {
+	if gp.raceguard != 0 {
 		return
 	}
-	gp.raceignore++
+	raceClearReadCache(gp.racectx)
+	gp.raceguard++
 	systemstack(func() {
 		kolkovApiClearShadow(uintptr(p), sz)
 	})
-	gp.raceignore--
+	gp.raceguard--
 }
 
 // racegostart notifies the race detector that a new goroutine is starting.
@@ -506,13 +848,29 @@ func racefree(p unsafe.Pointer, sz uintptr) {
 // We use gp.m.curg to get the parent (spawning) goroutine and pass its
 // goid explicitly to the API, since the API cannot extract goid on g0.
 //
-// The return value is stored in newg.racectx by proc.go.
-// For Kolkov detector, racectx is not used (API tracks contexts by goid).
-// We return a non-zero value so proc.go doesn't think initialization failed.
+// The return value is a short-lived spawn token. proc.go keeps it local and
+// passes it back with the child's goid; only the eagerly allocated child
+// RaceContext pointer is published in g.racectx.
 //
 //go:nosplit
 func racegostart(pc uintptr) uintptr {
 	gp := getg()
+	if gp == gp.m.g0 && gp.racectx > 1 {
+		// Runtime callbacks such as timers execute on g0 with an explicit
+		// temporary context. Spawn from that context so the child inherits
+		// synchronization acquired on behalf of the callback.
+		if gp.raceguard != 0 {
+			return 0
+		}
+		var spawnID uintptr
+		gp.raceguard++
+		systemstack(func() {
+			spawnID = kolkovApiOnGoStartFromContext(pc, gp.racectx)
+		})
+		gp.raceguard--
+		return spawnID
+	}
+
 	// Get the parent goroutine (the one that called 'go func()').
 	// On systemstack, gp is g0; gp.m.curg is the user goroutine.
 	var spawng *g
@@ -522,18 +880,21 @@ func racegostart(pc uintptr) uintptr {
 		spawng = gp
 	}
 
-	if spawng.raceignore != 0 {
+	// RaceDisable suppresses the fork edge, but racegosetchildid still creates
+	// an independent child context from the zero token below.
+	if spawng.raceguard != 0 || spawng.raceignore != 0 {
 		return 0
 	}
-	spawng.raceignore++
+	var spawnID uintptr
+	spawng.raceguard++
 	systemstack(func() {
-		kolkovApiOnGoStart(pc, int64(spawng.goid))
+		spawnID = kolkovApiOnGoStart(pc, int64(spawng.goid))
 	})
-	spawng.raceignore--
+	spawng.raceguard--
 
-	// Return non-zero so proc.go stores it in newg.racectx.
-	// The Kolkov API tracks contexts by goid, not racectx.
-	return 1
+	// This is a short-lived spawn token. newproc1 keeps it local and passes it
+	// unchanged to racegosetchildid, which returns the eagerly-created context.
+	return spawnID
 }
 
 // racegosetchildid associates the most recently created spawn context with
@@ -546,20 +907,20 @@ func racegostart(pc uintptr) uintptr {
 // (as uintptr for fast path access).
 //
 //go:nosplit
-func racegosetchildid(childGoid uint64) uintptr {
+func racegosetchildid(childGoid uint64, spawnID uintptr) uintptr {
 	gp := getg()
 	if gp.m != nil && gp.m.curg != nil {
 		gp = gp.m.curg
 	}
-	if gp.raceignore != 0 {
+	if gp.raceguard != 0 {
 		return 0
 	}
 	var ctx uintptr
-	gp.raceignore++
+	gp.raceguard++
 	systemstack(func() {
-		ctx = kolkovApiGoSetChildIDWithCtx(int64(childGoid))
+		ctx = kolkovApiGoSetChildIDWithCtx(int64(childGoid), spawnID)
 	})
-	gp.raceignore--
+	gp.raceguard--
 	return ctx
 }
 
@@ -574,14 +935,14 @@ func racegoend() {
 	if gp.m.curg != nil {
 		gp = gp.m.curg
 	}
-	if gp.raceignore != 0 {
+	if gp.raceguard != 0 {
 		return
 	}
-	gp.raceignore++
+	gp.raceguard++
 	systemstack(func() {
 		kolkovApiOnGoEnd(int64(gp.goid))
 	})
-	gp.raceignore--
+	gp.raceguard--
 	// Clear cached context to prevent dangling pointer after cleanup
 	gp.racectx = 0
 }
@@ -590,15 +951,43 @@ func racegoend() {
 //
 //go:nosplit
 func racectxstart(pc, spawnctx uintptr) uintptr {
-	// TODO: Create a new context with explicit spawn context
-	return 0
+	gp := getg()
+	if gp.m != nil && gp.m.curg != nil {
+		gp = gp.m.curg
+	}
+	if gp.raceguard != 0 {
+		return 0
+	}
+	if gp.raceignore != 0 {
+		// Keep the temporary context lifecycle intact while suppressing the
+		// user-disabled fork inheritance and parent clock advance.
+		spawnctx = 0
+	}
+	var ctx uintptr
+	gp.raceguard++
+	systemstack(func() {
+		ctx = kolkovApiContextStart(pc, spawnctx)
+	})
+	gp.raceguard--
+	return ctx
 }
 
 // racectxend ends a race context.
 //
 //go:nosplit
 func racectxend(racectx uintptr) {
-	// TODO: End the race context
+	gp := getg()
+	if gp.m != nil && gp.m.curg != nil {
+		gp = gp.m.curg
+	}
+	if gp.raceguard != 0 {
+		return
+	}
+	gp.raceguard++
+	systemstack(func() {
+		kolkovApiContextEnd(racectx)
+	})
+	gp.raceguard--
 }
 
 // racewriterangepc records a write to the memory range [addr, addr+sz) with explicit PC.
@@ -647,11 +1036,11 @@ func raceacquire(addr unsafe.Pointer) {
 	if gp != gp.m.curg {
 		return
 	}
-	if gp.raceignore != 0 {
+	if gp.raceguard != 0 || gp.raceignore != 0 {
 		return
 	}
 	racectx := gp.racectx
-	gp.raceignore++
+	gp.raceguard++
 	if racectx > 1 {
 		systemstack(func() {
 			kolkovOnAcquireCtx(uintptr(addr), racectx)
@@ -666,7 +1055,7 @@ func raceacquire(addr unsafe.Pointer) {
 			kolkovCacheShadowPtr()
 		}
 	}
-	gp.raceignore--
+	gp.raceguard--
 }
 
 // raceacquireg records an acquire operation on the given address for a specific goroutine.
@@ -675,16 +1064,16 @@ func raceacquire(addr unsafe.Pointer) {
 //
 //go:nosplit
 func raceacquireg(gp *g, addr unsafe.Pointer) {
-	if gp.raceignore != 0 {
-		return
-	}
 	// Protect the current goroutine from re-entrant race detector calls
 	// during the API call (which may trigger instrumented memory accesses).
 	curg := getg()
 	if curg.m != nil && curg.m.curg != nil {
 		curg = curg.m.curg
 	}
-	curg.raceignore++
+	if curg.raceguard != 0 || curg.raceignore != 0 || gp.raceignore != 0 {
+		return
+	}
+	curg.raceguard++
 	racectx := gp.racectx
 	if racectx > 1 {
 		// Fast path: target goroutine has cached context
@@ -697,7 +1086,7 @@ func raceacquireg(gp *g, addr unsafe.Pointer) {
 			kolkovApiOnAcquireForGoroutine(uintptr(addr), int64(gp.goid))
 		})
 	}
-	curg.raceignore--
+	curg.raceguard--
 }
 
 // raceacquirectx records an acquire operation with an explicit context.
@@ -713,10 +1102,12 @@ func raceacquirectx(racectx uintptr, addr unsafe.Pointer) {
 	if gp.m != nil && gp.m.curg != nil {
 		gp = gp.m.curg
 	}
-	if gp.raceignore != 0 {
+	// Explicit contexts are used by timer callbacks and must not inherit the
+	// current goroutine's user synchronization suppression.
+	if gp.raceguard != 0 {
 		return
 	}
-	gp.raceignore++
+	gp.raceguard++
 	if racectx > 1 {
 		// racectx is a real cached *RaceContext pointer
 		systemstack(func() {
@@ -728,7 +1119,7 @@ func raceacquirectx(racectx uintptr, addr unsafe.Pointer) {
 			kolkovOnAcquire(uintptr(addr))
 		})
 	}
-	gp.raceignore--
+	gp.raceguard--
 }
 
 // racerelease records a release operation on the given address.
@@ -739,11 +1130,11 @@ func racerelease(addr unsafe.Pointer) {
 	if gp != gp.m.curg {
 		return
 	}
-	if gp.raceignore != 0 {
+	if gp.raceguard != 0 || gp.raceignore != 0 {
 		return
 	}
 	racectx := gp.racectx
-	gp.raceignore++
+	gp.raceguard++
 	if racectx > 1 {
 		systemstack(func() {
 			kolkovOnReleaseCtx(uintptr(addr), racectx)
@@ -753,7 +1144,7 @@ func racerelease(addr unsafe.Pointer) {
 			kolkovOnRelease(uintptr(addr))
 		})
 	}
-	gp.raceignore--
+	gp.raceguard--
 }
 
 // racereleaseg records a release operation on the given address for a specific goroutine.
@@ -762,14 +1153,14 @@ func racerelease(addr unsafe.Pointer) {
 //
 //go:nosplit
 func racereleaseg(gp *g, addr unsafe.Pointer) {
-	if gp.raceignore != 0 {
-		return
-	}
 	curg := getg()
 	if curg.m != nil && curg.m.curg != nil {
 		curg = curg.m.curg
 	}
-	curg.raceignore++
+	if curg.raceguard != 0 || curg.raceignore != 0 || gp.raceignore != 0 {
+		return
+	}
+	curg.raceguard++
 	racectx := gp.racectx
 	if racectx > 1 {
 		systemstack(func() {
@@ -780,7 +1171,7 @@ func racereleaseg(gp *g, addr unsafe.Pointer) {
 			kolkovApiOnReleaseForGoroutine(uintptr(addr), int64(gp.goid))
 		})
 	}
-	curg.raceignore--
+	curg.raceguard--
 }
 
 // racereleaseacquire records a combined release-acquire operation.
@@ -791,31 +1182,33 @@ func racereleaseacquire(addr unsafe.Pointer) {
 }
 
 // racereleaseacquireg records a combined release-acquire operation for a specific goroutine.
-// The target goroutine gp may differ from the current goroutine.
+// The target goroutine gp may differ from the current goroutine. Channel callers serialize
+// this exchange under the channel lock, so acquire must consume the prior release before
+// release publishes the target context for the next slot user.
 //
 //go:nosplit
 func racereleaseacquireg(gp *g, addr unsafe.Pointer) {
-	if gp.raceignore != 0 {
-		return
-	}
 	curg := getg()
 	if curg.m != nil && curg.m.curg != nil {
 		curg = curg.m.curg
 	}
-	curg.raceignore++
+	if curg.raceguard != 0 || curg.raceignore != 0 || gp.raceignore != 0 {
+		return
+	}
+	curg.raceguard++
 	racectx := gp.racectx
 	if racectx > 1 {
 		systemstack(func() {
-			kolkovOnReleaseCtx(uintptr(addr), racectx)
 			kolkovOnAcquireCtx(uintptr(addr), racectx)
+			kolkovOnReleaseCtx(uintptr(addr), racectx)
 		})
 	} else {
 		systemstack(func() {
-			kolkovApiOnReleaseForGoroutine(uintptr(addr), int64(gp.goid))
 			kolkovApiOnAcquireForGoroutine(uintptr(addr), int64(gp.goid))
+			kolkovApiOnReleaseForGoroutine(uintptr(addr), int64(gp.goid))
 		})
 	}
-	curg.raceignore--
+	curg.raceguard--
 }
 
 // racereleasemerge records a release-merge operation on the given address.
@@ -826,11 +1219,11 @@ func racereleasemerge(addr unsafe.Pointer) {
 	if gp != gp.m.curg {
 		return
 	}
-	if gp.raceignore != 0 {
+	if gp.raceguard != 0 || gp.raceignore != 0 {
 		return
 	}
 	racectx := gp.racectx
-	gp.raceignore++
+	gp.raceguard++
 	if racectx > 1 {
 		systemstack(func() {
 			kolkovOnReleaseMergeCtx(uintptr(addr), racectx)
@@ -840,7 +1233,7 @@ func racereleasemerge(addr unsafe.Pointer) {
 			kolkovOnReleaseMerge(uintptr(addr))
 		})
 	}
-	gp.raceignore--
+	gp.raceguard--
 }
 
 // racereleasemergeg records a release-merge operation for a specific goroutine.
@@ -849,14 +1242,14 @@ func racereleasemerge(addr unsafe.Pointer) {
 //
 //go:nosplit
 func racereleasemergeg(gp *g, addr unsafe.Pointer) {
-	if gp.raceignore != 0 {
-		return
-	}
 	curg := getg()
 	if curg.m != nil && curg.m.curg != nil {
 		curg = curg.m.curg
 	}
-	curg.raceignore++
+	if curg.raceguard != 0 || curg.raceignore != 0 || gp.raceignore != 0 {
+		return
+	}
+	curg.raceguard++
 	racectx := gp.racectx
 	if racectx > 1 {
 		systemstack(func() {
@@ -867,14 +1260,26 @@ func racereleasemergeg(gp *g, addr unsafe.Pointer) {
 			kolkovApiOnReleaseMergeForGoroutine(uintptr(addr), int64(gp.goid))
 		})
 	}
-	curg.raceignore--
+	curg.raceguard--
 }
 
 // racefingo notifies the race detector that the current goroutine is a finalizer.
 //
 //go:nosplit
 func racefingo() {
-	// TODO: Special handling for finalizer goroutines
+	gp := getg()
+	if gp.m != nil && gp.m.curg != nil {
+		gp = gp.m.curg
+	}
+	if gp.raceguard != 0 || gp.racectx <= 1 {
+		return
+	}
+	racectx := gp.racectx
+	gp.raceguard++
+	systemstack(func() {
+		kolkovApiFinalizerGo(racectx)
+	})
+	gp.raceguard--
 }
 
 // Hot-path race detection functions.
@@ -882,52 +1287,168 @@ func racefingo() {
 // Previously implemented in assembly (race_kolkov_*.s), now pure Go
 // per @randall77 guidance: no assembly needed, use sys.GetCallerPC().
 
+// racereadSlowPath contains the closure and systemstack state needed only when
+// the inline FastTrack checks miss. Keeping it out of raceread prevents those
+// cold-path captures from inflating every compiler-generated read hook's frame.
+//
+//go:noinline
+//go:nosplit
+func racereadSlowPath(addr, pc uintptr) {
+	gp := getg()
+	racectx := gp.racectx
+	if racectx > 1 {
+		// Cache misses can still avoid systemstack when this goroutine wrote the
+		// location in the current FastTrack epoch.
+		shadowPtr := uintptr(kolkovShadowPtr.Load())
+		if vsPtr := raceShadowState(shadowPtr, addr); vsPtr != nil {
+			currentEpoch := *(*uint64)(unsafe.Pointer(racectx + ctxEpochOffset))
+			if atomic.Load64((*uint64)(unsafe.Add(vsPtr, vsWOffset))) == currentEpoch &&
+				raceShadowState(shadowPtr, addr) == vsPtr {
+				return
+			}
+		}
+	}
+
+	gp.raceguard++
+	if racectx > 1 {
+		systemstack(func() {
+			kolkovOnReadCtx(addr, pc, racectx)
+		})
+		gp.raceguard--
+		return
+	}
+
+	var newCtx uintptr
+	systemstack(func() {
+		newCtx = kolkovOnReadSlow(addr, pc)
+	})
+	if newCtx > 1 {
+		gp.racectx = newCtx
+		kolkovCacheShadowPtr()
+	}
+	gp.raceguard--
+}
+
 // raceread records a read of the given address.
 // Called from compiler-generated instrumentation.
-// sys.GetCallerPC() must be the first call to capture instrumented code's PC.
+// sys.GetCallerPC() is evaluated only on a cache miss and before the first
+// actual call, so it still captures the instrumented caller's PC.
 //
 //go:nosplit
 func raceread(addr uintptr) {
-	pc := sys.GetCallerPC()
 	gp := getg()
-	if gp == nil || gp.m == nil || gp.m.curg == nil {
-		return
-	}
-	if gp != gp.m.curg {
+	if gp == nil || gp.m == nil || gp.m.curg == nil || gp != gp.m.curg {
 		// Running on g0/gsignal — suppress to prevent detector re-entrancy.
 		// Without this, detector allocations on g0 trigger racewrite which
 		// re-enters the detector, causing cascading false positives.
 		return
 	}
-	if gp.raceignore != 0 {
+	if gp.raceguard != 0 {
 		return
 	}
 	racectx := gp.racectx
-	gp.raceignore++
+	// FastTrack redundant-read elimination: a completed exact read represents
+	// subsequent reads until this context writes that address or advances at
+	// synchronization. The parallel GC-visible state pointer prevents an
+	// allocator clear from reviving an address-only entry: the mapping load is
+	// the hook's linearization point, and a replacement pointer forces the sound
+	// slow path. Cache collisions only reduce optimization coverage.
 	if racectx > 1 {
-		// T22: Same-epoch fast path — skip systemstack for ~65% of reads.
-		// If the shadow cell's write epoch matches this goroutine's epoch,
-		// no other goroutine has written since our last check. No race possible.
-		if raceInlineSameEpochRead(addr, racectx) {
-			gp.raceignore--
-			return
-		}
-		// Full path: context cached in g.racectx
-		systemstack(func() {
-			kolkovOnReadCtx(addr, pc, racectx)
-		})
-	} else {
-		// Slow path: first access — create context, cache it
-		var newCtx uintptr
-		systemstack(func() {
-			newCtx = kolkovOnReadSlow(addr, pc)
-		})
-		if newCtx > 1 {
-			gp.racectx = newCtx
-			kolkovCacheShadowPtr()
+		index := (addr >> 3) & ctxReadCacheMask
+		slot := (*uintptr)(unsafe.Pointer(racectx + ctxReadCacheOffset + index*goarch.PtrSize))
+		cachedWidth := *(*uint8)(unsafe.Pointer(racectx + ctxReadWidthOffset + index))
+		if *slot == addr && cachedWidth == 1 && raceReadCacheEpochValid(racectx) {
+			// Static storage in the first module cannot be freed or reused. The
+			// exact address match is therefore sufficient after the initial read
+			// published this entry; heap, stack, and plugin storage still require
+			// exact shadow-state identity revalidation below.
+			if raceFirstModuleStaticData(addr) {
+				return
+			}
+			cachedState := *(*unsafe.Pointer)(unsafe.Pointer(racectx + ctxReadStateOffset + index*goarch.PtrSize))
+			if cachedState != nil && raceShadowState(uintptr(kolkovShadowPtr.Load()), addr) == cachedState {
+				return
+			}
 		}
 	}
-	gp.raceignore--
+	pc := sys.GetCallerPC()
+	racereadSlowPath(addr, pc)
+}
+
+// racereadn records an exact 2-, 4-, or 8-byte compiler scalar read. A
+// completed read of first-module storage may use an address-only cache entry;
+// reclaimable storage also revalidates the authoritative start-address state.
+//
+//go:nosplit
+func racereadn(addr, size uintptr) {
+	gp := getg()
+	if gp.raceguard != 0 {
+		return
+	}
+	racectx := gp.racectx
+	if racectx > 1 {
+		index := (addr >> 3) & ctxReadCacheMask
+		cachedAddr := *(*uintptr)(unsafe.Pointer(racectx + ctxReadCacheOffset + index*goarch.PtrSize))
+		cachedWidth := *(*uint8)(unsafe.Pointer(racectx + ctxReadWidthOffset + index))
+		if cachedAddr == addr && cachedWidth == uint8(size) && raceReadCacheEpochValid(racectx) {
+			if raceFirstModuleStaticDataRange(addr, size) {
+				return
+			}
+			cachedState := *(*unsafe.Pointer)(unsafe.Pointer(racectx + ctxReadStateOffset + index*goarch.PtrSize))
+			if cachedState != nil && raceShadowState(uintptr(kolkovShadowPtr.Load()), addr) == cachedState {
+				return
+			}
+		}
+	}
+	// Compiler hooks normally run on the current user goroutine. Keep the
+	// system-stack rejection on cache misses, but off the steady-state hit path;
+	// runtime work on g0/gsignal remains suppressed exactly as in raceread.
+	if gp.m == nil || gp.m.curg == nil || gp != gp.m.curg {
+		return
+	}
+	pc := sys.GetCallerPC()
+	racereadnSlowPath(addr, size, pc)
+}
+
+// racereadnpc is the explicit-PC counterpart used by ObjectPC scalar hooks.
+// Those calls are not compiler hot-path hooks, so they deliberately enter the
+// authoritative sized detector path rather than duplicating the inline cache.
+//
+//go:nosplit
+func racereadnpc(addr unsafe.Pointer, size, pc uintptr) {
+	if !raceAccessRangeValid(uintptr(addr), size) {
+		return
+	}
+	gp := getg()
+	if gp == nil || gp.m == nil || gp.m.curg == nil || gp != gp.m.curg || gp.raceguard != 0 {
+		return
+	}
+	racereadnSlowPath(uintptr(addr), size, pc)
+}
+
+//go:noinline
+//go:nosplit
+func racereadnSlowPath(addr, size, pc uintptr) {
+	gp := getg()
+	racectx := gp.racectx
+	gp.raceguard++
+	if racectx > 1 {
+		systemstack(func() {
+			kolkovOnReadSizedCtx(addr, size, pc, racectx)
+		})
+		gp.raceguard--
+		return
+	}
+
+	var newCtx uintptr
+	systemstack(func() {
+		newCtx = kolkovOnReadSizedSlow(addr, size, pc)
+	})
+	if newCtx > 1 {
+		gp.racectx = newCtx
+		kolkovCacheShadowPtr()
+	}
+	gp.raceguard--
 }
 
 // racewrite records a write to the given address.
@@ -946,19 +1467,13 @@ func racewrite(addr uintptr) {
 		// re-enters the detector, causing cascading false positives.
 		return
 	}
-	if gp.raceignore != 0 {
+	if gp.raceguard != 0 {
 		return
 	}
 	racectx := gp.racectx
-	gp.raceignore++
+	raceInvalidateReadCache(racectx, addr)
+	gp.raceguard++
 	if racectx > 1 {
-		// T22: Same-epoch fast path — skip systemstack for ~65% of writes.
-		// If the shadow cell's write epoch matches AND no concurrent readers,
-		// no race is possible. Skip the expensive systemstack call.
-		if raceInlineSameEpochWrite(addr, racectx) {
-			gp.raceignore--
-			return
-		}
 		systemstack(func() {
 			kolkovOnWriteCtx(addr, pc, racectx)
 		})
@@ -972,7 +1487,51 @@ func racewrite(addr uintptr) {
 			kolkovCacheShadowPtr()
 		}
 	}
-	gp.raceignore--
+	gp.raceguard--
+}
+
+// racewriten records an exact compiler scalar write. Ordinary FastTrack
+// history remains anchored at the start address while the atomic sidecar sees
+// the physical width.
+//
+//go:nosplit
+func racewriten(addr, size uintptr) {
+	if !raceAccessRangeValid(addr, size) {
+		return
+	}
+	pc := sys.GetCallerPC()
+	racewritenpc(addr, size, pc)
+}
+
+// racewritenpc is the shared explicit-PC sized scalar write path.
+//
+//go:nosplit
+func racewritenpc(addr, size, pc uintptr) {
+	if !raceAccessRangeValid(addr, size) {
+		return
+	}
+	gp := getg()
+	if gp == nil || gp.m == nil || gp.m.curg == nil || gp != gp.m.curg || gp.raceguard != 0 {
+		return
+	}
+	racectx := gp.racectx
+	raceInvalidateReadCacheRange(racectx, addr, size)
+	gp.raceguard++
+	if racectx > 1 {
+		systemstack(func() {
+			kolkovOnWriteSizedCtx(addr, size, pc, racectx)
+		})
+	} else {
+		var newCtx uintptr
+		systemstack(func() {
+			newCtx = kolkovOnWriteSizedSlow(addr, size, pc)
+		})
+		if newCtx > 1 {
+			gp.racectx = newCtx
+			kolkovCacheShadowPtr()
+		}
+	}
+	gp.raceguard--
 }
 
 // racereadrange records a read of the given address range.
@@ -980,6 +1539,9 @@ func racewrite(addr uintptr) {
 //
 //go:nosplit
 func racereadrange(addr, size uintptr) {
+	if !raceAccessRangeValid(addr, size) {
+		return
+	}
 	pc := sys.GetCallerPC()
 	gp := getg()
 	if gp == nil || gp.m == nil || gp.m.curg == nil {
@@ -991,32 +1553,26 @@ func racereadrange(addr, size uintptr) {
 		// re-enters the detector, causing cascading false positives.
 		return
 	}
-	if gp.raceignore != 0 {
+	if gp.raceguard != 0 {
 		return
 	}
 	racectx := gp.racectx
-	gp.raceignore++
+	gp.raceguard++
 	if racectx > 1 {
-		// T22: Same-epoch fast path.
-		if raceInlineSameEpochRead(addr, racectx) {
-			gp.raceignore--
-			return
-		}
 		systemstack(func() {
-			// Track base address for now. Full range tracking is T11.
-			kolkovOnReadCtx(addr, pc, racectx)
+			kolkovOnReadRangeCtx(addr, size, pc, racectx)
 		})
 	} else {
 		var newCtx uintptr
 		systemstack(func() {
-			newCtx = kolkovOnReadSlow(addr, pc)
+			newCtx = kolkovOnReadRangeSlow(addr, size, pc)
 		})
 		if newCtx > 1 {
 			gp.racectx = newCtx
 			kolkovCacheShadowPtr()
 		}
 	}
-	gp.raceignore--
+	gp.raceguard--
 }
 
 // racewriterange records a write to the given address range.
@@ -1024,6 +1580,9 @@ func racereadrange(addr, size uintptr) {
 //
 //go:nosplit
 func racewriterange(addr, size uintptr) {
+	if !raceAccessRangeValid(addr, size) {
+		return
+	}
 	pc := sys.GetCallerPC()
 	gp := getg()
 	if gp == nil || gp.m == nil || gp.m.curg == nil {
@@ -1035,38 +1594,36 @@ func racewriterange(addr, size uintptr) {
 		// re-enters the detector, causing cascading false positives.
 		return
 	}
-	if gp.raceignore != 0 {
+	if gp.raceguard != 0 {
 		return
 	}
 	racectx := gp.racectx
-	gp.raceignore++
+	raceInvalidateReadCacheRange(racectx, addr, size)
+	gp.raceguard++
 	if racectx > 1 {
-		// T22: Same-epoch fast path.
-		if raceInlineSameEpochWrite(addr, racectx) {
-			gp.raceignore--
-			return
-		}
 		systemstack(func() {
-			// Track base address for now. Full range tracking is T11.
-			kolkovOnWriteCtx(addr, pc, racectx)
+			kolkovOnWriteRangeCtx(addr, size, pc, racectx)
 		})
 	} else {
 		var newCtx uintptr
 		systemstack(func() {
-			newCtx = kolkovOnWriteSlow(addr, pc)
+			newCtx = kolkovOnWriteRangeSlow(addr, size, pc)
 		})
 		if newCtx > 1 {
 			gp.racectx = newCtx
 			kolkovCacheShadowPtr()
 		}
 	}
-	gp.raceignore--
+	gp.raceguard--
 }
 
 // racereadrangepc1 is the internal implementation for range reads with explicit PC.
 //
 //go:nosplit
 func racereadrangepc1(addr, size, pc uintptr) {
+	if !raceAccessRangeValid(addr, size) {
+		return
+	}
 	gp := getg()
 	if gp == nil || gp.m == nil || gp.m.curg == nil {
 		return
@@ -1077,37 +1634,35 @@ func racereadrangepc1(addr, size, pc uintptr) {
 		// re-enters the detector, causing cascading false positives.
 		return
 	}
-	if gp.raceignore != 0 {
+	if gp.raceguard != 0 {
 		return
 	}
 	racectx := gp.racectx
-	gp.raceignore++
+	gp.raceguard++
 	if racectx > 1 {
-		// T22: Same-epoch fast path.
-		if raceInlineSameEpochRead(addr, racectx) {
-			gp.raceignore--
-			return
-		}
 		systemstack(func() {
-			kolkovOnReadCtx(addr, pc, racectx)
+			kolkovOnReadRangeCtx(addr, size, pc, racectx)
 		})
 	} else {
 		var newCtx uintptr
 		systemstack(func() {
-			newCtx = kolkovOnReadSlow(addr, pc)
+			newCtx = kolkovOnReadRangeSlow(addr, size, pc)
 		})
 		if newCtx > 1 {
 			gp.racectx = newCtx
 			kolkovCacheShadowPtr()
 		}
 	}
-	gp.raceignore--
+	gp.raceguard--
 }
 
 // racewriterangepc1 is the internal implementation for range writes with explicit PC.
 //
 //go:nosplit
 func racewriterangepc1(addr, size, pc uintptr) {
+	if !raceAccessRangeValid(addr, size) {
+		return
+	}
 	gp := getg()
 	if gp == nil || gp.m == nil || gp.m.curg == nil {
 		return
@@ -1118,31 +1673,27 @@ func racewriterangepc1(addr, size, pc uintptr) {
 		// re-enters the detector, causing cascading false positives.
 		return
 	}
-	if gp.raceignore != 0 {
+	if gp.raceguard != 0 {
 		return
 	}
 	racectx := gp.racectx
-	gp.raceignore++
+	raceInvalidateReadCacheRange(racectx, addr, size)
+	gp.raceguard++
 	if racectx > 1 {
-		// T22: Same-epoch fast path.
-		if raceInlineSameEpochWrite(addr, racectx) {
-			gp.raceignore--
-			return
-		}
 		systemstack(func() {
-			kolkovOnWriteCtx(addr, pc, racectx)
+			kolkovOnWriteRangeCtx(addr, size, pc, racectx)
 		})
 	} else {
 		var newCtx uintptr
 		systemstack(func() {
-			newCtx = kolkovOnWriteSlow(addr, pc)
+			newCtx = kolkovOnWriteRangeSlow(addr, size, pc)
 		})
 		if newCtx > 1 {
 			gp.racectx = newCtx
 			kolkovCacheShadowPtr()
 		}
 	}
-	gp.raceignore--
+	gp.raceguard--
 }
 
 // racefuncenter records function entry.
@@ -1165,9 +1716,6 @@ func racefuncenterfp(fp uintptr) {
 func racefuncexit() {
 }
 
-// Pure-Go detector implementation stubs
-// These will be implemented as the detector is ported to runtime.
-
 // raceKolkovInit initializes the pure-Go race detector.
 //
 //go:nosplit
@@ -1181,106 +1729,3 @@ func raceKolkovInit() {
 func raceKolkovFini() {
 	kolkovDetectorFini()
 }
-
-// The declarations below generate ABI wrappers for functions
-// implemented in assembly in this package but declared in another
-// package.
-
-//go:linkname abigen_sync_atomic_LoadInt32 sync/atomic.LoadInt32
-func abigen_sync_atomic_LoadInt32(addr *int32) (val int32)
-
-//go:linkname abigen_sync_atomic_LoadInt64 sync/atomic.LoadInt64
-func abigen_sync_atomic_LoadInt64(addr *int64) (val int64)
-
-//go:linkname abigen_sync_atomic_LoadUint32 sync/atomic.LoadUint32
-func abigen_sync_atomic_LoadUint32(addr *uint32) (val uint32)
-
-//go:linkname abigen_sync_atomic_LoadUint64 sync/atomic.LoadUint64
-func abigen_sync_atomic_LoadUint64(addr *uint64) (val uint64)
-
-//go:linkname abigen_sync_atomic_LoadUintptr sync/atomic.LoadUintptr
-func abigen_sync_atomic_LoadUintptr(addr *uintptr) (val uintptr)
-
-//go:linkname abigen_sync_atomic_LoadPointer sync/atomic.LoadPointer
-func abigen_sync_atomic_LoadPointer(addr *unsafe.Pointer) (val unsafe.Pointer)
-
-//go:linkname abigen_sync_atomic_StoreInt32 sync/atomic.StoreInt32
-func abigen_sync_atomic_StoreInt32(addr *int32, val int32)
-
-//go:linkname abigen_sync_atomic_StoreInt64 sync/atomic.StoreInt64
-func abigen_sync_atomic_StoreInt64(addr *int64, val int64)
-
-//go:linkname abigen_sync_atomic_StoreUint32 sync/atomic.StoreUint32
-func abigen_sync_atomic_StoreUint32(addr *uint32, val uint32)
-
-//go:linkname abigen_sync_atomic_StoreUint64 sync/atomic.StoreUint64
-func abigen_sync_atomic_StoreUint64(addr *uint64, val uint64)
-
-//go:linkname abigen_sync_atomic_SwapInt32 sync/atomic.SwapInt32
-func abigen_sync_atomic_SwapInt32(addr *int32, new int32) (old int32)
-
-//go:linkname abigen_sync_atomic_SwapInt64 sync/atomic.SwapInt64
-func abigen_sync_atomic_SwapInt64(addr *int64, new int64) (old int64)
-
-//go:linkname abigen_sync_atomic_SwapUint32 sync/atomic.SwapUint32
-func abigen_sync_atomic_SwapUint32(addr *uint32, new uint32) (old uint32)
-
-//go:linkname abigen_sync_atomic_SwapUint64 sync/atomic.SwapUint64
-func abigen_sync_atomic_SwapUint64(addr *uint64, new uint64) (old uint64)
-
-//go:linkname abigen_sync_atomic_AddInt32 sync/atomic.AddInt32
-func abigen_sync_atomic_AddInt32(addr *int32, delta int32) (new int32)
-
-//go:linkname abigen_sync_atomic_AddUint32 sync/atomic.AddUint32
-func abigen_sync_atomic_AddUint32(addr *uint32, delta uint32) (new uint32)
-
-//go:linkname abigen_sync_atomic_AddInt64 sync/atomic.AddInt64
-func abigen_sync_atomic_AddInt64(addr *int64, delta int64) (new int64)
-
-//go:linkname abigen_sync_atomic_AddUint64 sync/atomic.AddUint64
-func abigen_sync_atomic_AddUint64(addr *uint64, delta uint64) (new uint64)
-
-//go:linkname abigen_sync_atomic_AddUintptr sync/atomic.AddUintptr
-func abigen_sync_atomic_AddUintptr(addr *uintptr, delta uintptr) (new uintptr)
-
-//go:linkname abigen_sync_atomic_AndInt32 sync/atomic.AndInt32
-func abigen_sync_atomic_AndInt32(addr *int32, mask int32) (old int32)
-
-//go:linkname abigen_sync_atomic_AndUint32 sync/atomic.AndUint32
-func abigen_sync_atomic_AndUint32(addr *uint32, mask uint32) (old uint32)
-
-//go:linkname abigen_sync_atomic_AndInt64 sync/atomic.AndInt64
-func abigen_sync_atomic_AndInt64(addr *int64, mask int64) (old int64)
-
-//go:linkname abigen_sync_atomic_AndUint64 sync/atomic.AndUint64
-func abigen_sync_atomic_AndUint64(addr *uint64, mask uint64) (old uint64)
-
-//go:linkname abigen_sync_atomic_AndUintptr sync/atomic.AndUintptr
-func abigen_sync_atomic_AndUintptr(addr *uintptr, mask uintptr) (old uintptr)
-
-//go:linkname abigen_sync_atomic_OrInt32 sync/atomic.OrInt32
-func abigen_sync_atomic_OrInt32(addr *int32, mask int32) (old int32)
-
-//go:linkname abigen_sync_atomic_OrUint32 sync/atomic.OrUint32
-func abigen_sync_atomic_OrUint32(addr *uint32, mask uint32) (old uint32)
-
-//go:linkname abigen_sync_atomic_OrInt64 sync/atomic.OrInt64
-func abigen_sync_atomic_OrInt64(addr *int64, mask int64) (old int64)
-
-//go:linkname abigen_sync_atomic_OrUint64 sync/atomic.OrUint64
-func abigen_sync_atomic_OrUint64(addr *uint64, mask uint64) (old uint64)
-
-//go:linkname abigen_sync_atomic_OrUintptr sync/atomic.OrUintptr
-func abigen_sync_atomic_OrUintptr(addr *uintptr, mask uintptr) (old uintptr)
-
-//go:linkname abigen_sync_atomic_CompareAndSwapInt32 sync/atomic.CompareAndSwapInt32
-func abigen_sync_atomic_CompareAndSwapInt32(addr *int32, old, new int32) (swapped bool)
-
-//go:linkname abigen_sync_atomic_CompareAndSwapInt64 sync/atomic.CompareAndSwapInt64
-func abigen_sync_atomic_CompareAndSwapInt64(addr *int64, old, new int64) (swapped bool)
-
-//go:linkname abigen_sync_atomic_CompareAndSwapUint32 sync/atomic.CompareAndSwapUint32
-func abigen_sync_atomic_CompareAndSwapUint32(addr *uint32, old, new uint32) (swapped bool)
-
-//go:linkname abigen_sync_atomic_CompareAndSwapUint64 sync/atomic.CompareAndSwapUint64
-func abigen_sync_atomic_CompareAndSwapUint64(addr *uint64, old, new uint64) (swapped bool)

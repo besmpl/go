@@ -283,8 +283,9 @@ func TestStats(t *testing.T) {
 		t.Errorf("Expected 2 unique stacks, got %d", uniqueStacks)
 	}
 
-	// Memory should be reasonable (96 bytes per stack: 64 bytes StackTrace + 32 bytes overhead).
-	expectedMemory := int64(2 * 96)
+	// Stats accounts for 88 bytes per stack: 64 bytes for StackTrace and
+	// 24 bytes of cell/allocation overhead.
+	expectedMemory := int64(2 * 88)
 	if totalMemory != expectedMemory {
 		t.Errorf("Expected %d bytes, got %d", expectedMemory, totalMemory)
 	}

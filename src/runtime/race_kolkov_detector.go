@@ -34,8 +34,7 @@ func kolkovDetectorInit() {
 // kolkovDetectorFini finalizes the Kolkov race detector.
 func kolkovDetectorFini() {
 	kolkovEnabled.Store(0)
-	// Call API Fini to print full report
-	kolkovApiFini()
+	kolkovApiRuntimeFini()
 }
 
 // kolkovRaceErrors returns the number of races detected.
@@ -51,6 +50,18 @@ func kolkovRaceErrors() int {
 //go:nosplit
 func kolkovIncrementErrors() {
 	kolkovErrors.Add(1)
+}
+
+// kolkovReportDone is called only after a complete race report has been
+// printed. Keep halt_on_error out of the memory-access hot path and terminate
+// here so the configured report is never truncated.
+//
+//go:linkname kolkovReportDone
+//go:nosplit
+func kolkovReportDone() {
+	if raceKolkovHaltOnError {
+		exit(raceKolkovExitCode)
+	}
 }
 
 // kolkovOnRead handles a memory read access.
@@ -138,24 +149,34 @@ func kolkovApiOnReleaseForGoroutine(addr uintptr, goid int64)
 //go:linkname kolkovApiOnReleaseMergeForGoroutine runtime/race/kolkov/api.raceReleaseMergeForGoroutine
 func kolkovApiOnReleaseMergeForGoroutine(addr uintptr, goid int64)
 
-//go:linkname kolkovApiGoSetChildID runtime/race/kolkov/api.raceGoSetChildID
-func kolkovApiGoSetChildID(childGoid int64)
-
 // T13: Eager context creation during goroutine spawn.
+//
 //go:linkname kolkovApiGoSetChildIDWithCtx runtime/race/kolkov/api.raceGoSetChildIDWithCtx
-func kolkovApiGoSetChildIDWithCtx(childGoid int64) uintptr
+func kolkovApiGoSetChildIDWithCtx(childGoid int64, spawnID uintptr) uintptr
 
 //go:linkname kolkovApiClearShadow runtime/race/kolkov/api.raceClearShadow
 func kolkovApiClearShadow(addr, size uintptr)
 
-//go:linkname kolkovApiFini runtime/race/kolkov/api.Fini
-func kolkovApiFini()
+//go:linkname kolkovApiRuntimeFini runtime/race/kolkov/api.runtimeFini
+func kolkovApiRuntimeFini()
 
 //go:linkname kolkovApiOnGoStart runtime/race/kolkov/api.raceGoStartFromRuntime
-func kolkovApiOnGoStart(pc uintptr, parentGoid int64)
+func kolkovApiOnGoStart(pc uintptr, parentGoid int64) uintptr
+
+//go:linkname kolkovApiOnGoStartFromContext runtime/race/kolkov/api.raceGoStartFromContext
+func kolkovApiOnGoStartFromContext(pc, parentCtx uintptr) uintptr
 
 //go:linkname kolkovApiOnGoEnd runtime/race/kolkov/api.raceGoEndFromRuntime
 func kolkovApiOnGoEnd(goid int64)
+
+//go:linkname kolkovApiFinalizerGo runtime/race/kolkov/api.raceFinalizerGoFromRuntime
+func kolkovApiFinalizerGo(racectx uintptr)
+
+//go:linkname kolkovApiContextStart runtime/race/kolkov/api.raceContextStartFromRuntime
+func kolkovApiContextStart(pc, spawnctx uintptr) uintptr
+
+//go:linkname kolkovApiContextEnd runtime/race/kolkov/api.raceContextEndFromRuntime
+func kolkovApiContextEnd(racectx uintptr)
 
 // === g.racectx Fast/Slow Path Bridges (T9 optimization) ===
 // Fast path: context pointer passed directly as uintptr (skips contextsMap lookup).
@@ -163,8 +184,20 @@ func kolkovApiOnGoEnd(goid int64)
 //go:linkname kolkovOnReadCtx runtime/race/kolkov/api.racereadCtx
 func kolkovOnReadCtx(addr, pc, racectx uintptr)
 
+//go:linkname kolkovOnReadSizedCtx runtime/race/kolkov/api.racereadSizedCtx
+func kolkovOnReadSizedCtx(addr, size, pc, racectx uintptr)
+
 //go:linkname kolkovOnWriteCtx runtime/race/kolkov/api.racewriteCtx
 func kolkovOnWriteCtx(addr, pc, racectx uintptr)
+
+//go:linkname kolkovOnWriteSizedCtx runtime/race/kolkov/api.racewriteSizedCtx
+func kolkovOnWriteSizedCtx(addr, size, pc, racectx uintptr)
+
+//go:linkname kolkovOnReadRangeCtx runtime/race/kolkov/api.racereadRangeCtx
+func kolkovOnReadRangeCtx(addr, size, pc, racectx uintptr)
+
+//go:linkname kolkovOnWriteRangeCtx runtime/race/kolkov/api.racewriteRangeCtx
+func kolkovOnWriteRangeCtx(addr, size, pc, racectx uintptr)
 
 //go:linkname kolkovOnAcquireCtx runtime/race/kolkov/api.raceacquireCtx
 func kolkovOnAcquireCtx(addr, racectx uintptr)
@@ -187,8 +220,20 @@ func kolkovGetShadowPtr() uintptr
 //go:linkname kolkovOnReadSlow runtime/race/kolkov/api.racereadSlow
 func kolkovOnReadSlow(addr, pc uintptr) uintptr
 
+//go:linkname kolkovOnReadSizedSlow runtime/race/kolkov/api.racereadSizedSlow
+func kolkovOnReadSizedSlow(addr, size, pc uintptr) uintptr
+
 //go:linkname kolkovOnWriteSlow runtime/race/kolkov/api.racewriteSlow
 func kolkovOnWriteSlow(addr, pc uintptr) uintptr
+
+//go:linkname kolkovOnWriteSizedSlow runtime/race/kolkov/api.racewriteSizedSlow
+func kolkovOnWriteSizedSlow(addr, size, pc uintptr) uintptr
+
+//go:linkname kolkovOnReadRangeSlow runtime/race/kolkov/api.racereadRangeSlow
+func kolkovOnReadRangeSlow(addr, size, pc uintptr) uintptr
+
+//go:linkname kolkovOnWriteRangeSlow runtime/race/kolkov/api.racewriteRangeSlow
+func kolkovOnWriteRangeSlow(addr, size, pc uintptr) uintptr
 
 //go:linkname kolkovOnAcquireSlow runtime/race/kolkov/api.raceacquireSlow
 func kolkovOnAcquireSlow(addr uintptr) uintptr

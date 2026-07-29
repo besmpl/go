@@ -29,9 +29,9 @@ func TestVectorClockPooling_Integration(t *testing.T) {
 					vc := NewFromPool()
 
 					// Simulate some usage.
-					vc.Set(uint16(gid%256), uint32(i))
-					vc.Increment(uint16(gid % 256))
-					_ = vc.Get(uint16(gid % 256))
+					vc.Set(uint32(gid%256), uint32(i))
+					vc.Increment(uint32(gid % 256))
+					_ = vc.Get(uint32(gid % 256))
 
 					// Release back to pool.
 					vc.Release()

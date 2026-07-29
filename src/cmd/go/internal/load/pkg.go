@@ -418,6 +418,15 @@ func (p *Package) copyBuild(opts PackageOpts, pp *build.Package) {
 	p.SwigFiles = pp.SwigFiles
 	p.SwigCXXFiles = pp.SwigCXXFiles
 	p.SysoFiles = pp.SysoFiles
+	if cfg.BuildRace && !cfg.BuildContext.CgoEnabled && p.Standard && p.ImportPath == "runtime/race" {
+		// The runtime/race .syso files contain the C/C++ ThreadSanitizer
+		// runtime. A race build without cgo uses the pure-Go detector instead.
+		// System object files cannot express a cgo build constraint, so classify
+		// them as ignored here rather than passing them to the linker.
+		p.IgnoredOtherFiles = str.StringList(p.IgnoredOtherFiles, p.SysoFiles)
+		sort.Strings(p.IgnoredOtherFiles)
+		p.SysoFiles = nil
+	}
 	if cfg.BuildMSan {
 		// There's no way for .syso files to be built both with and without
 		// support for memory sanitizer. Assume they are built without,

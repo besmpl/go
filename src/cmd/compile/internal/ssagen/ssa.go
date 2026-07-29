@@ -164,8 +164,10 @@ func InitConfig() {
 	ir.Syms.Racefuncenter = typecheck.LookupRuntimeFunc("racefuncenter")
 	ir.Syms.Racefuncexit = typecheck.LookupRuntimeFunc("racefuncexit")
 	ir.Syms.Raceread = typecheck.LookupRuntimeFunc("raceread")
+	ir.Syms.Racereadn = typecheck.LookupRuntimeFunc("racereadn")
 	ir.Syms.Racereadrange = typecheck.LookupRuntimeFunc("racereadrange")
 	ir.Syms.Racewrite = typecheck.LookupRuntimeFunc("racewrite")
+	ir.Syms.Racewriten = typecheck.LookupRuntimeFunc("racewriten")
 	ir.Syms.Racewriterange = typecheck.LookupRuntimeFunc("racewriterange")
 	ir.Syms.TypeAssert = typecheck.LookupRuntimeFunc("typeAssert")
 	ir.Syms.WBZero = typecheck.LookupRuntimeFunc("wbZero")
@@ -1545,13 +1547,25 @@ func (s *state) instrument2(t *types.Type, addr, addr2 *ssa.Value, kind instrume
 		}
 		needWidth = true
 	} else if base.Flag.Race {
-		// for non-composite objects we can write just the start
-		// address, as any write must write the first byte.
+		// Pure-Go race tracking needs the exact width of scalar accesses to
+		// distinguish overlapping ordinary and atomic operations. Keep the
+		// legacy hook for one-byte and non-atomic-sized values; the TSAN bridge
+		// intentionally preserves its existing start-address semantics.
 		switch kind {
 		case instrumentRead:
-			fn = ir.Syms.Raceread
+			if w == 2 || w == 4 || w == 8 {
+				fn = ir.Syms.Racereadn
+				needWidth = true
+			} else {
+				fn = ir.Syms.Raceread
+			}
 		case instrumentWrite:
-			fn = ir.Syms.Racewrite
+			if w == 2 || w == 4 || w == 8 {
+				fn = ir.Syms.Racewriten
+				needWidth = true
+			} else {
+				fn = ir.Syms.Racewrite
+			}
 		default:
 			panic("unreachable")
 		}

@@ -57,6 +57,44 @@ func TestGetOrCreate_DifferentAddresses(t *testing.T) {
 	}
 }
 
+// collidingAddresses returns addresses that map to the same top-level hash
+// bucket. Keeping this in the package (rather than hard-coding addresses) makes
+// the collision regression independent of the particular hash mixer.
+func collidingAddresses(t *testing.T, count int) []uintptr {
+	t.Helper()
+
+	target := fastHashSync(1)
+	addrs := make([]uintptr, 0, count)
+	for page := uintptr(0); len(addrs) < count; page++ {
+		addr := page<<syncPageShift | 1
+		if fastHashSync(addr) == target {
+			addrs = append(addrs, addr)
+		}
+		if page == ^uintptr(0)>>syncPageShift {
+			t.Fatalf("could not find %d colliding addresses", count)
+		}
+	}
+	return addrs
+}
+
+// TestGetOrCreate_CollisionOverflowPreservesEntries guards the happens-before
+// state of every live synchronization object when a hash bucket is crowded.
+func TestGetOrCreate_CollisionOverflowPreservesEntries(t *testing.T) {
+	shadow := NewSyncShadow()
+	addrs := collidingAddresses(t, 17)
+	states := make([]*SyncVar, len(addrs))
+
+	for i, addr := range addrs {
+		states[i] = shadow.GetOrCreate(addr)
+	}
+
+	for i, addr := range addrs {
+		if got := shadow.GetOrCreate(addr); got != states[i] {
+			t.Fatalf("GetOrCreate(%#x) lost its SyncVar after collision overflow", addr)
+		}
+	}
+}
+
 // TestGetOrCreate_Concurrent verifies thread-safe concurrent access.
 func TestGetOrCreate_Concurrent(t *testing.T) {
 	shadow := NewSyncShadow()
@@ -64,12 +102,15 @@ func TestGetOrCreate_Concurrent(t *testing.T) {
 	numGoroutines := 100
 
 	// Launch concurrent goroutines all accessing the same address.
+	start := make(chan struct{})
 	results := make(chan *SyncVar, numGoroutines)
 	for i := 0; i < numGoroutines; i++ {
 		go func() {
+			<-start
 			results <- shadow.GetOrCreate(addr)
 		}()
 	}
+	close(start)
 
 	// Collect all results.
 	firstSV := <-results
@@ -78,6 +119,90 @@ func TestGetOrCreate_Concurrent(t *testing.T) {
 		if sv != firstSV {
 			t.Errorf("Concurrent GetOrCreate returned different SyncVar instances")
 		}
+	}
+}
+
+// TestClearRange_AddressReuse verifies that allocator lifecycle clearing removes
+// only entries in the half-open range and gives a reused address fresh HB state.
+func TestClearRange_AddressReuse(t *testing.T) {
+	shadow := NewSyncShadow()
+	first := uintptr(0x1ff0)
+	size := uintptr(0x30) // Crosses an application-page boundary.
+	last := first + size - 1
+	outside := []uintptr{first - 1, last + 1}
+	inside := []uintptr{first, first + 7, 0x2000, last}
+
+	outsideStates := make([]*SyncVar, len(outside))
+	for i, addr := range outside {
+		outsideStates[i] = shadow.GetOrCreate(addr)
+	}
+	insideStates := make([]*SyncVar, len(inside))
+	clock := vectorclock.New()
+	clock.Set(3, 9)
+	for i, addr := range inside {
+		insideStates[i] = shadow.GetOrCreate(addr)
+		insideStates[i].SetReleaseClock(clock)
+	}
+
+	shadow.ClearRange(first, size)
+
+	for i, addr := range outside {
+		if !shadow.HasEntry(addr) {
+			t.Errorf("ClearRange removed out-of-range entry %#x", addr)
+		}
+		if got := shadow.GetOrCreate(addr); got != outsideStates[i] {
+			t.Errorf("ClearRange changed out-of-range SyncVar %#x", addr)
+		}
+	}
+	for i, addr := range inside {
+		if shadow.HasEntry(addr) {
+			t.Errorf("ClearRange retained stale entry %#x", addr)
+		}
+		fresh := shadow.GetOrCreate(addr)
+		if fresh == insideStates[i] {
+			t.Errorf("reused address %#x retained its old SyncVar", addr)
+		}
+		if fresh.GetReleaseClock() != nil {
+			t.Errorf("reused address %#x inherited a release clock", addr)
+		}
+	}
+}
+
+// TestClearRange_LargeSparseRange exercises the path which scans live page
+// records instead of walking every page in a large, mostly empty span.
+func TestClearRange_LargeSparseRange(t *testing.T) {
+	shadow := NewSyncShadow()
+	first := uintptr(0x1000)
+	lastPage := first + uintptr(syncDirectClearPages+1)*(1<<syncPageShift)
+	inside := []uintptr{first, first + 0x12345, lastPage + 17}
+	outside := lastPage + 1<<syncPageShift
+
+	for _, addr := range inside {
+		shadow.GetOrCreate(addr)
+	}
+	outsideState := shadow.GetOrCreate(outside)
+	shadow.ClearRange(first, lastPage+18-first)
+
+	for _, addr := range inside {
+		if shadow.HasEntry(addr) {
+			t.Errorf("large ClearRange retained entry %#x", addr)
+		}
+	}
+	if got := shadow.GetOrCreate(outside); got != outsideState {
+		t.Fatal("large ClearRange removed the first out-of-range entry")
+	}
+}
+
+// TestGetOrCreate_CachedHasNoAllocations protects the common sync lookup path.
+func TestGetOrCreate_CachedHasNoAllocations(t *testing.T) {
+	shadow := NewSyncShadow()
+	addr := uintptr(0x1234)
+	shadow.GetOrCreate(addr)
+
+	if allocs := testing.AllocsPerRun(1000, func() {
+		shadow.GetOrCreate(addr)
+	}); allocs != 0 {
+		t.Fatalf("cached GetOrCreate allocated %.2f times per lookup", allocs)
 	}
 }
 
@@ -127,6 +252,9 @@ func TestSyncVar_GetReleaseClock_Nil(t *testing.T) {
 	if clock != nil {
 		t.Error("Expected nil releaseClock on uninitialized SyncVar")
 	}
+	if joined := sv.JoinReleaseClock(vectorclock.New()); joined {
+		t.Fatal("JoinReleaseClock reported a release for an empty SyncVar")
+	}
 }
 
 // TestSyncVar_SetReleaseClock_First verifies first SetReleaseClock allocates.
@@ -140,6 +268,13 @@ func TestSyncVar_SetReleaseClock_First(t *testing.T) {
 
 	// First SetReleaseClock should allocate and copy.
 	sv.SetReleaseClock(vc)
+	joined := vectorclock.New()
+	if !sv.JoinReleaseClock(joined) {
+		t.Fatal("JoinReleaseClock did not report the published release")
+	}
+	if joined.Get(0) != 10 || joined.Get(1) != 20 {
+		t.Fatalf("joined release = {%d,%d}, want {10,20}", joined.Get(0), joined.Get(1))
+	}
 
 	// Verify releaseClock is now non-nil.
 	releaseClock := sv.GetReleaseClock()
@@ -289,406 +424,60 @@ func TestSyncVar_MergeReleaseClock_RWMutexScenario(t *testing.T) {
 	}
 }
 
-// === Channel State Tests (Phase 4 Task 4.2) ===
+func TestSyncVarConcurrentReleaseAcquireSeesCompleteClock(t *testing.T) {
+	var sv SyncVar
+	first := vectorclock.New()
+	first.Set(1, 11)
+	first.Set(1<<20, 101)
+	second := vectorclock.New()
+	second.Set(1, 22)
+	second.Set(1<<20, 202)
+	sv.SetReleaseClock(first)
 
-// TestSyncVar_GetOrCreateChannel verifies lazy channel state creation.
-func TestSyncVar_GetOrCreateChannel(t *testing.T) {
-	sv := &SyncVar{}
-
-	// Initially, GetChannel should return nil (not a channel).
-	if sv.GetChannel() != nil {
-		t.Error("Expected nil channel state before GetOrCreateChannel")
-	}
-
-	// GetOrCreateChannel should create and return ChannelState.
-	chState1 := sv.GetOrCreateChannel()
-	if chState1 == nil {
-		t.Fatal("GetOrCreateChannel returned nil")
-	}
-
-	// Second call should return same instance.
-	chState2 := sv.GetOrCreateChannel()
-	if chState1 != chState2 {
-		t.Error("GetOrCreateChannel returned different instances")
-	}
-
-	// GetChannel should now return the created instance.
-	if sv.GetChannel() != chState1 {
-		t.Error("GetChannel returned different instance than GetOrCreateChannel")
-	}
+	const iterations = 2000
+	start := make(chan struct{})
+	done := make(chan struct{}, 2)
+	go func() {
+		<-start
+		for i := 0; i < iterations; i++ {
+			if i&1 == 0 {
+				sv.SetReleaseClock(first)
+			} else {
+				sv.SetReleaseClock(second)
+			}
+		}
+		done <- struct{}{}
+	}()
+	go func() {
+		<-start
+		for i := 0; i < iterations; i++ {
+			acquired := vectorclock.New()
+			sv.JoinReleaseClock(acquired)
+			dense, sparse := acquired.Get(1), acquired.Get(1<<20)
+			if !((dense == 11 && sparse == 101) || (dense == 22 && sparse == 202)) {
+				t.Errorf("acquire observed partial release clock: dense=%d sparse=%d", dense, sparse)
+				break
+			}
+		}
+		done <- struct{}{}
+	}()
+	close(start)
+	<-done
+	<-done
 }
 
-// TestSyncVar_ChannelSendClock verifies send clock management.
-func TestSyncVar_ChannelSendClock(t *testing.T) {
-	sv := &SyncVar{}
+// BenchmarkGetOrCreate_Cached measures the common synchronization lookup after
+// the address owner and its page index have been published.
+func BenchmarkGetOrCreate_Cached(b *testing.B) {
+	shadow := NewSyncShadow()
+	addr := uintptr(0x1234)
+	want := shadow.GetOrCreate(addr)
 
-	// Initially, GetChannelSendClock should return nil.
-	if sv.GetChannelSendClock() != nil {
-		t.Error("Expected nil send clock before SetChannelSendClock")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := shadow.GetOrCreate(addr); got != want {
+			b.Fatal("cached lookup changed SyncVar identity")
+		}
 	}
-
-	// Create a clock to set.
-	vc1 := vectorclock.New()
-	vc1.Set(0, 10)
-	vc1.Set(1, 20)
-
-	// SetChannelSendClock should capture the clock.
-	sv.SetChannelSendClock(vc1)
-
-	// Verify send clock was set.
-	sendClock := sv.GetChannelSendClock()
-	if sendClock == nil {
-		t.Fatal("SetChannelSendClock did not set send clock")
-	}
-	if sendClock.Get(0) != 10 {
-		t.Errorf("Expected sendClock[0]=10, got %d", sendClock.Get(0))
-	}
-	if sendClock.Get(1) != 20 {
-		t.Errorf("Expected sendClock[1]=20, got %d", sendClock.Get(1))
-	}
-
-	// Verify it's a copy, not a reference.
-	if sendClock == vc1 {
-		t.Error("SetChannelSendClock did not copy, it's a reference")
-	}
-
-	// Update send clock with different values.
-	vc2 := vectorclock.New()
-	vc2.Set(0, 30)
-	vc2.Set(2, 40)
-	sv.SetChannelSendClock(vc2)
-
-	// Verify clock was updated in place.
-	sendClockUpdated := sv.GetChannelSendClock()
-	if sendClockUpdated != sendClock {
-		t.Error("SetChannelSendClock allocated new clock instead of updating in place")
-	}
-	if sendClockUpdated.Get(0) != 30 {
-		t.Errorf("Expected sendClock[0]=30, got %d", sendClockUpdated.Get(0))
-	}
-	if sendClockUpdated.Get(2) != 40 {
-		t.Errorf("Expected sendClock[2]=40, got %d", sendClockUpdated.Get(2))
-	}
-}
-
-// TestSyncVar_ChannelRecvClock verifies receive clock management.
-func TestSyncVar_ChannelRecvClock(t *testing.T) {
-	sv := &SyncVar{}
-
-	// Initially, GetChannelRecvClock should return nil.
-	if sv.GetChannelRecvClock() != nil {
-		t.Error("Expected nil recv clock before SetChannelRecvClock")
-	}
-
-	// Create a clock to set.
-	vc := vectorclock.New()
-	vc.Set(1, 15)
-
-	// SetChannelRecvClock should capture the clock.
-	sv.SetChannelRecvClock(vc)
-
-	// Verify recv clock was set.
-	recvClock := sv.GetChannelRecvClock()
-	if recvClock == nil {
-		t.Fatal("SetChannelRecvClock did not set recv clock")
-	}
-	if recvClock.Get(1) != 15 {
-		t.Errorf("Expected recvClock[1]=15, got %d", recvClock.Get(1))
-	}
-}
-
-// TestSyncVar_ChannelCloseClock verifies close clock management.
-func TestSyncVar_ChannelCloseClock(t *testing.T) {
-	sv := &SyncVar{}
-
-	// Initially, GetChannelCloseClock should return nil.
-	if sv.GetChannelCloseClock() != nil {
-		t.Error("Expected nil close clock before SetChannelCloseClock")
-	}
-
-	// Initially, IsChannelClosed should return false.
-	if sv.IsChannelClosed() {
-		t.Error("Expected IsChannelClosed=false before close")
-	}
-
-	// Create a clock to set.
-	vc := vectorclock.New()
-	vc.Set(0, 100)
-
-	// SetChannelCloseClock should capture the clock and mark as closed.
-	sv.SetChannelCloseClock(vc)
-
-	// Verify close clock was set.
-	closeClock := sv.GetChannelCloseClock()
-	if closeClock == nil {
-		t.Fatal("SetChannelCloseClock did not set close clock")
-	}
-	if closeClock.Get(0) != 100 {
-		t.Errorf("Expected closeClock[0]=100, got %d", closeClock.Get(0))
-	}
-
-	// Verify isClosed flag was set.
-	if !sv.IsChannelClosed() {
-		t.Error("Expected IsChannelClosed=true after close")
-	}
-
-	// Verify it's a copy, not a reference.
-	if closeClock == vc {
-		t.Error("SetChannelCloseClock did not copy, it's a reference")
-	}
-
-	// Calling SetChannelCloseClock again should be idempotent (no panic).
-	vc2 := vectorclock.New()
-	vc2.Set(0, 200)
-	sv.SetChannelCloseClock(vc2)
-
-	// Close clock should NOT change (first close wins).
-	closeClock2 := sv.GetChannelCloseClock()
-	if closeClock2.Get(0) != 100 {
-		t.Errorf("Expected closeClock to remain 100, got %d", closeClock2.Get(0))
-	}
-}
-
-// TestSyncVar_ChannelState_Independent verifies channel and mutex state are independent.
-func TestSyncVar_ChannelState_Independent(t *testing.T) {
-	sv := &SyncVar{}
-
-	// Set mutex release clock.
-	mutexClock := vectorclock.New()
-	mutexClock.Set(0, 10)
-	sv.SetReleaseClock(mutexClock)
-
-	// Set channel send clock.
-	chanClock := vectorclock.New()
-	chanClock.Set(1, 20)
-	sv.SetChannelSendClock(chanClock)
-
-	// Verify both are independent.
-	if sv.GetReleaseClock().Get(0) != 10 {
-		t.Error("Mutex release clock was affected by channel state")
-	}
-	if sv.GetChannelSendClock().Get(1) != 20 {
-		t.Error("Channel send clock was affected by mutex state")
-	}
-
-	// Verify they don't share memory.
-	if sv.GetReleaseClock() == sv.GetChannelSendClock() {
-		t.Error("Mutex and channel clocks share memory")
-	}
-}
-
-// === WaitGroup Tests (Phase 4 Task 4.3) ===
-
-// TestSyncVar_GetOrCreateWaitGroup verifies lazy WaitGroup state allocation.
-func TestSyncVar_GetOrCreateWaitGroup(t *testing.T) {
-	sv := &SyncVar{}
-
-	// Initially, GetWaitGroup should return nil.
-	if sv.GetWaitGroup() != nil {
-		t.Error("Expected nil WaitGroup before GetOrCreateWaitGroup")
-	}
-
-	// GetOrCreateWaitGroup should allocate WaitGroupState.
-	wgState := sv.GetOrCreateWaitGroup()
-	if wgState == nil {
-		t.Fatal("GetOrCreateWaitGroup returned nil")
-	}
-
-	// Second call should return same instance (no new allocation).
-	wgState2 := sv.GetOrCreateWaitGroup()
-	if wgState != wgState2 {
-		t.Error("GetOrCreateWaitGroup created new instance instead of reusing")
-	}
-
-	// GetWaitGroup should now return the allocated state.
-	if sv.GetWaitGroup() != wgState {
-		t.Error("GetWaitGroup returned different instance")
-	}
-}
-
-// TestSyncVar_WaitGroupAdd verifies counter management.
-func TestSyncVar_WaitGroupAdd(t *testing.T) {
-	sv := &SyncVar{}
-
-	// Initially, counter should be 0.
-	if sv.GetWaitGroupCounter() != 0 {
-		t.Errorf("Expected counter=0, got %d", sv.GetWaitGroupCounter())
-	}
-
-	// WaitGroupAdd(1) should increment counter to 1.
-	sv.WaitGroupAdd(1)
-	if sv.GetWaitGroupCounter() != 1 {
-		t.Errorf("Expected counter=1 after Add(1), got %d", sv.GetWaitGroupCounter())
-	}
-
-	// WaitGroupAdd(3) should increment counter to 4.
-	sv.WaitGroupAdd(3)
-	if sv.GetWaitGroupCounter() != 4 {
-		t.Errorf("Expected counter=4 after Add(3), got %d", sv.GetWaitGroupCounter())
-	}
-
-	// WaitGroupAdd(-1) should decrement counter to 3 (simulating Done).
-	sv.WaitGroupAdd(-1)
-	if sv.GetWaitGroupCounter() != 3 {
-		t.Errorf("Expected counter=3 after Add(-1), got %d", sv.GetWaitGroupCounter())
-	}
-
-	// Multiple Done() calls should bring counter back to 0.
-	sv.WaitGroupAdd(-1)
-	sv.WaitGroupAdd(-1)
-	sv.WaitGroupAdd(-1)
-	if sv.GetWaitGroupCounter() != 0 {
-		t.Errorf("Expected counter=0 after all Done(), got %d", sv.GetWaitGroupCounter())
-	}
-}
-
-// TestSyncVar_MergeWaitGroupDoneClock verifies doneClock accumulation.
-func TestSyncVar_MergeWaitGroupDoneClock(t *testing.T) {
-	sv := &SyncVar{}
-
-	// Initially, GetWaitGroupDoneClock should return nil.
-	if sv.GetWaitGroupDoneClock() != nil {
-		t.Error("Expected nil doneClock before any Done()")
-	}
-
-	// First Done() call - should copy the clock.
-	clock1 := vectorclock.New()
-	clock1.Set(0, 10)
-	clock1.Set(1, 5)
-	sv.MergeWaitGroupDoneClock(clock1)
-
-	doneClock := sv.GetWaitGroupDoneClock()
-	if doneClock == nil {
-		t.Fatal("MergeWaitGroupDoneClock did not set doneClock")
-	}
-	if doneClock.Get(0) != 10 || doneClock.Get(1) != 5 {
-		t.Errorf("Expected doneClock[0]=10, [1]=5, got [0]=%d, [1]=%d",
-			doneClock.Get(0), doneClock.Get(1))
-	}
-
-	// Verify it's a copy, not a reference.
-	if doneClock == clock1 {
-		t.Error("MergeWaitGroupDoneClock did not copy, it's a reference")
-	}
-
-	// Second Done() call - should merge (element-wise max).
-	clock2 := vectorclock.New()
-	clock2.Set(0, 8)  // Lower than 10 - should NOT update
-	clock2.Set(1, 12) // Higher than 5 - should update
-	clock2.Set(2, 7)  // New thread - should set
-	sv.MergeWaitGroupDoneClock(clock2)
-
-	doneClock = sv.GetWaitGroupDoneClock()
-	if doneClock.Get(0) != 10 {
-		t.Errorf("Expected doneClock[0]=10 (max(10,8)), got %d", doneClock.Get(0))
-	}
-	if doneClock.Get(1) != 12 {
-		t.Errorf("Expected doneClock[1]=12 (max(5,12)), got %d", doneClock.Get(1))
-	}
-	if doneClock.Get(2) != 7 {
-		t.Errorf("Expected doneClock[2]=7 (new thread), got %d", doneClock.Get(2))
-	}
-
-	// Third Done() call - verify continued accumulation.
-	clock3 := vectorclock.New()
-	clock3.Set(0, 20)
-	clock3.Set(3, 15)
-	sv.MergeWaitGroupDoneClock(clock3)
-
-	doneClock = sv.GetWaitGroupDoneClock()
-	if doneClock.Get(0) != 20 {
-		t.Errorf("Expected doneClock[0]=20 (max(10,20)), got %d", doneClock.Get(0))
-	}
-	if doneClock.Get(1) != 12 {
-		t.Errorf("Expected doneClock[1]=12 (unchanged), got %d", doneClock.Get(1))
-	}
-	if doneClock.Get(2) != 7 {
-		t.Errorf("Expected doneClock[2]=7 (unchanged), got %d", doneClock.Get(2))
-	}
-	if doneClock.Get(3) != 15 {
-		t.Errorf("Expected doneClock[3]=15 (new thread), got %d", doneClock.Get(3))
-	}
-}
-
-// TestSyncVar_WaitGroupState_Independent verifies WaitGroup state is independent.
-func TestSyncVar_WaitGroupState_Independent(t *testing.T) {
-	sv := &SyncVar{}
-
-	// Set mutex release clock.
-	mutexClock := vectorclock.New()
-	mutexClock.Set(0, 10)
-	sv.SetReleaseClock(mutexClock)
-
-	// Set channel send clock.
-	chanClock := vectorclock.New()
-	chanClock.Set(1, 20)
-	sv.SetChannelSendClock(chanClock)
-
-	// Set WaitGroup done clock.
-	wgClock := vectorclock.New()
-	wgClock.Set(2, 30)
-	sv.MergeWaitGroupDoneClock(wgClock)
-
-	// Verify all three are independent.
-	if sv.GetReleaseClock().Get(0) != 10 {
-		t.Error("Mutex release clock was affected by other state")
-	}
-	if sv.GetChannelSendClock().Get(1) != 20 {
-		t.Error("Channel send clock was affected by other state")
-	}
-	if sv.GetWaitGroupDoneClock().Get(2) != 30 {
-		t.Error("WaitGroup done clock was affected by other state")
-	}
-
-	// Verify they don't share memory.
-	if sv.GetReleaseClock() == sv.GetChannelSendClock() ||
-		sv.GetReleaseClock() == sv.GetWaitGroupDoneClock() ||
-		sv.GetChannelSendClock() == sv.GetWaitGroupDoneClock() {
-		t.Error("Different sync primitives share memory")
-	}
-}
-
-// TestSyncVar_WaitGroupCounterAndClock verifies counter and clock are synchronized.
-func TestSyncVar_WaitGroupCounterAndClock(t *testing.T) {
-	sv := &SyncVar{}
-
-	// Simulate typical WaitGroup usage pattern:
-	// Add(2) → Done() → Done()
-
-	// Parent: Add(2)
-	sv.WaitGroupAdd(2)
-	if sv.GetWaitGroupCounter() != 2 {
-		t.Errorf("Expected counter=2 after Add(2), got %d", sv.GetWaitGroupCounter())
-	}
-
-	// Child 1: Done()
-	child1Clock := vectorclock.New()
-	child1Clock.Set(1, 10)
-	sv.MergeWaitGroupDoneClock(child1Clock)
-	sv.WaitGroupAdd(-1) // Done is Add(-1)
-
-	if sv.GetWaitGroupCounter() != 1 {
-		t.Errorf("Expected counter=1 after first Done(), got %d", sv.GetWaitGroupCounter())
-	}
-	doneClock := sv.GetWaitGroupDoneClock()
-	if doneClock.Get(1) != 10 {
-		t.Errorf("Expected doneClock[1]=10, got %d", doneClock.Get(1))
-	}
-
-	// Child 2: Done()
-	child2Clock := vectorclock.New()
-	child2Clock.Set(2, 15)
-	sv.MergeWaitGroupDoneClock(child2Clock)
-	sv.WaitGroupAdd(-1) // Done is Add(-1)
-
-	if sv.GetWaitGroupCounter() != 0 {
-		t.Errorf("Expected counter=0 after second Done(), got %d", sv.GetWaitGroupCounter())
-	}
-	doneClock = sv.GetWaitGroupDoneClock()
-	if doneClock.Get(1) != 10 || doneClock.Get(2) != 15 {
-		t.Errorf("Expected doneClock[1]=10, [2]=15, got [1]=%d, [2]=%d",
-			doneClock.Get(1), doneClock.Get(2))
-	}
-
-	// Counter=0 means Wait() can return, and waiter will merge doneClock.
 }

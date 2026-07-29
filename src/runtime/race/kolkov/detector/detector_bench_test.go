@@ -263,16 +263,56 @@ func BenchmarkReset(b *testing.B) {
 func BenchmarkOnRead_NoRace(b *testing.B) {
 	d := NewDetector()
 	ctx := goroutine.Alloc(1)
-	addr := uintptr(0x1000)
+	const (
+		addr = uintptr(0x1000)
+		pc   = uintptr(0x1001)
+	)
 
-	// Setup: First read to initialize shadow cell.
-	d.OnRead(addr, ctx, 0)
+	// Runtime/compiler hooks always provide the caller PC. A zero PC deliberately
+	// exercises the direct-API stack-capture fallback rather than this hot path.
+	d.OnRead(addr, ctx, pc)
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		d.OnRead(addr, ctx, 0)
+		d.OnRead(addr, ctx, pc)
+	}
+}
+
+// BenchmarkOnReadSized_CompactAlias measures the authoritative detector miss
+// path for a compiler uint64 read. Runtime cache hits bypass this function; this
+// benchmark guards the compact physical-alias publication itself.
+func BenchmarkOnReadSized_CompactAlias(b *testing.B) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(1)
+	const (
+		addr = uintptr(0x1804) // Exercise membership across two shadow words.
+		pc   = uintptr(0x1801)
+	)
+	d.OnReadSized(addr, 8, ctx, pc)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		d.OnReadSized(addr, 8, ctx, pc)
+	}
+}
+
+// BenchmarkOnWriteSized_CompactAlias is the write counterpart.
+func BenchmarkOnWriteSized_CompactAlias(b *testing.B) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(1)
+	const (
+		addr = uintptr(0x2804)
+		pc   = uintptr(0x2801)
+	)
+	d.OnWriteSized(addr, 8, ctx, pc)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		d.OnWriteSized(addr, 8, ctx, pc)
 	}
 }
 
@@ -295,34 +335,27 @@ func BenchmarkOnRead_NoRace_NewAddress(b *testing.B) {
 	}
 }
 
-// BenchmarkOnRead_SameEpoch benchmarks the same-epoch fast path for reads.
-//
-// This is the CRITICAL optimization path that handles 63% of reads
-// according to the FastTrack paper.
-//
-// Target: <20ns per operation (just a comparison and early return).
+// BenchmarkOnRead_SameEpoch benchmarks the supplied-PC detector path for
+// repeated reads in the same epoch. A zero PC selects the separate fallback
+// stack-capture path and would obscure this path's zero-allocation contract.
+// Latency includes shadow lookup, lane isolation, and read-cache publication;
+// it is not just an epoch comparison and early return.
 func BenchmarkOnRead_SameEpoch(b *testing.B) {
 	d := NewDetector()
 	ctx := goroutine.Alloc(1)
-	addr := uintptr(0x2000)
+	const (
+		addr = uintptr(0x2000)
+		pc   = uintptr(0x2001)
+	)
 
 	// Setup: Read once to create shadow cell.
-	d.OnRead(addr, ctx, 0)
-
-	// Get shadow cell and manually set it to current epoch.
-	vs := d.shadowMemory.Get(addr)
-	vs.SetReadEpoch(ctx.GetEpoch())
+	d.OnRead(addr, ctx, pc)
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		// This should hit the same-epoch fast path every time.
-		// Note: We need to manually maintain vs.GetReadEpoch() == currentEpoch
-		// because IncrementClock advances the epoch.
-		currentEpoch := ctx.GetEpoch()
-		vs.SetReadEpoch(currentEpoch)
-		d.OnRead(addr, ctx, 0)
+		d.OnRead(addr, ctx, pc)
 	}
 }
 
@@ -476,4 +509,100 @@ func BenchmarkOnReadOnWrite_Comparison(b *testing.B) {
 			d.OnWrite(addr, ctx, 0)
 		}
 	})
+}
+
+func BenchmarkOnReadRange(b *testing.B) {
+	for _, size := range []uintptr{8, 64, 1024, 64 << 10, 1 << 20} {
+		b.Run(rangeBenchmarkLabel(size), func(b *testing.B) {
+			d := NewDetector()
+			ctx := goroutine.Alloc(1)
+			const addr = uintptr(0x800000)
+			d.OnReadRange(addr, size, ctx, 0x1000)
+
+			b.ReportAllocs()
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				d.OnReadRange(addr, size, ctx, 0x1000)
+			}
+		})
+	}
+}
+
+func BenchmarkOnWriteRange(b *testing.B) {
+	for _, size := range []uintptr{8, 64, 1024, 64 << 10, 1 << 20} {
+		b.Run(rangeBenchmarkLabel(size), func(b *testing.B) {
+			d := NewDetector()
+			ctx := goroutine.Alloc(1)
+			const addr = uintptr(0x900000)
+			d.OnWriteRange(addr, size, ctx, 0x2000)
+
+			b.ReportAllocs()
+			b.SetBytes(int64(size))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				d.OnWriteRange(addr, size, ctx, 0x2000)
+			}
+		})
+	}
+}
+
+func rangeBenchmarkLabel(size uintptr) string {
+	switch size {
+	case 8:
+		return "8"
+	case 64:
+		return "64"
+	case 1024:
+		return "1024"
+	case 64 << 10:
+		return "64KiB"
+	case 1 << 20:
+		return "1MiB"
+	default:
+		return "other"
+	}
+}
+
+func BenchmarkAtomicStore32(b *testing.B) {
+	benchmarkAtomicStore(b, 4)
+}
+
+func BenchmarkAtomicStore64(b *testing.B) {
+	benchmarkAtomicStore(b, 8)
+}
+
+func benchmarkAtomicStore(b *testing.B, size uintptr) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(1)
+	const addr = uintptr(0xa00000)
+	var token AtomicToken
+	d.AtomicBegin(addr, size, ctx, false, &token)
+	d.AtomicEnd(addr, size, ctx, &token, 0x3000, true)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		d.AtomicBegin(addr, size, ctx, false, &token)
+		d.AtomicEnd(addr, size, ctx, &token, 0x3000, true)
+	}
+}
+
+func BenchmarkAtomicLoad64(b *testing.B) {
+	d := NewDetector()
+	writer := goroutine.Alloc(1)
+	reader := goroutine.Alloc(2)
+	const addr = uintptr(0xb00000)
+	var token AtomicToken
+	d.AtomicBegin(addr, 8, writer, false, &token)
+	d.AtomicEnd(addr, 8, writer, &token, 0x4000, true)
+	d.AtomicBegin(addr, 8, reader, true, &token)
+	d.AtomicEnd(addr, 8, reader, &token, 0x4001, false)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		d.AtomicBegin(addr, 8, reader, true, &token)
+		d.AtomicEnd(addr, 8, reader, &token, 0x4001, false)
+	}
 }

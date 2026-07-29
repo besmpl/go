@@ -211,7 +211,10 @@ func TestGoNoRace_ReadMostlyPattern(t *testing.T) {
 			mu.RLock()
 			RaceAcquire(uintptr(unsafe.Pointer(&mu)))
 			RaceRead(addr)
-			RaceRelease(uintptr(unsafe.Pointer(&mu)))
+			// Concurrent read unlocks must merge their clocks. RaceRelease is
+			// the serialized mutex-unlock operation and may overwrite the prior
+			// release clock while another reader is still acquiring it.
+			RaceReleaseMerge(uintptr(unsafe.Pointer(&mu)))
 			mu.RUnlock()
 			ch <- true
 		}()

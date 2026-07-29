@@ -26,15 +26,8 @@ func runtimeCallersFrames(callers []uintptr) *runtimeFrames
 
 type runtimeFrames struct{}
 
-type runtimeFrame struct {
-	PC       uintptr
-	Function string
-	File     string
-	Line     int
-}
-
-//go:linkname runtimeFramesNext runtime.framesNext
-func runtimeFramesNext(f *runtimeFrames) (frame runtimeFrame, more bool)
+//go:linkname runtimeFramesNext runtime.kolkovFramesNext
+func runtimeFramesNext(f *runtimeFrames) (pc uintptr, function, file string, line int, more bool)
 
 const (
 	// MaxFrames is the maximum number of stack frames to capture.
@@ -188,13 +181,13 @@ func (st *StackTrace) FormatStack() string {
 
 	result := ""
 	for {
-		frame, more := runtimeFramesNext(frames)
-		if frame.PC == 0 {
+		pc, function, file, line, more := runtimeFramesNext(frames)
+		if pc == 0 {
 			break
 		}
 
 		// Skip runtime internal frames.
-		if hasPrefix(frame.Function, "runtime.") {
+		if hasPrefix(function, "runtime.") {
 			if !more {
 				break
 			}
@@ -202,10 +195,10 @@ func (st *StackTrace) FormatStack() string {
 		}
 
 		// Format: "  function_name()\n"
-		result += "  " + frame.Function + "()\n"
+		result += "  " + function + "()\n"
 
 		// Format: "      file.go:line\n"
-		result += "      " + frame.File + ":" + itoa(frame.Line) + "\n"
+		result += "      " + file + ":" + itoa(line) + "\n"
 
 		if !more {
 			break

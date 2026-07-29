@@ -60,8 +60,10 @@ type symsStruct struct {
 	Racefuncenter             *obj.LSym
 	Racefuncexit              *obj.LSym
 	Raceread                  *obj.LSym
+	Racereadn                 *obj.LSym
 	Racereadrange             *obj.LSym
 	Racewrite                 *obj.LSym
+	Racewriten                *obj.LSym
 	Racewriterange            *obj.LSym
 	TypeAssert                *obj.LSym
 	WBZero                    *obj.LSym

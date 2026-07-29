@@ -40,7 +40,47 @@ func racefingo()                                                            { th
 func racemalloc(p unsafe.Pointer, sz uintptr)                               { throw("race") }
 func racefree(p unsafe.Pointer, sz uintptr)                                 { throw("race") }
 func racegostart(pc uintptr) uintptr                                        { throw("race"); return 0 }
-func racegosetchildid(childGoid uint64) uintptr                             { throw("race"); return 0 }
+func racegosetchildid(childGoid uint64, spawnctx uintptr) uintptr           { throw("race"); return 0 }
 func racegoend()                                                            { throw("race") }
-func racectxstart(spawnctx, racectx uintptr) uintptr                        { throw("race"); return 0 }
+func racectxstart(pc, spawnctx uintptr) uintptr                             { throw("race"); return 0 }
 func racectxend(racectx uintptr)                                            { throw("race") }
+
+// The Kolkov packages have ordinary unit tests that run without -race. Keep
+// their narrow runtime bridges available in non-race binaries without
+// enabling detector state or changing the public race API.
+
+//go:linkname kolkovIncrementErrors
+func kolkovIncrementErrors() {}
+
+//go:linkname kolkovReportDone
+func kolkovReportDone() {}
+
+//go:linkname kolkovFramesNext
+func kolkovFramesNext(frames *Frames) (pc uintptr, function, file string, line int, more bool) {
+	frame, more := frames.Next()
+	return frame.PC, frame.Function, frame.File, frame.Line, more
+}
+
+//go:linkname kolkovPCFunctionHasPrefix
+func kolkovPCFunctionHasPrefix(pc uintptr, prefix string) bool {
+	f := findfunc(pc)
+	if !f.valid() {
+		return false
+	}
+	if entry := f.entry(); pc > entry {
+		pc--
+	}
+	u, uf := newInlineUnwinder(f, pc)
+	name := u.srcFunc(uf).name()
+	return len(name) >= len(prefix) && name[:len(prefix)] == prefix
+}
+
+//go:linkname kolkovGetGoid
+//go:nosplit
+func kolkovGetGoid() int64 {
+	gp := getg()
+	if gp.m != nil && gp.m.curg != nil {
+		return int64(gp.m.curg.goid)
+	}
+	return int64(gp.goid)
+}

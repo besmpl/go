@@ -537,7 +537,8 @@ type g struct {
 	inMarkAssist bool
 	coroexit     bool // argument to coroswitch_m
 
-	raceignore      int8  // ignore race detection events
+	raceignore      int8  // nesting depth of user-requested race synchronization suppression
+	raceguard       int8  // pure-Go detector recursion guard
 	nocgocallback   bool  // whether disable callback from C
 	tracking        bool  // whether we're tracking this G for sched latency statistics
 	trackingSeq     uint8 // used to decide whether to track this G

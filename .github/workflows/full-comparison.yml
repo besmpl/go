@@ -5,258 +5,134 @@ on:
     branches: [pure-go-race]
     paths:
       - 'src/runtime/race/**'
-      - 'src/runtime/race_kolkov*.go'
+      - 'src/runtime/race*.go'
+      - 'src/runtime/race*.s'
+      - 'src/runtime/atomic_pointer*.go'
+      - 'src/runtime/proc.go'
+      - 'src/runtime/runtime2.go'
+      - 'src/runtime/time.go'
+      - 'src/internal/race/**'
+      - 'src/sync/atomic/race*.s'
+      - 'src/sync/atomic/type.go'
+      - 'src/sync/atomic/pointer_load*.go'
+      - 'src/cmd/compile/internal/base/flag.go'
+      - 'src/cmd/compile/internal/gc/main.go'
+      - 'src/cmd/compile/internal/inline/inl.go'
+      - 'src/cmd/compile/internal/ir/symtab.go'
+      - 'src/cmd/compile/internal/noder/import.go'
+      - 'src/cmd/compile/internal/ssa/config.go'
+      - 'src/cmd/compile/internal/ssa/rewrite.go'
+      - 'src/cmd/compile/internal/ssa/rewritegeneric.go'
+      - 'src/cmd/compile/internal/ssagen/intrinsics.go'
+      - 'src/cmd/compile/internal/ssagen/ssa.go'
+      - 'src/cmd/compile/internal/typecheck/_builtin/runtime.go'
+      - 'src/cmd/compile/internal/typecheck/builtin.go'
+      - 'src/cmd/compile/internal/types/type.go'
+      - 'src/cmd/compile/internal/walk/compare.go'
+      - 'src/cmd/compile/internal/walk/order.go'
+      - 'src/cmd/compile/internal/walk/select.go'
+      - 'src/cmd/internal/goobj/builtinlist.go'
+      - 'src/cmd/internal/objabi/pkgspecial.go'
+      - 'src/cmd/dist/test.go'
+      - 'src/cmd/go/internal/load/pkg.go'
+      - 'src/cmd/go/testdata/script/*race*'
+      - 'VERSION'
+      - 'go.env'
       - 'benchmarks/**'
       - '.github/workflows/full-comparison.yml'
   workflow_dispatch:
-    inputs:
-      count:
-        description: 'Benchmark iterations (higher = more stable)'
-        default: '10'
-        type: string
-      benchtime:
-        description: 'Time per benchmark iteration'
-        default: '1s'
-        type: string
 
 permissions:
   contents: read
 
-env:
-  BENCH_COUNT: ${{ inputs.count || '1' }}
-  BENCH_TIME: ${{ inputs.benchtime || '1s' }}
-
 jobs:
   compare:
-    name: BASELINE vs TSAN vs KOLKOV
+    name: Baseline vs TSAN vs PureGo
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout exact revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-    - name: Set up Go (system — for BASELINE and TSAN)
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.26'
-        cache: false
+      - name: Initialize evidence status
+        run: |
+          mkdir -p benchmarks/results
+          echo RUNNING > benchmarks/results/status.txt
 
-    - name: Install tools
-      run: |
-        go install golang.org/x/perf/cmd/benchstat@latest
-        sudo apt-get update && sudo apt-get install -y gcc bc
+      - name: Set up pinned bootstrap Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.0'
+          cache: false
 
-    - name: Build go-race toolchain
-      run: cd src && GOROOT_BOOTSTRAP=$(go env GOROOT) ./make.bash
-      env:
-        CGO_ENABLED: 0
+      - name: Test benchmark evidence validation
+        run: bash benchmarks/scripts/test_run_comparison.sh
 
-    - name: Capture environment
-      id: env
-      run: |
-        CPU=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)
-        RAM=$(free -h | awk '/^Mem:/{print $2}')
-        CORES=$(nproc)
-        GO_VER=$(go version | awk '{print $3}')
-        GCC_VER=$(gcc --version | head -1)
+      - name: Install pinned benchmark tools
+        run: |
+          go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260709024250-82a0b07e230d
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y gcc time
 
-        {
-          echo "=== Environment ==="
-          echo "Date:    $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          echo "Runner:  $(uname -s) $(uname -r)"
-          echo "CPU:     ${CPU}"
-          echo "Cores:   ${CORES}"
-          echo "RAM:     ${RAM}"
-          echo "Go:      ${GO_VER}"
-          echo "GCC:     ${GCC_VER}"
-          echo "GOARCH:  $(go env GOARCH)"
-          echo "GOOS:    $(go env GOOS)"
-        } > env.txt
+      - name: Build this fork's toolchain
+        run: |
+          [[ "$(git rev-parse --verify HEAD)" == "$GITHUB_SHA" ]]
+          GOROOT_BOOTSTRAP="$(go env GOROOT)" \
+            bash benchmarks/run_comparison.sh --build-toolchain bin/go
 
-        cat env.txt
+      - name: Run gated same-host comparison
+        working-directory: benchmarks
+        run: |
+          bash ./run_comparison.sh \
+            --go ../bin/go \
+            --count 10 \
+            --benchtime 1s \
+            --max-raceread-ratio 1.00
 
-        # Export for summary script
-        echo "CPU=${CPU}" >> $GITHUB_ENV
-        echo "CORES=${CORES}" >> $GITHUB_ENV
-        echo "RAM=${RAM}" >> $GITHUB_ENV
-        echo "GO_VER=${GO_VER}" >> $GITHUB_ENV
+      - name: Publish validated summary
+        run: |
+          [[ "$(cat benchmarks/results/status.txt)" == PASS ]]
+          grep -F 'fork go tool nm check: __tsan symbols present' benchmarks/results/symbols-tsan.txt
+          grep -F 'fork go tool nm check: no __tsan or runtime/cgo symbols' benchmarks/results/symbols-purego.txt
+          bash benchmarks/run_comparison.sh \
+            --validate-release-contract benchmarks/results/release-contract.txt
+          cat benchmarks/results/summary.md >> "$GITHUB_STEP_SUMMARY"
 
-    - name: Run BASELINE (no -race)
-      working-directory: benchmarks
-      run: |
-        echo "Running BASELINE benchmarks (no -race)..."
-        go test \
-          -bench=. -benchmem \
-          -count=${{ env.BENCH_COUNT }} \
-          -benchtime=${{ env.BENCH_TIME }} \
-          -timeout=30m \
-          > ../baseline.txt 2>&1
-        echo "  $(grep -c '^Benchmark' ../baseline.txt) results"
+      - name: Mark incomplete evidence failed
+        if: failure()
+        run: |
+          mkdir -p benchmarks/results
+          echo FAIL > benchmarks/results/status.txt
 
-    - name: Run TSAN (system Go, -race, CGO_ENABLED=1)
-      working-directory: benchmarks
-      run: |
-        echo "Running TSAN benchmarks (-race, CGO_ENABLED=1)..."
-        CGO_ENABLED=1 go test -race \
-          -bench=. -benchmem \
-          -count=${{ env.BENCH_COUNT }} \
-          -benchtime=${{ env.BENCH_TIME }} \
-          -timeout=30m \
-          > ../tsan.txt 2>&1
-        echo "  $(grep -c '^Benchmark' ../tsan.txt) results"
-
-    - name: Run KOLKOV (go-race, -race, CGO_ENABLED=0)
-      working-directory: benchmarks
-      run: |
-        echo "Running Kolkov benchmarks (-race, CGO_ENABLED=0, go-race toolchain)..."
-        CGO_ENABLED=0 ../bin/go test -race \
-          -bench=. -benchmem \
-          -count=${{ env.BENCH_COUNT }} \
-          -benchtime=${{ env.BENCH_TIME }} \
-          -timeout=30m \
-          > ../kolkov_raw.txt 2>&1 || true
-
-        # Clean race detector noise (TID warnings, race reports, ==================)
-        # Use "ns/op" to match only valid result lines, not WARNING/race prefixed lines
-        grep "ns/op\|^goos:\|^goarch:\|^pkg:\|^cpu:\|^ok \|^PASS\|^FAIL" \
-          ../kolkov_raw.txt > ../kolkov.txt || true
-        echo "  $(grep -c 'ns/op' ../kolkov.txt) results"
-
-    - name: Run benchstat comparisons
-      run: |
-        # TSAN vs Kolkov (primary comparison)
-        benchstat tsan.txt kolkov.txt \
-          > benchstat_tsan_vs_kolkov.txt 2>&1 || true
-
-        # All three configs
-        benchstat baseline.txt tsan.txt kolkov.txt \
-          > benchstat_all.txt 2>&1 || true
-
-    - name: Measure peak RSS
-      working-directory: benchmarks
-      run: |
-        echo "Measuring peak RSS (WorkerPool/g64, benchtime=3s)..."
-        > ../memory_rss.txt
-
-        # BASELINE RSS
-        tmpfile=$(mktemp)
-        /usr/bin/time -v go test \
-          -bench=BenchmarkWorkerPool/g64 \
-          -benchtime=3s -count=1 -timeout=5m \
-          > /dev/null 2> "$tmpfile" || true
-        peak_kb=$(grep "Maximum resident set size" "$tmpfile" | awk '{print $NF}' || echo 0)
-        peak_mb=$(( peak_kb / 1024 ))
-        echo "BASELINE: ${peak_mb} MB (${peak_kb} KB)" | tee -a ../memory_rss.txt
-        rm -f "$tmpfile"
-
-        # TSAN RSS
-        tmpfile=$(mktemp)
-        CGO_ENABLED=1 /usr/bin/time -v go test -race \
-          -bench=BenchmarkWorkerPool/g64 \
-          -benchtime=3s -count=1 -timeout=5m \
-          > /dev/null 2> "$tmpfile" || true
-        peak_kb=$(grep "Maximum resident set size" "$tmpfile" | awk '{print $NF}' || echo 0)
-        peak_mb=$(( peak_kb / 1024 ))
-        echo "TSAN: ${peak_mb} MB (${peak_kb} KB)" | tee -a ../memory_rss.txt
-        rm -f "$tmpfile"
-
-        # KOLKOV RSS
-        tmpfile=$(mktemp)
-        CGO_ENABLED=0 /usr/bin/time -v ../bin/go test -race \
-          -bench=BenchmarkWorkerPool/g64 \
-          -benchtime=3s -count=1 -timeout=5m \
-          > /dev/null 2> "$tmpfile" || true
-        peak_kb=$(grep "Maximum resident set size" "$tmpfile" | awk '{print $NF}' || echo 0)
-        peak_mb=$(( peak_kb / 1024 ))
-        echo "KOLKOV: ${peak_mb} MB (${peak_kb} KB)" | tee -a ../memory_rss.txt
-        rm -f "$tmpfile"
-
-    - name: Generate Step Summary
-      run: |
-        # Header
-        {
-          echo "## Benchmark Results: Pure-Go Race Detector vs TSAN"
-          echo ""
-          echo "**Platform:** Ubuntu $(lsb_release -rs 2>/dev/null || echo '24.04'), $(uname -m)"
-          echo "**CPU:** ${CPU}"
-          echo "**Cores:** ${CORES} | **RAM:** ${RAM}"
-          echo "**Go:** ${GO_VER}"
-          echo "**Method:** \`go test -bench -count=${{ env.BENCH_COUNT }} -benchtime=${{ env.BENCH_TIME }} -benchmem\`"
-          echo ""
-        } >> $GITHUB_STEP_SUMMARY
-
-        # Generate comparison table using script if available
-        if [ -f benchmarks/scripts/generate-summary.sh ]; then
-          bash benchmarks/scripts/generate-summary.sh \
-            baseline.txt tsan.txt kolkov.txt >> $GITHUB_STEP_SUMMARY
-        else
-          # Fallback: raw benchstat + RSS if script not available
-          {
-            echo "### benchstat: TSAN vs Kolkov"
-            echo ""
-            echo '```'
-            grep -v "parsing iteration count" benchstat_tsan_vs_kolkov.txt || cat benchstat_tsan_vs_kolkov.txt
-            echo '```'
-            echo ""
-            echo "### Peak RSS (Memory)"
-            echo ""
-            echo "| Config | Peak RSS |"
-            echo "|--------|----------|"
-            while IFS= read -r line; do
-              config=$(echo "$line" | cut -d: -f1)
-              value=$(echo "$line" | cut -d: -f2 | xargs)
-              echo "| ${config} | ${value} |"
-            done < memory_rss.txt
-            echo ""
-          } >> $GITHUB_STEP_SUMMARY
-        fi
-
-        # Raw output in collapsible sections
-        {
-          echo "<details><summary>Raw Output: BASELINE (click to expand)</summary>"
-          echo ""
-          echo '```'
-          head -50 baseline.txt
-          echo '```'
-          echo "</details>"
-          echo ""
-
-          echo "<details><summary>Raw Output: TSAN</summary>"
-          echo ""
-          echo '```'
-          head -50 tsan.txt
-          echo '```'
-          echo "</details>"
-          echo ""
-
-          echo "<details><summary>Raw Output: KOLKOV</summary>"
-          echo ""
-          echo '```'
-          head -50 kolkov.txt
-          echo '```'
-          echo "</details>"
-          echo ""
-
-          echo "<details><summary>Full benchstat (all 3 configs)</summary>"
-          echo ""
-          echo '```'
-          grep -v "parsing iteration count" benchstat_all.txt || cat benchstat_all.txt
-          echo '```'
-          echo "</details>"
-        } >> $GITHUB_STEP_SUMMARY
-
-    - name: Upload results
-      uses: actions/upload-artifact@v4
-      with:
-        name: benchmark-results-${{ github.sha }}
-        path: |
-          env.txt
-          baseline.txt
-          tsan.txt
-          kolkov.txt
-          kolkov_raw.txt
-          benchstat_tsan_vs_kolkov.txt
-          benchstat_all.txt
-          memory_rss.txt
-        retention-days: 90
+      - name: Upload success or failure evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: |
+            benchmarks/results/status.txt
+            benchmarks/results/release-contract.txt
+            benchmarks/results/environment.txt
+            benchmarks/results/source-status.txt
+            benchmarks/results/raw/**
+            benchmarks/results/baseline.txt
+            benchmarks/results/tsan.txt
+            benchmarks/results/purego.txt
+            benchmarks/results/*.samples
+            benchmarks/results/raceread-*.txt
+            benchmarks/results/raceread_ratio.txt
+            benchmarks/results/sample-order.txt
+            benchmarks/results/benchstat_tsan_vs_purego.txt
+            benchmarks/results/benchstat_all.txt
+            benchmarks/results/memory_rss.txt
+            benchmarks/results/rss-*.stdout
+            benchmarks/results/rss-*.time
+            benchmarks/results/symbols-*.txt
+            benchmarks/results/summary.md
+            bin/go.benchmark-attestation
+          if-no-files-found: warn
+          retention-days: 90

@@ -1000,9 +1000,14 @@ func (t *tester) registerTests() {
 		}
 	}
 
-	if t.raceDetectorSupported() && !t.msan && !t.asan {
+	if t.tsanRaceDetectorSupported() && !t.msan && !t.asan {
 		// N.B. -race is incompatible with -msan and -asan.
 		t.registerRaceTests()
+	}
+	if t.pureGoRaceDetectorSupported() && !t.msan && !t.asan {
+		// Exercise the cgo-independent detector explicitly. A cgo-enabled
+		// builder otherwise selects ThreadSanitizer for every race test.
+		t.registerPureGoRaceTests()
 	}
 
 	if goos != "android" && !t.iOS() {
@@ -1534,14 +1539,8 @@ func (t *tester) hasParallelism() bool {
 	return true
 }
 
-func (t *tester) raceDetectorSupported() bool {
-	if gohostos != goos {
-		return false
-	}
-	if !t.cgoEnabled {
-		return false
-	}
-	if !raceDetectorSupported(goos, goarch) {
+func (t *tester) tsanRaceDetectorSupported() bool {
+	if !t.pureGoRaceDetectorSupported() || !t.cgoEnabled {
 		return false
 	}
 	// The race detector doesn't work on Alpine Linux:
@@ -1555,6 +1554,10 @@ func (t *tester) raceDetectorSupported() bool {
 		return false
 	}
 	return true
+}
+
+func (t *tester) pureGoRaceDetectorSupported() bool {
+	return gohostos == goos && raceDetectorSupported(goos, goarch)
 }
 
 func isAlpineLinux() bool {
@@ -1604,6 +1607,43 @@ func (t *tester) registerRaceTests() {
 				pkgs:     []string{"flag", "os/exec"},
 			})
 	}
+}
+
+func (t *tester) registerPureGoRaceTests() {
+	const hdr = "Testing pure-Go race detector"
+	t.registerTest(hdr,
+		&goTest{
+			variant: "race-purego",
+			race:    true,
+			runTests: "^(TestRace|TestPureGo(Output|Semantics|ConcurrentSynctestTimers|" +
+				"AtomicPointerPublicationFromNoRacePackage|BridgeGCAndStackReuse|CompactRangeFrameBudget))$",
+			env: []string{"CGO_ENABLED=0"},
+			pkg: "runtime/race",
+		})
+	t.registerTest(hdr,
+		&goTest{
+			variant:  "race-purego",
+			race:     true,
+			runTests: "^(TestRaceFirstModuleStaticData|TestRaceStatic(Byte)?ReadCacheSynchronization|TestRaceStaticReadCacheFinalizerHandoff)$",
+			env:      []string{"CGO_ENABLED=0"},
+			pkg:      "runtime",
+		})
+	t.registerTest(hdr,
+		&goTest{
+			variant:  "race-purego",
+			race:     true,
+			runTests: "^TestPointerOperationsKeepGCVisibleRoots$",
+			env:      []string{"CGO_ENABLED=0"},
+			pkg:      "sync/atomic",
+		})
+	t.registerTest(hdr,
+		&goTest{
+			variant:  "race-purego",
+			race:     true,
+			runTests: "TestParse|TestEcho|TestStdinCloseRace|TestClosedPipeRace|TestTypeRace|TestFdRace|TestFdReadRace|TestFileCloseRace",
+			env:      []string{"CGO_ENABLED=0"},
+			pkgs:     []string{"flag", "net", "os", "os/exec", "encoding/gob"},
+		})
 }
 
 // cgoPackages is the standard packages that use cgo.

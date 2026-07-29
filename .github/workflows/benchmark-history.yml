@@ -10,12 +10,46 @@ on:
     branches: [pure-go-race]
     paths:
       - 'src/runtime/race/**'
-      - 'src/runtime/race_kolkov*.go'
+      - 'src/runtime/race*.go'
+      - 'src/runtime/race*.s'
+      - 'src/runtime/atomic_pointer*.go'
+      - 'src/runtime/proc.go'
+      - 'src/runtime/runtime2.go'
+      - 'src/runtime/time.go'
+      - 'src/internal/race/**'
+      - 'src/sync/atomic/race*.s'
+      - 'src/sync/atomic/type.go'
+      - 'src/sync/atomic/pointer_load*.go'
+      - 'src/cmd/compile/internal/base/flag.go'
+      - 'src/cmd/compile/internal/gc/main.go'
+      - 'src/cmd/compile/internal/inline/inl.go'
+      - 'src/cmd/compile/internal/ir/symtab.go'
+      - 'src/cmd/compile/internal/noder/import.go'
+      - 'src/cmd/compile/internal/ssa/config.go'
+      - 'src/cmd/compile/internal/ssa/rewrite.go'
+      - 'src/cmd/compile/internal/ssa/rewritegeneric.go'
+      - 'src/cmd/compile/internal/ssagen/intrinsics.go'
+      - 'src/cmd/compile/internal/ssagen/ssa.go'
+      - 'src/cmd/compile/internal/typecheck/_builtin/runtime.go'
+      - 'src/cmd/compile/internal/typecheck/builtin.go'
+      - 'src/cmd/compile/internal/types/type.go'
+      - 'src/cmd/compile/internal/walk/compare.go'
+      - 'src/cmd/compile/internal/walk/order.go'
+      - 'src/cmd/compile/internal/walk/select.go'
+      - 'src/cmd/internal/goobj/builtinlist.go'
+      - 'src/cmd/internal/objabi/pkgspecial.go'
+      - 'src/cmd/dist/test.go'
+      - 'src/cmd/go/internal/load/pkg.go'
+      - 'src/cmd/go/testdata/script/*race*'
+      - 'VERSION'
+      - 'go.env'
       - 'benchmarks/**'
+      - '.github/workflows/benchmark-history.yml'
 
 permissions:
   contents: write
   deployments: write
+  issues: write
 
 jobs:
   benchmark:
@@ -23,31 +57,86 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Go 1.26 (bootstrap)
-        uses: actions/setup-go@v5
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          go-version: '1.26'
+          persist-credentials: false
+
+      - name: Setup pinned Go 1.26 (bootstrap)
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.0'
+          cache: false
+
+      - name: Test benchmark evidence validation
+        run: bash benchmarks/scripts/test_run_comparison.sh
 
       - name: Build go-race toolchain
-        env:
-          CGO_ENABLED: 0
         run: |
-          cd src && GOROOT_BOOTSTRAP=$(go env GOROOT) ./make.bash
+          [[ "$(git rev-parse --verify HEAD)" == "$GITHUB_SHA" ]]
+          GOROOT_BOOTSTRAP="$(go env GOROOT)" \
+            bash benchmarks/run_comparison.sh --build-toolchain bin/go
 
-      - name: Run Kolkov benchmarks
+      - name: Verify pure-Go backend
+        run: |
+          backend="$(CGO_ENABLED=0 ./bin/go list -race -f 'GoFiles={{join .GoFiles ","}} CgoFiles={{join .CgoFiles ","}} SysoFiles={{join .SysoFiles ","}}' runtime/race)"
+          [[ "${backend}" == *race_kolkov_import.go* ]]
+          [[ "${backend}" == *'CgoFiles= SysoFiles=' ]]
+          echo "${backend}"
+
+      - name: Run and validate PureGo benchmarks
         run: |
           cd benchmarks
-          CGO_ENABLED=0 ../bin/go test -race \
-            -bench=. -benchmem -count=6 -benchtime=1s -timeout=15m \
-            > raw_output.txt 2>&1 || true
+          if ! CGO_ENABLED=0 ../bin/go test -race \
+            -bench=. -benchmem -count=10 -benchtime=1s -timeout=30m \
+            > output.txt 2>&1; then
+            cat output.txt >&2
+            exit 1
+          fi
+          if grep -Eq '^FAIL([[:space:]]|$)|^--- FAIL:|WARNING: DATA RACE|fatal error:|runtime: fatal' output.txt; then
+            cat output.txt >&2
+            exit 1
+          fi
+          grep -q '^PASS$' output.txt
+          grep -Eq '^ok[[:space:]]' output.txt
+          awk '
+            function positive_decimal(value) {
+              return value ~ /^[0-9]+([.][0-9]+)?$/ && (value + 0) > 0
+            }
+            /^Benchmark/ {
+              timed=0
+              for (i=2; i<=NF; i++) {
+                if ($i=="ns/op" || $i=="us/op" || $i=="µs/op" || $i=="ms/op" || $i=="s/op") {
+                  timed++
+                  if (i==2 || !positive_decimal($(i-1))) bad=1
+                }
+              }
+              if (timed != 1) bad=1
+              samples[$1]++
+              total++
+            }
+            END {
+              if (!total) exit 1
+              for (name in samples) if (samples[name] != 10) {
+                printf "%s has %d samples; want 10\n", name, samples[name] > "/dev/stderr"
+                bad=1
+              }
+              if (bad) exit 1
+            }
+          ' output.txt
 
-          # Clean noise from race detector output (TID warnings, race reports, ==================)
-          grep "ns/op\|^goos:\|^goarch:\|^pkg:\|^cpu:\|^ok \|^PASS" raw_output.txt > output.txt
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: benchmark-history-${{ github.sha }}
+          path: |
+            benchmarks/output.txt
+            bin/go.benchmark-attestation
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Store benchmark result
-        uses: benchmark-action/github-action-benchmark@v1
+        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
         with:
           tool: 'go'
           output-file-path: benchmarks/output.txt

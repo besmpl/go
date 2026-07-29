@@ -22,6 +22,48 @@ func TestCASBasedShadow_New(t *testing.T) {
 	t.Logf("NewCASBasedShadow() created valid instance")
 }
 
+func TestCASBasedShadowStableOverflowHistory(t *testing.T) {
+	shadow := NewCASBasedShadow()
+	shadow.SetAddressCompression(false)
+	const addr = uintptr(0x1234_5000)
+	hash := fastHash(addr)
+	for i := uint64(0); i < casMaxProbes; i++ {
+		idx := (hash + i) & casHashMask
+		shadow.cells[idx].Store(&CASCell{
+			addr:     addr + uintptr(i+1)*0x10000,
+			varState: new(ShadowSlot),
+		})
+	}
+
+	const workers = 32
+	results := make(chan *VarState, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			results <- shadow.GetOrCreate(addr)
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var first *VarState
+	for state := range results {
+		if first == nil {
+			first = state
+		} else if state != first {
+			t.Fatalf("overflow lookup returned independent histories: %p and %p", first, state)
+		}
+	}
+	if first == nil || shadow.Get(addr) != first {
+		t.Fatal("overflow history was not stably indexed")
+	}
+	if shadow.overflow[hash&(casOverflowSize-1)].Load() == nil {
+		t.Fatal("test did not exercise overflow chain")
+	}
+}
+
 // TestCASBasedShadow_Load_Empty verifies Load returns nil for empty shadow.
 func TestCASBasedShadow_Load_Empty(t *testing.T) {
 	shadow := NewCASBasedShadow()
@@ -130,7 +172,7 @@ func TestCASBasedShadow_MultipleAddresses(t *testing.T) {
 		if !created {
 			t.Errorf("LoadOrStore(0x%x) should create new cell", addr)
 		}
-		vs.SetW(epoch.NewEpoch(uint16(i+1), uint64((i+1)*100)))
+		vs.SetW(epoch.NewEpoch(uint32(i+1), uint64((i+1)*100)))
 		cells[i] = vs
 	}
 
@@ -146,7 +188,7 @@ func TestCASBasedShadow_MultipleAddresses(t *testing.T) {
 			t.Errorf("Load(0x%x) returned different instance", addr)
 		}
 
-		expectedW := epoch.NewEpoch(uint16(i+1), uint64((i+1)*100))
+		expectedW := epoch.NewEpoch(uint32(i+1), uint64((i+1)*100))
 		if vs.GetW() != expectedW {
 			t.Errorf("VarState[0x%x].W = %v, want %v", addr, vs.GetW(), expectedW)
 		}
@@ -378,7 +420,7 @@ func TestCASBasedShadow_Concurrent_MultipleAddresses(t *testing.T) {
 				vs, _ := shadow.LoadOrStore(addr)
 
 				// Update the cell.
-				vs.SetW(epoch.NewEpoch(uint16(gid), uint64(j)))
+				vs.SetW(epoch.NewEpoch(uint32(gid), uint64(j)))
 			}
 		}(i)
 	}

@@ -123,7 +123,6 @@ func NewSampler(config SamplerConfig) *Sampler {
 //   - Enabled: ~5ns (atomic add + modulo)
 //
 // Thread Safety: Safe for concurrent calls.
-//
 func (s *Sampler) ShouldSample() bool {
 	// Fast path: Sampling disabled
 	if !s.config.Enabled || s.config.Rate <= 1 {

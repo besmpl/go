@@ -1,7 +1,6 @@
 package detector
 
 import (
-	"bytes"
 	"os"
 	"runtime"
 	"strings"
@@ -118,22 +117,11 @@ func TestOnWrite_WriteWriteRace(t *testing.T) {
 	ctx.C.Set(1, 5)
 	ctx.Epoch = epoch.NewEpoch(1, 5)
 
-	// Capture stderr to verify race report.
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
+	var output string
+	d.reportObserver = func(report *RaceReport) { output = report.String() }
 
 	// Second write should detect write-write race.
 	d.OnWrite(addr, ctx, 0)
-
-	// Restore stderr.
-	w.Close()
-	os.Stderr = oldStderr
-
-	// Read captured output.
-	var buf bytes.Buffer
-	buf.ReadFrom(r)
-	output := buf.String()
 
 	// Verify race was detected.
 	if d.RacesDetected() != 1 {
@@ -177,21 +165,11 @@ func TestOnWrite_ReadWriteRace(t *testing.T) {
 	ctx.C.Set(1, 5)
 	ctx.Epoch = epoch.NewEpoch(1, 5)
 
-	// Capture stderr.
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
+	var output string
+	d.reportObserver = func(report *RaceReport) { output = report.String() }
 
 	// Write should detect read-write race.
 	d.OnWrite(addr, ctx, 0)
-
-	// Restore stderr.
-	w.Close()
-	os.Stderr = oldStderr
-
-	// Read captured output.
-	var buf bytes.Buffer
-	buf.ReadFrom(r)
 
 	// Verify race was detected.
 	if d.RacesDetected() != 1 {
@@ -199,7 +177,6 @@ func TestOnWrite_ReadWriteRace(t *testing.T) {
 	}
 
 	// Verify race report (Phase 5 Task 5.1 new format).
-	output := buf.String()
 	if !strings.Contains(output, "Write at") {
 		t.Error("Race report should contain 'Write at' (current access)")
 	}
@@ -301,9 +278,10 @@ func TestOnWrite_UpdatesShadowMemory(t *testing.T) {
 	_ = initialEpoch // Suppress unused warning
 }
 
-// TestOnWrite_IncrementsLogicalClock tests that OnWrite advances the
-// logical clock after processing.
-func TestOnWrite_IncrementsLogicalClock(t *testing.T) {
+// TestOnWrite_ClockAdvancesOnlyAtSynchronization verifies the FastTrack clock
+// contract: ordinary accesses retain the current epoch and synchronization
+// operations advance it.
+func TestOnWrite_ClockAdvancesOnlyAtSynchronization(t *testing.T) {
 	d := NewDetector()
 	ctx := goroutine.Alloc(1)
 	addr := uintptr(0xA000)
@@ -314,12 +292,13 @@ func TestOnWrite_IncrementsLogicalClock(t *testing.T) {
 	// Perform write.
 	d.OnWrite(addr, ctx, 0)
 
-	// Get new clock value.
-	newClock := ctx.C.Get(1)
+	if got := ctx.C.Get(1); got != initialClock {
+		t.Fatalf("ordinary write advanced logical clock: initial=%d, got=%d", initialClock, got)
+	}
 
-	// Clock should have incremented.
-	if newClock <= initialClock {
-		t.Errorf("Logical clock not incremented: initial=%d, new=%d", initialClock, newClock)
+	d.OnRelease(0xA100, ctx)
+	if got := ctx.C.Get(1); got <= initialClock {
+		t.Errorf("release did not advance logical clock: initial=%d, got=%d", initialClock, got)
 	}
 }
 
@@ -484,26 +463,13 @@ func TestHappensBeforeRead(t *testing.T) {
 func TestReportRace(t *testing.T) {
 	d := NewDetector()
 
-	// Capture stderr.
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
-
 	// Report a race.
 	addr := uintptr(0xDEADBEEF)
 	prevEpoch := epoch.NewEpoch(2, 100)
 	currEpoch := epoch.NewEpoch(3, 200)
 
+	output := formatLegacyRace("test-race", addr, prevEpoch, currEpoch)
 	d.reportRace("test-race", addr, prevEpoch, currEpoch)
-
-	// Restore stderr.
-	w.Close()
-	os.Stderr = oldStderr
-
-	// Read output.
-	var buf bytes.Buffer
-	buf.ReadFrom(r)
-	output := buf.String()
 
 	// Verify output contains expected elements.
 	expectedStrings := []string{
@@ -515,7 +481,7 @@ func TestReportRace(t *testing.T) {
 	}
 
 	for _, expected := range expectedStrings {
-		if !bytes.Contains(buf.Bytes(), []byte(expected)) {
+		if !strings.Contains(output, expected) {
 			t.Errorf("Race report missing expected string: %q\nGot:\n%s", expected, output)
 		}
 	}
@@ -545,7 +511,7 @@ func TestConcurrentWrites(_ *testing.T) {
 	for i := 0; i < numGoroutines; i++ {
 		go func(id int) {
 			// Each goroutine gets its own context with unique TID
-			ctx := goroutine.Alloc(uint16(id + 1))
+			ctx := goroutine.Alloc(uint32(id + 1))
 			baseAddr := uintptr(0x10000 + id*0x1000)
 			for j := 0; j < writesPerGoroutine; j++ {
 				addr := baseAddr + uintptr(j)
@@ -637,21 +603,11 @@ func TestOnRead_WriteReadRace(t *testing.T) {
 	ctx.C.Set(1, 5)
 	ctx.Epoch = epoch.NewEpoch(1, 5)
 
-	// Capture stderr.
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
+	var output string
+	d.reportObserver = func(report *RaceReport) { output = report.String() }
 
 	// Read should detect write-read race.
 	d.OnRead(addr, ctx, 0)
-
-	// Restore stderr.
-	w.Close()
-	os.Stderr = oldStderr
-
-	// Read captured output.
-	var buf bytes.Buffer
-	buf.ReadFrom(r)
 
 	// Verify race was detected.
 	if d.RacesDetected() != 1 {
@@ -659,7 +615,6 @@ func TestOnRead_WriteReadRace(t *testing.T) {
 	}
 
 	// Verify race report (Phase 5 Task 5.1 new format).
-	output := buf.String()
 	if !strings.Contains(output, "Read at") {
 		t.Error("Race report should contain 'Read at' (current access)")
 	}
@@ -744,8 +699,14 @@ func TestOnRead_MultipleReads(t *testing.T) {
 	// Second read.
 	d.OnRead(addr, ctx, 0)
 
-	// Read epoch should have been updated.
-	secondReadEpoch := vs.GetReadEpoch()
+	// A changed sole-member compact descriptor promotes to an authoritative
+	// materialized state. Re-resolve it rather than inspecting the retired
+	// immutable compact snapshot from the first read.
+	secondState := d.shadowMemory.Get(addr)
+	if secondState == nil {
+		t.Fatal("Second read removed shadow state")
+	}
+	secondReadEpoch := secondState.GetReadEpoch()
 	if secondReadEpoch.Same(firstReadEpoch) {
 		t.Error("Read epoch not updated on second read")
 	}
@@ -823,9 +784,9 @@ func TestOnRead_UpdatesShadowMemory(t *testing.T) {
 	}
 }
 
-// TestOnRead_IncrementsLogicalClock tests that OnRead advances the
-// logical clock after processing.
-func TestOnRead_IncrementsLogicalClock(t *testing.T) {
+// TestOnRead_ClockAdvancesOnlyAtSynchronization verifies ordinary reads retain
+// their epoch and an acquire advances it.
+func TestOnRead_ClockAdvancesOnlyAtSynchronization(t *testing.T) {
 	d := NewDetector()
 	ctx := goroutine.Alloc(1)
 	addr := uintptr(0xB000)
@@ -836,12 +797,13 @@ func TestOnRead_IncrementsLogicalClock(t *testing.T) {
 	// Perform read.
 	d.OnRead(addr, ctx, 0)
 
-	// Get new clock value.
-	newClock := ctx.C.Get(1)
+	if got := ctx.C.Get(1); got != initialClock {
+		t.Fatalf("ordinary read advanced logical clock: initial=%d, got=%d", initialClock, got)
+	}
 
-	// Clock should have incremented.
-	if newClock <= initialClock {
-		t.Errorf("Logical clock not incremented: initial=%d, new=%d", initialClock, newClock)
+	d.OnAcquire(0xB100, ctx)
+	if got := ctx.C.Get(1); got <= initialClock {
+		t.Errorf("acquire did not advance logical clock: initial=%d, got=%d", initialClock, got)
 	}
 }
 
@@ -953,7 +915,7 @@ func TestConcurrentReads(_ *testing.T) {
 	for i := 0; i < numGoroutines; i++ {
 		go func(id int) {
 			// Each goroutine gets its own context with unique TID
-			ctx := goroutine.Alloc(uint16(id + 1))
+			ctx := goroutine.Alloc(uint32(id + 1))
 			baseAddr := uintptr(0x20000 + id*0x1000)
 			for j := 0; j < readsPerGoroutine; j++ {
 				addr := baseAddr + uintptr(j)
@@ -984,7 +946,7 @@ func TestConcurrentReadsAndWrites(_ *testing.T) {
 	for i := 0; i < numGoroutines; i++ {
 		go func(id int) {
 			// Each goroutine gets its own context with unique TID
-			ctx := goroutine.Alloc(uint16(id + 1))
+			ctx := goroutine.Alloc(uint32(id + 1))
 			baseAddr := uintptr(0x30000 + id*0x1000)
 			for j := 0; j < opsPerGoroutine; j++ {
 				addr := baseAddr + uintptr(j)
@@ -998,7 +960,7 @@ func TestConcurrentReadsAndWrites(_ *testing.T) {
 	for i := 0; i < numGoroutines; i++ {
 		go func(id int) {
 			// Each goroutine gets its own context with unique TID
-			ctx := goroutine.Alloc(uint16(id + numGoroutines + 1))
+			ctx := goroutine.Alloc(uint32(id + numGoroutines + 1))
 			baseAddr := uintptr(0x40000 + id*0x1000)
 			for j := 0; j < opsPerGoroutine; j++ {
 				addr := baseAddr + uintptr(j)

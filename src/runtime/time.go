@@ -1122,21 +1122,27 @@ func (t *timer) unlockAndRun(now int64, bubble *synctestBubble) {
 	if t.ts != nil {
 		assertLockHeld(&t.ts.mu)
 	}
+	var timerRaceCtx uintptr
 	if raceenabled {
 		// Note that we are running on a system stack,
 		// so there is no chance of getg().m being reassigned
 		// out from under us while this function executes.
 		gp := getg()
-		var tsLocal *timers
 		if bubble == nil {
-			tsLocal = &gp.m.p.ptr().timers
+			tsLocal := &gp.m.p.ptr().timers
+			if tsLocal.raceCtx == 0 {
+				// Timer execution is independent of whichever goroutine
+				// happens to run the timer. The matching release/acquire
+				// on t below supplies the creation or reset HB edge.
+				tsLocal.raceCtx = racectxstart(abi.FuncPCABIInternal((*timers).run)+sys.PCQuantum, 0)
+			}
+			timerRaceCtx = tsLocal.raceCtx
 		} else {
-			tsLocal = &bubble.timers
+			// Immediate bubbled timers can run concurrently on multiple
+			// system stacks, so each firing owns a temporary context.
+			timerRaceCtx = racectxstart(abi.FuncPCABIInternal((*timers).run)+sys.PCQuantum, 0)
 		}
-		if tsLocal.raceCtx == 0 {
-			tsLocal.raceCtx = racegostart(abi.FuncPCABIInternal((*timers).run) + sys.PCQuantum)
-		}
-		raceacquirectx(tsLocal.raceCtx, unsafe.Pointer(t))
+		raceacquirectx(timerRaceCtx, unsafe.Pointer(t))
 	}
 
 	if t.state&(timerModified|timerZombie) != 0 {
@@ -1179,16 +1185,12 @@ func (t *timer) unlockAndRun(now int64, bubble *synctestBubble) {
 	t.unlock()
 
 	if raceenabled {
-		// Temporarily use the current P's racectx for g0.
+		// Temporarily use the timer firing's context for g0.
 		gp := getg()
 		if gp.racectx != 0 {
 			throw("unexpected racectx")
 		}
-		if bubble == nil {
-			gp.racectx = gp.m.p.ptr().timers.raceCtx
-		} else {
-			gp.racectx = bubble.timers.raceCtx
-		}
+		gp.racectx = timerRaceCtx
 	}
 
 	if ts != nil {
@@ -1264,6 +1266,9 @@ func (t *timer) unlockAndRun(now int64, bubble *synctestBubble) {
 	if raceenabled {
 		gp := getg()
 		gp.racectx = 0
+		if bubble != nil {
+			racectxend(timerRaceCtx)
+		}
 	}
 }
 

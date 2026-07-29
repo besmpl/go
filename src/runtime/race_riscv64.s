@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build race
+//go:build race && cgo
 
 #include "go_asm.h"
 #include "funcdata.h"
@@ -32,6 +32,14 @@ TEXT	runtime·raceread<ABIInternal>(SB), NOSPLIT, $0-8
 	MOV	X1, X12
 	JMP	racecalladdr<>(SB)
 
+// func runtime·racereadn(addr, size uintptr)
+// The Pure-Go backend consumes size; TSAN retains scalar semantics.
+TEXT	runtime·racereadn<ABIInternal>(SB), NOSPLIT, $0-16
+	MOV	$__tsan_read(SB), X5
+	MOV	X10, X11
+	MOV	X1, X12
+	JMP	racecalladdr<>(SB)
+
 // func runtime·RaceRead(addr uintptr)
 TEXT	runtime·RaceRead(SB), NOSPLIT, $0-8
 	// This needs to be a tail call, because raceread reads caller pc.
@@ -50,6 +58,14 @@ TEXT	runtime·racereadpc(SB), NOSPLIT, $0-24
 // Called from instrumented code.
 TEXT	runtime·racewrite<ABIInternal>(SB), NOSPLIT, $0-8
 	// void __tsan_write(ThreadState *thr, void *addr, void *pc);
+	MOV	$__tsan_write(SB), X5
+	MOV	X10, X11
+	MOV	X1, X12
+	JMP	racecalladdr<>(SB)
+
+// func runtime·racewriten(addr, size uintptr)
+// See racereadn above.
+TEXT	runtime·racewriten<ABIInternal>(SB), NOSPLIT, $0-16
 	MOV	$__tsan_write(SB), X5
 	MOV	X10, X11
 	MOV	X1, X12

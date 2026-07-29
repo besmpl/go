@@ -54,9 +54,6 @@ type Pointer[T any] struct {
 	v unsafe.Pointer
 }
 
-// Load atomically loads and returns the value stored in x.
-func (x *Pointer[T]) Load() *T { return (*T)(LoadPointer(&x.v)) }
-
 // Store atomically stores val into x.
 func (x *Pointer[T]) Store(val *T) { StorePointer(&x.v, unsafe.Pointer(val)) }
 

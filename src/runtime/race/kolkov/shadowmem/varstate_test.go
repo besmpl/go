@@ -1,11 +1,81 @@
 package shadowmem
 
 import (
+	"runtime"
+	"sync"
 	"testing"
+	"time"
 	"unsafe"
 
 	"runtime/race/kolkov/epoch"
+	"runtime/race/kolkov/vectorclock"
 )
+
+func TestSpinlockMutualExclusion(t *testing.T) {
+	const (
+		workers    = 8
+		increments = 2_000
+	)
+
+	var (
+		lock  spinlock
+		value int
+		wg    sync.WaitGroup
+	)
+	start := make(chan struct{})
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			<-start
+			for range increments {
+				lock.lock()
+				value++
+				lock.unlock()
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if want := workers * increments; value != want {
+		t.Fatalf("protected value = %d, want %d", value, want)
+	}
+}
+
+func TestSpinlockHeldWaiterMakesProgressOnSingleP(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousProcs)
+
+	var lock spinlock
+	lock.lock()
+
+	started := make(chan struct{})
+	acquired := make(chan struct{})
+	go func() {
+		close(started)
+		lock.lock()
+		close(acquired)
+		lock.unlock()
+	}()
+
+	<-started
+	// Force the waiter to enter the saturated path while this goroutine owns the
+	// lock and only one P is available. It can return control only by scheduling.
+	runtime.Gosched()
+	select {
+	case <-acquired:
+		t.Fatal("waiter acquired a held lock")
+	default:
+	}
+	lock.unlock()
+
+	select {
+	case <-acquired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiter did not acquire the released lock")
+	}
+}
 
 // TestVarStateSize verifies that VarState has expected size.
 // Phase 3: 24 bytes (W + mu + readEpoch + readClock pointer).
@@ -13,21 +83,21 @@ import (
 // v0.2.0 Task 4 (64-bit Epoch): 48 bytes (W changed from uint32 to uint64, adds 8 bytes).
 // v0.2.0 Task 6 (Stack Depot): 64 bytes (adds writeStackHash uint64 + readStackHash uint64).
 // v0.3.0 P1 (Enhanced Read-Shared): 96 bytes (readEpoch → readEpochs[4] + readerCount uint8).
-// v0.3.0 Lock-Free: 112 bytes (W/exclusiveWriter/writePC/readPC become atomic types with padding).
-// Trade-off: 112 bytes per VarState BUT lock-free hot path (2-5ns vs 20-50ns mutex).
+// Runtime temporal-cache correctness: 128 bytes (adds a detector transaction lock).
+// Trade-off: 128 bytes per VarState keeps completed cacheable accesses linearizable.
 func TestVarStateSize(t *testing.T) {
 	// v0.3.0 Lock-Free: atomic.Uint64 W(24) + atomic.Int64 exclusiveWriter(24) + atomic.Uintptr writePC(24)
 	//       + atomic.Uintptr readPC(24) + mu(8) + readEpochs[4](32) + readerCount(1) + padding
 	//       + readClock(8) + writeCount(4) + writeStackHash(8) + readStackHash(8) = 112
 	// Note: Atomic types have additional padding for alignment, increasing from 96 to 112 bytes.
-	const expectedSize = 112
+	const expectedSize = 128
 	actualSize := unsafe.Sizeof(VarState{})
 
 	if actualSize != expectedSize {
-		t.Errorf("VarState size = %d bytes, want %d bytes (v0.3.0 lock-free with atomic fields)", actualSize, expectedSize)
+		t.Errorf("VarState size = %d bytes, want %d bytes (with detector access lock)", actualSize, expectedSize)
 	}
 
-	t.Logf("VarState size: %d bytes (v0.3.0 Lock-Free with atomic hot-path fields)", actualSize)
+	t.Logf("VarState size: %d bytes (with detector access lock)", actualSize)
 }
 
 // TestVarStateNewZero verifies that NewVarState creates a zero-initialized state.
@@ -65,6 +135,170 @@ func TestVarStateNewZero(t *testing.T) {
 	t.Logf("NewVarState() correctly initialized: W=%s R=%s", vs.GetW(), vs.GetReadEpoch())
 }
 
+func TestPromotedReadersPreserveHighLogicalIDs(t *testing.T) {
+	vs := &VarState{}
+	vs.SetReadEpoch(epoch.NewEpoch(65536, 3))
+	vs.PromoteToReadClock(epoch.NewEpoch(1<<20+7, 5), nil)
+	defer vs.Demote()
+
+	seen := vectorclock.New()
+	seen.Set(65536, 3)
+	if got, conflict := vs.FirstConcurrentRead(seen); !conflict {
+		t.Fatal("high sparse reader was lost during promotion")
+	} else if tid, clock := got.Decode(); tid != 1<<20+7 || clock != 5 {
+		t.Fatalf("first concurrent read = %d@%d, want 5@%d", clock, tid, uint32(1<<20+7))
+	}
+	seen.Set(1<<20+7, 5)
+	if got, conflict := vs.FirstConcurrentRead(seen); conflict {
+		t.Fatalf("fully observed promoted readers still conflict: %v", got)
+	}
+}
+
+func TestPromotedReadClockContainsOnlySuppliedReadEvents(t *testing.T) {
+	vs := NewVarState()
+	vs.SetReadEpoch(epoch.NewEpoch(5, 100))
+	vs.PromoteToReadClock(epoch.NewEpoch(3, 50), nil)
+	defer vs.Demote()
+
+	readClock := vs.GetReadClock()
+	if got := readClock.Get(5); got != 100 {
+		t.Fatalf("first reader clock = %d, want 100", got)
+	}
+	if got := readClock.Get(3); got != 50 {
+		t.Fatalf("promoting reader clock = %d, want 50", got)
+	}
+	if got := readClock.Get(9); got != 0 {
+		t.Fatalf("unrecorded thread clock = %d, want 0", got)
+	}
+}
+
+func TestStalePromotedReadPreservesPostDemotionReader(t *testing.T) {
+	vs := NewVarState()
+	vs.PromoteToReadClock(epoch.NewEpoch(1, 10), nil)
+	vs.Demote()
+	vs.SetReadEpoch(epoch.NewEpoch(2, 20))
+
+	// Simulate a caller that observed promoted state before the demotion.
+	vs.JoinReadClock(epoch.NewEpoch(3, 30), nil)
+
+	reads := vs.GetReadEpochs()
+	if len(reads) != 2 || reads[0] != epoch.NewEpoch(2, 20) || reads[1] != epoch.NewEpoch(3, 30) {
+		t.Fatalf("stale promoted join preserved reads %v, want [20@2 30@3]", reads)
+	}
+}
+
+func TestPromotedReadClockPrunesLargeObservedFrontier(t *testing.T) {
+	vs := NewVarState()
+	vs.PromoteToReadClock(epoch.NewEpoch(1, 1), nil)
+	defer vs.Demote()
+
+	observed := vectorclock.New()
+	const readers = 2048
+	for tid := uint32(1); tid <= readers; tid++ {
+		read := epoch.NewEpoch(tid, 1)
+		if tid != 1 {
+			vs.JoinReadClock(read, nil)
+		}
+		observed.Set(tid, 1)
+	}
+	const phantomTID = uint32(1 << 20)
+	observed.Set(phantomTID, 7)
+
+	current := epoch.NewEpoch(readers+1, 1)
+	vs.JoinReadClock(current, observed)
+
+	readClock := vs.GetReadClock()
+	count := 0
+	readClock.Range(func(tid, clock uint32) bool {
+		count++
+		if tid != readers+1 || clock != 1 {
+			t.Errorf("retained promoted read = %d@%d, want 1@%d", clock, tid, readers+1)
+		}
+		return true
+	})
+	if count != 1 {
+		t.Fatalf("promoted frontier size = %d, want 1", count)
+	}
+	if got := readClock.Get(phantomTID); got != 0 {
+		t.Fatalf("causally observed non-reader clock = %d, want 0", got)
+	}
+}
+
+func TestPromotedReadSameTIDUpdateDoesNotPruneOtherReaders(t *testing.T) {
+	updates := map[string]func(*VarState, epoch.Epoch, *vectorclock.VectorClock){
+		"join":      (*VarState).JoinReadClock,
+		"promotion": (*VarState).PromoteToReadClock,
+	}
+	for name, update := range updates {
+		t.Run(name, func(t *testing.T) {
+			vs := NewVarState()
+			vs.PromoteToReadClock(epoch.NewEpoch(1, 10), nil)
+			defer vs.Demote()
+			vs.JoinReadClock(epoch.NewEpoch(2, 20), nil)
+
+			observed := vectorclock.New()
+			observed.Set(1, 11)
+			observed.Set(2, 20)
+			update(vs, epoch.NewEpoch(1, 11), observed)
+
+			readClock := vs.GetReadClock()
+			if got := readClock.Get(1); got != 11 {
+				t.Fatalf("same-TID reader clock = %d, want 11", got)
+			}
+			if got := readClock.Get(2); got != 20 {
+				t.Fatalf("dominated reader clock = %d, want retained clock 20", got)
+			}
+		})
+	}
+}
+
+func TestPromotedReadNewTIDStillPrunesObservedReaders(t *testing.T) {
+	updates := map[string]func(*VarState, epoch.Epoch, *vectorclock.VectorClock){
+		"join":      (*VarState).JoinReadClock,
+		"promotion": (*VarState).PromoteToReadClock,
+	}
+	for name, update := range updates {
+		t.Run(name, func(t *testing.T) {
+			vs := NewVarState()
+			vs.PromoteToReadClock(epoch.NewEpoch(1, 10), nil)
+			defer vs.Demote()
+			vs.JoinReadClock(epoch.NewEpoch(2, 20), nil)
+
+			observed := vectorclock.New()
+			observed.Set(1, 10)
+			observed.Set(2, 20)
+			update(vs, epoch.NewEpoch(3, 30), observed)
+
+			readClock := vs.GetReadClock()
+			if got := readClock.Get(1); got != 0 {
+				t.Fatalf("first dominated reader clock = %d, want pruned", got)
+			}
+			if got := readClock.Get(2); got != 0 {
+				t.Fatalf("second dominated reader clock = %d, want pruned", got)
+			}
+			if got := readClock.Get(3); got != 30 {
+				t.Fatalf("new-TID reader clock = %d, want 30", got)
+			}
+		})
+	}
+}
+
+func TestPromotedReadSameTIDUpdateDoesNotAllocate(t *testing.T) {
+	vs := NewVarState()
+	vs.PromoteToReadClock(epoch.NewEpoch(1, 10), nil)
+	defer vs.Demote()
+	vs.JoinReadClock(epoch.NewEpoch(2, 20), nil)
+
+	observed := vectorclock.New()
+	observed.Set(2, 20)
+	current := epoch.NewEpoch(1, 11)
+	if allocs := testing.AllocsPerRun(1000, func() {
+		vs.JoinReadClock(current, observed)
+	}); allocs != 0 {
+		t.Fatalf("same-TID promoted update allocated %.2f objects per call", allocs)
+	}
+}
+
 // TestVarStateReset verifies that Reset zeros both W and readEpoch fields.
 func TestVarStateReset(t *testing.T) {
 	vs := NewVarState()
@@ -98,9 +332,9 @@ func TestVarStateReset(t *testing.T) {
 func TestVarStateReadWrite(t *testing.T) {
 	tests := []struct {
 		name     string
-		wTID     uint16
+		wTID     uint32
 		wClock   uint32
-		rTID     uint16
+		rTID     uint32
 		rClock   uint32
 		wantWStr string // Expected W.String() format.
 		wantRStr string // Expected R.String() format.

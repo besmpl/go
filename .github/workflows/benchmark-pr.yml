@@ -5,149 +5,445 @@ on:
     branches: [pure-go-race]
     paths:
       - 'src/runtime/race/**'
-      - 'src/runtime/race_kolkov*.go'
+      - 'src/runtime/race*.go'
+      - 'src/runtime/race*.s'
+      - 'src/runtime/atomic_pointer*.go'
+      - 'src/runtime/proc.go'
+      - 'src/runtime/runtime2.go'
+      - 'src/runtime/time.go'
+      - 'src/internal/race/**'
+      - 'src/sync/atomic/race*.s'
+      - 'src/sync/atomic/type.go'
+      - 'src/sync/atomic/pointer_load*.go'
+      - 'src/cmd/compile/internal/base/flag.go'
+      - 'src/cmd/compile/internal/gc/main.go'
+      - 'src/cmd/compile/internal/inline/inl.go'
+      - 'src/cmd/compile/internal/ir/symtab.go'
+      - 'src/cmd/compile/internal/noder/import.go'
+      - 'src/cmd/compile/internal/ssa/config.go'
+      - 'src/cmd/compile/internal/ssa/rewrite.go'
+      - 'src/cmd/compile/internal/ssa/rewritegeneric.go'
+      - 'src/cmd/compile/internal/ssagen/intrinsics.go'
+      - 'src/cmd/compile/internal/ssagen/ssa.go'
+      - 'src/cmd/compile/internal/typecheck/_builtin/runtime.go'
+      - 'src/cmd/compile/internal/typecheck/builtin.go'
+      - 'src/cmd/compile/internal/types/type.go'
+      - 'src/cmd/compile/internal/walk/compare.go'
+      - 'src/cmd/compile/internal/walk/order.go'
+      - 'src/cmd/compile/internal/walk/select.go'
+      - 'src/cmd/internal/goobj/builtinlist.go'
+      - 'src/cmd/internal/objabi/pkgspecial.go'
+      - 'src/cmd/dist/test.go'
+      - 'src/cmd/go/internal/load/pkg.go'
+      - 'src/cmd/go/testdata/script/*race*'
+      - 'VERSION'
+      - 'go.env'
       - 'benchmarks/**'
+      - '.github/workflows/benchmark-pr.yml'
 
 permissions:
   contents: read
-  pull-requests: write
 
 jobs:
   benchmark:
-    name: Kolkov Benchmark Check
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    name: Base vs PR PureGo
     if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      # Same-host median tolerance: fail when PR BenchmarkRaceRead regresses by more than 5%.
+      PR_RACEREAD_MAX_RATIO: '1.05'
 
     steps:
-    - name: Checkout PR branch
-      uses: actions/checkout@v4
-      with:
-        ref: ${{ github.event.pull_request.head.sha }}
-        path: pr
+      - name: Checkout PR revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          persist-credentials: false
 
-    - name: Checkout base branch
-      uses: actions/checkout@v4
-      with:
-        ref: ${{ github.event.pull_request.base.sha }}
-        path: base
+      - name: Checkout base revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.26'
-        cache: false
+      - name: Initialize evidence status
+        run: echo RUNNING > pr-benchmark-status.txt
 
-    - name: Install benchstat
-      run: go install golang.org/x/perf/cmd/benchstat@latest
+      - name: Set up pinned bootstrap Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.0'
+          cache: false
 
-    - name: Build base toolchain
-      working-directory: base
-      run: cd src && GOROOT_BOOTSTRAP=$(go env GOROOT) ./make.bash
-      env:
-        CGO_ENABLED: 0
+      - name: Test benchmark evidence validation
+        run: bash pr/benchmarks/scripts/test_run_comparison.sh
 
-    - name: Build PR toolchain
-      working-directory: pr
-      run: cd src && GOROOT_BOOTSTRAP=$(go env GOROOT) ./make.bash
-      env:
-        CGO_ENABLED: 0
+      - name: Install pinned benchstat
+        run: |
+          go install golang.org/x/perf/cmd/benchstat@v0.0.0-20260709024250-82a0b07e230d
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-    - name: Run base benchmarks (Kolkov only)
-      working-directory: base/benchmarks
-      run: |
-        CGO_ENABLED=0 ../bin/go test -race \
-          -bench=. -benchmem -count=6 -benchtime=1s -timeout=15m \
-          > ../../base_raw.txt 2>&1 || true
-        grep "ns/op\|^goos:\|^goarch:\|^pkg:\|^cpu:\|^ok \|^PASS" \
-          ../../base_raw.txt > ../../base-kolkov.txt || true
-        echo "Base: $(grep -c 'ns/op' ../../base-kolkov.txt) results"
+      - name: Build base toolchain
+        run: |
+          SOURCE_ROOT_OVERRIDE="$GITHUB_WORKSPACE/base" \
+            GOROOT_BOOTSTRAP="$(go env GOROOT)" \
+            bash pr/benchmarks/run_comparison.sh --build-toolchain base/bin/go
 
-    - name: Run PR benchmarks (Kolkov only)
-      working-directory: pr/benchmarks
-      run: |
-        CGO_ENABLED=0 ../bin/go test -race \
-          -bench=. -benchmem -count=6 -benchtime=1s -timeout=15m \
-          > ../../pr_raw.txt 2>&1 || true
-        grep "ns/op\|^goos:\|^goarch:\|^pkg:\|^cpu:\|^ok \|^PASS" \
-          ../../pr_raw.txt > ../../pr-kolkov.txt || true
-        echo "PR: $(grep -c 'ns/op' ../../pr-kolkov.txt) results"
+      - name: Build PR toolchain
+        run: |
+          GOROOT_BOOTSTRAP="$(go env GOROOT)" \
+            bash pr/benchmarks/run_comparison.sh --build-toolchain pr/bin/go
 
-    - name: Compare with benchstat
-      id: compare
-      run: |
-        benchstat base-kolkov.txt pr-kolkov.txt > comparison.txt 2>&1 || true
+      - name: Verify exact revisions and pure-Go backends
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          verify_toolchain() {
+            local label="$1" checkout="$2" expected_sha="$3"
+            local go_bin="${checkout}/bin/go" expected_goroot actual_goroot actual_sha backend
+            SOURCE_ROOT_OVERRIDE="$GITHUB_WORKSPACE/${checkout}" \
+              bash pr/benchmarks/run_comparison.sh --validate-toolchain-build "${checkout}/bin/go"
+            expected_goroot="$(cd "${checkout}" && pwd -P)"
+            actual_goroot="$(CGO_ENABLED=0 "${go_bin}" env GOROOT)"
+            actual_goroot="$(cd "${actual_goroot}" && pwd -P)"
+            actual_sha="$(git -C "${checkout}" rev-parse --verify HEAD)"
+            backend="$(CGO_ENABLED=0 "${go_bin}" list -race -f 'GoFiles={{join .GoFiles ","}} CgoFiles={{join .CgoFiles ","}} SysoFiles={{join .SysoFiles ","}}' runtime/race)"
 
-        # Build PR comment
-        {
-          echo "## Benchmark Comparison (Kolkov)"
-          echo ""
-          echo "Comparing \`${{ github.event.pull_request.base.ref }}\` -> PR #${{ github.event.pull_request.number }} (\`${{ github.event.pull_request.head.ref }}\`)"
-          echo ""
-        } > comment.md
+            [[ "${actual_goroot}" == "${expected_goroot}" ]] || {
+              echo "${label}: GOROOT ${actual_goroot}; want ${expected_goroot}" >&2
+              return 1
+            }
+            [[ "${actual_sha}" == "${expected_sha}" ]] || {
+              echo "${label}: revision ${actual_sha}; want ${expected_sha}" >&2
+              return 1
+            }
+            [[ "${backend}" == *race_kolkov_import.go* ]] || {
+              echo "${label}: Kolkov source not selected: ${backend}" >&2
+              return 1
+            }
+            [[ "${backend}" == *'CgoFiles= SysoFiles=' ]] || {
+              echo "${label}: cgo or TSAN objects selected: ${backend}" >&2
+              return 1
+            }
+            printf '%s revision=%s backend=%s\n' "${label}" "${actual_sha}" "${backend}"
+          }
 
-        # Extract geomean
-        GEOMEAN=$(grep -E "^geomean" comparison.txt | head -1 || echo "")
-        if [ -n "$GEOMEAN" ]; then
-          echo "**Geomean:** \`$GEOMEAN\`" >> comment.md
-          echo "" >> comment.md
-        fi
+          verify_toolchain BASE base "$BASE_SHA"
+          verify_toolchain PR pr "$PR_SHA"
 
-        # Check for improvements
-        IMPROVEMENTS=$(grep -E "\-[0-9]+\.[0-9]+%" comparison.txt | grep -v "~" | head -10 || echo "")
-        if [ -n "$IMPROVEMENTS" ]; then
-          echo "**Improvements:**" >> comment.md
-          echo '```' >> comment.md
-          echo "$IMPROVEMENTS" >> comment.md
-          echo '```' >> comment.md
-          echo "" >> comment.md
-        fi
+      - name: Build exact pure-Go benchmark binaries
+        run: |
+          SOURCE_ROOT_OVERRIDE="$GITHUB_WORKSPACE/base" bash pr/benchmarks/run_comparison.sh --validate-toolchain-build base/bin/go
+          bash pr/benchmarks/run_comparison.sh --validate-toolchain-build pr/bin/go
+          shared_benchmark_revision="$(git -C pr rev-parse --verify HEAD)"
+          shared_benchmark_source_hash="$(git -C pr hash-object -- benchmarks/race_bench_test.go)"
+          shared_benchmark_module_hash="$(git -C pr hash-object -- benchmarks/go.mod)"
+          [[ "${shared_benchmark_revision}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${shared_benchmark_source_hash}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${shared_benchmark_module_hash}" =~ ^[0-9a-f]{40}$ ]]
+          (cd pr/benchmarks && CGO_ENABLED=0 "$GITHUB_WORKSPACE/base/bin/go" test -c -race -o "$GITHUB_WORKSPACE/base-purego.test" .)
+          (cd pr/benchmarks && CGO_ENABLED=0 "$GITHUB_WORKSPACE/pr/bin/go" test -c -race -o "$GITHUB_WORKSPACE/pr-purego.test" .)
+          [[ "$(git -C pr hash-object -- benchmarks/race_bench_test.go)" == "${shared_benchmark_source_hash}" ]]
+          [[ "$(git -C pr hash-object -- benchmarks/go.mod)" == "${shared_benchmark_module_hash}" ]]
+          [[ -x "$GITHUB_WORKSPACE/base-purego.test" ]]
+          [[ -x "$GITHUB_WORKSPACE/pr-purego.test" ]]
+          SOURCE_ROOT_OVERRIDE="$GITHUB_WORKSPACE/base" bash pr/benchmarks/run_comparison.sh --validate-toolchain-build base/bin/go
+          bash pr/benchmarks/run_comparison.sh --validate-toolchain-build pr/bin/go
+          base_id="$(base/bin/go tool buildid "$GITHUB_WORKSPACE/base-purego.test")"
+          pr_id="$(pr/bin/go tool buildid "$GITHUB_WORKSPACE/pr-purego.test")"
+          [[ -n "${base_id}" && -n "${pr_id}" ]]
+          base_hash="$(git hash-object "$GITHUB_WORKSPACE/base-purego.test")"
+          pr_hash="$(git hash-object "$GITHUB_WORKSPACE/pr-purego.test")"
+          [[ "${base_hash}" =~ ^[0-9a-f]{40}$ && "${pr_hash}" =~ ^[0-9a-f]{40}$ ]]
+          base_nm="$(mktemp)"
+          pr_nm="$(mktemp)"
+          trap 'rm -f "${base_nm}" "${pr_nm}"' EXIT
+          base/bin/go tool nm "$GITHUB_WORKSPACE/base-purego.test" > "${base_nm}"
+          pr/bin/go tool nm "$GITHUB_WORKSPACE/pr-purego.test" > "${pr_nm}"
+          if grep -Eq '__tsan|runtime/cgo' "${base_nm}"; then
+            echo 'BASE PureGo binary unexpectedly contains TSAN or runtime/cgo symbols' >&2
+            exit 1
+          fi
+          if grep -Eq '__tsan|runtime/cgo' "${pr_nm}"; then
+            echo 'PR PureGo binary unexpectedly contains TSAN or runtime/cgo symbols' >&2
+            exit 1
+          fi
+          printf 'base_binary_hash=%s\npr_binary_hash=%s\n' "${base_hash}" "${pr_hash}" > "$GITHUB_WORKSPACE/pr-binary-hashes.env"
+          {
+            printf 'Shared benchmark workload: PR revision=%s race_bench_test.go=%s go.mod=%s\n' \
+              "${shared_benchmark_revision}" "${shared_benchmark_source_hash}" "${shared_benchmark_module_hash}"
+            echo 'BASE source/bin/native-tool attestation:'
+            cat "$GITHUB_WORKSPACE/base/bin/go.benchmark-attestation"
+            printf 'BASE exact benchmark binary: buildid=%s hash=%s\n' "${base_id}" "${base_hash}"
+            echo 'BASE PureGo symbol check: no __tsan or runtime/cgo symbols'
+            echo 'PR source/bin/native-tool attestation:'
+            cat "$GITHUB_WORKSPACE/pr/bin/go.benchmark-attestation"
+            printf 'PR exact benchmark binary: buildid=%s hash=%s\n' "${pr_id}" "${pr_hash}"
+            echo 'PR PureGo symbol check: no __tsan or runtime/cgo symbols'
+          } > "$GITHUB_WORKSPACE/pr-binary-manifest.txt"
+          rm -f "${base_nm}" "${pr_nm}"
+          trap - EXIT
 
-        # Check for regressions
-        REGRESSIONS=$(grep -E "\+[0-9]+\.[0-9]+%" comparison.txt | grep -v "~" | head -10 || echo "")
-        if [ -n "$REGRESSIONS" ]; then
-          echo "**Potential regressions:**" >> comment.md
-          echo '```' >> comment.md
-          echo "$REGRESSIONS" >> comment.md
-          echo '```' >> comment.md
-        else
-          echo "No significant regressions detected." >> comment.md
-        fi
+      - name: Run paired alternating samples
+        run: |
+          source pr-binary-hashes.env
+          SOURCE_ROOT_OVERRIDE="$GITHUB_WORKSPACE/base" bash pr/benchmarks/run_comparison.sh --validate-toolchain-build base/bin/go
+          bash pr/benchmarks/run_comparison.sh --validate-toolchain-build pr/bin/go
+          BENCH_GOMAXPROCS="$(nproc)"
+          [[ "${BENCH_GOMAXPROCS}" =~ ^[1-9][0-9]*$ ]]
+          cpu_model="$(awk -F: '/^model name[[:space:]]*:/ { sub(/^[[:space:]]*/, "", $2); print $2; exit }' /proc/cpuinfo)"
+          {
+            printf 'CPU: %s\n' "${cpu_model:-$(uname -m)}"
+            printf 'Logical CPUs: %s\n' "${BENCH_GOMAXPROCS}"
+            printf 'GOMAXPROCS: %s (explicit for both binaries)\n' "${BENCH_GOMAXPROCS}"
+          } > pr-environment.txt
+          mkdir -p raw/base raw/pr
+          : > base-purego.txt
+          : > pr-purego.txt
+          : > sample-order.txt
 
-        {
-          echo ""
-          echo "<details><summary>Full benchstat output</summary>"
-          echo ""
-          echo '```'
-          grep -v "parsing iteration count" comparison.txt || cat comparison.txt
-          echo '```'
-          echo "</details>"
-          echo ""
-          echo "> CI runners have ~10-20% variance. Run \`bash benchmarks/run_comparison.sh\` locally for accurate results."
-        } >> comment.md
+          validate_sample() {
+            local label="$1" input="$2" manifest="$3"
+            [[ -s "${input}" ]] || { echo "${label}: empty output" >&2; return 1; }
+            if grep -Eq '^FAIL([[:space:]]|$)|^--- FAIL:|WARNING: DATA RACE|fatal error:|runtime: fatal' "${input}"; then
+              cat "${input}" >&2
+              echo "${label}: failure, race, or runtime fatal" >&2
+              return 1
+            fi
+            grep -q '^PASS$' "${input}" || { echo "${label}: missing PASS" >&2; return 1; }
+            local unsorted="${manifest}.unsorted"
+            if ! awk '
+              function positive_decimal(value) {
+                return value ~ /^[0-9]+([.][0-9]+)?$/ && (value + 0) > 0
+              }
+              /^Benchmark/ {
+                timed=0
+                for (i=2; i<=NF; i++) {
+                  if ($i=="ns/op" || $i=="us/op" || $i=="µs/op" || $i=="ms/op" || $i=="s/op") {
+                    timed++
+                    if (i==2 || !positive_decimal($(i-1))) {
+                      print "invalid benchmark metric: " $0 > "/dev/stderr"
+                      bad=1
+                    }
+                  }
+                }
+                if (timed != 1) { print "invalid benchmark line: " $0 > "/dev/stderr"; bad=1; next }
+                samples[$1]++; total++
+              }
+              END {
+                if (!total) exit 1
+                for (name in samples) {
+                  if (samples[name] != 1) bad=1
+                  print name "\t" samples[name]
+                }
+                if (bad) exit 1
+              }
+            ' "${input}" > "${unsorted}"; then
+              rm -f "${unsorted}" "${manifest}"
+              return 1
+            fi
+            if ! LC_ALL=C sort "${unsorted}" > "${manifest}"; then
+              rm -f "${unsorted}" "${manifest}"
+              return 1
+            fi
+            rm -f "${unsorted}"
+            [[ -s "${manifest}" ]] || { rm -f "${manifest}"; return 1; }
+          }
 
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: benchmark-pr-${{ github.event.pull_request.number }}
-        path: |
-          base-kolkov.txt
-          pr-kolkov.txt
-          comparison.txt
-        retention-days: 30
+          run_sample() {
+            local label="$1" binary="$2" expected_hash="$3" sample="$4" output actual_hash
+            output="raw/${label}/${sample}.txt"
+            actual_hash="$(git hash-object "${binary}")"
+            [[ "${actual_hash}" == "${expected_hash}" ]] || { echo "${label}: benchmark binary changed before sample ${sample}" >&2; return 1; }
+            printf '%s %s\n' "${sample}" "${label}" >> sample-order.txt
+            if ! GOMAXPROCS="${BENCH_GOMAXPROCS}" "${binary}" -test.run='^$' -test.bench='.' -test.benchmem -test.benchtime=1s -test.count=1 -test.timeout=10m > "${output}" 2>&1; then
+              cat "${output}" >&2
+              return 1
+            fi
+            validate_sample "${label} ${sample}" "${output}" "${output}.samples"
+            actual_hash="$(git hash-object "${binary}")"
+            [[ "${actual_hash}" == "${expected_hash}" ]] || { echo "${label}: benchmark binary changed during sample ${sample}" >&2; return 1; }
+            cat "${output}" >> "${label}-purego.txt"
+          }
 
-    - name: Find existing comment
-      uses: peter-evans/find-comment@v3
-      id: fc
-      with:
-        issue-number: ${{ github.event.pull_request.number }}
-        comment-author: 'github-actions[bot]'
-        body-includes: '## Benchmark Comparison (Kolkov)'
+          for sample in $(seq 1 10); do
+            sample_name="$(printf '%03d' "${sample}")"
+            if (( sample % 2 == 1 )); then
+              run_sample base "$GITHUB_WORKSPACE/base-purego.test" "$base_binary_hash" "${sample_name}"
+              run_sample pr "$GITHUB_WORKSPACE/pr-purego.test" "$pr_binary_hash" "${sample_name}"
+            else
+              run_sample pr "$GITHUB_WORKSPACE/pr-purego.test" "$pr_binary_hash" "${sample_name}"
+              run_sample base "$GITHUB_WORKSPACE/base-purego.test" "$base_binary_hash" "${sample_name}"
+            fi
+          done
+          SOURCE_ROOT_OVERRIDE="$GITHUB_WORKSPACE/base" bash pr/benchmarks/run_comparison.sh --validate-toolchain-build base/bin/go
+          bash pr/benchmarks/run_comparison.sh --validate-toolchain-build pr/bin/go
+          [[ "$(git hash-object base-purego.test)" == "$base_binary_hash" ]]
+          [[ "$(git hash-object pr-purego.test)" == "$pr_binary_hash" ]]
 
-    - name: Post PR comment
-      uses: peter-evans/create-or-update-comment@v4
-      with:
-        comment-id: ${{ steps.fc.outputs.comment-id }}
-        issue-number: ${{ github.event.pull_request.number }}
-        body-path: comment.md
-        edit-mode: replace
+      - name: Validate and compare evidence
+        run: |
+          source pr-binary-hashes.env
+          SOURCE_ROOT_OVERRIDE="$GITHUB_WORKSPACE/base" bash pr/benchmarks/run_comparison.sh --validate-toolchain-build base/bin/go
+          bash pr/benchmarks/run_comparison.sh --validate-toolchain-build pr/bin/go
+          [[ "$(git hash-object base-purego.test)" == "$base_binary_hash" ]]
+          [[ "$(git hash-object pr-purego.test)" == "$pr_binary_hash" ]]
+          manifest() {
+            local input="$1" output="$2" unsorted
+            unsorted="${output}.unsorted"
+            if ! awk '
+              function positive_decimal(value) {
+                return value ~ /^[0-9]+([.][0-9]+)?$/ && (value + 0) > 0
+              }
+              /^Benchmark/ {
+                timed=0
+                for (i=2; i<=NF; i++) {
+                  if ($i=="ns/op" || $i=="us/op" || $i=="µs/op" || $i=="ms/op" || $i=="s/op") {
+                    timed++
+                    if (i==2 || !positive_decimal($(i-1))) bad=1
+                  }
+                }
+                if (timed != 1) bad=1
+                samples[$1]++
+                total++
+              }
+              END {
+                if (!total) exit 1
+                for (name in samples) {
+                  if (samples[name] != 10) bad=1
+                  print name "\t" samples[name]
+                }
+                if (bad) exit 1
+              }
+            ' "${input}" > "${unsorted}"; then
+              rm -f "${unsorted}" "${output}"
+              return 1
+            fi
+            if ! LC_ALL=C sort "${unsorted}" > "${output}"; then
+              rm -f "${unsorted}" "${output}"
+              return 1
+            fi
+            rm -f "${unsorted}"
+            [[ -s "${output}" ]] || { rm -f "${output}"; return 1; }
+          }
+          manifest base-purego.txt base.samples
+          manifest pr-purego.txt pr.samples
+          if ! cmp -s base.samples pr.samples; then
+            echo 'Base and PR benchmark manifests differ:' >&2
+            echo '--- BASE' >&2; cat base.samples >&2
+            echo '--- PR' >&2; cat pr.samples >&2
+            exit 1
+          fi
+
+          extract_raceread() {
+            awk '
+              function positive_decimal(value) {
+                return value ~ /^[0-9]+([.][0-9]+)?$/ && (value + 0) > 0
+              }
+              /^BenchmarkRaceRead(-[0-9]+)?[[:space:]]/ {
+                for (i=2; i<=NF; i++) if ($i=="ns/op") {
+                  if (!positive_decimal($(i-1))) bad=1
+                  print $(i-1); found++
+                }
+              }
+              END { if (bad || found != 10) exit 1 }
+            ' "$1"
+          }
+          median() {
+            awk '
+              function positive_decimal(value) {
+                return value ~ /^[0-9]+([.][0-9]+)?$/ && (value + 0) > 0
+              }
+              NF != 1 || !positive_decimal($1) { bad=1 }
+              NR==5 { left=$1 }
+              NR==6 { right=$1 }
+              END { if (bad || NR!=10 || left=="" || right=="") exit 1; printf "%.17g", (left+right)/2 }
+            '
+          }
+          extract_raceread base-purego.txt > base-raceread.txt
+          extract_raceread pr-purego.txt > pr-raceread.txt
+          LC_ALL=C sort -n base-raceread.txt > base-raceread.sorted.txt
+          LC_ALL=C sort -n pr-raceread.txt > pr-raceread.sorted.txt
+          base_median="$(median < base-raceread.sorted.txt)"
+          pr_median="$(median < pr-raceread.sorted.txt)"
+          ratio_raw="$(awk -v pr="${pr_median}" -v base="${base_median}" 'BEGIN { if (base<=0) exit 1; printf "%.17g", pr/base }')"
+          [[ "${ratio_raw}" =~ ^[0-9]+([.][0-9]+)?$ ]]
+          awk -v ratio="${ratio_raw}" 'BEGIN { exit !(ratio > 0) }'
+          ratio_display="$(awk -v ratio="${ratio_raw}" 'BEGIN { printf "%.6f", ratio }')"
+          [[ "$PR_RACEREAD_MAX_RATIO" =~ ^[0-9]+([.][0-9]+)?$ ]]
+          awk -v maximum="$PR_RACEREAD_MAX_RATIO" 'BEGIN { exit !(maximum >= 1) }'
+          {
+            printf 'BenchmarkRaceRead BASE median ns/op: %s\n' "${base_median}"
+            printf 'BenchmarkRaceRead PR median ns/op: %s\n' "${pr_median}"
+            printf 'PR/BASE ratio: %s\n' "${ratio_display}"
+            printf 'PR/BASE ratio (raw gate value): %s\n' "${ratio_raw}"
+            printf 'Regression gate: <=%s (5%% same-host median tolerance)\n' "$PR_RACEREAD_MAX_RATIO"
+          } > pr-raceread-ratio.txt
+          awk -v ratio="${ratio_raw}" -v maximum="$PR_RACEREAD_MAX_RATIO" 'BEGIN { exit !(ratio <= maximum) }' || {
+            cat pr-raceread-ratio.txt >&2
+            echo 'BenchmarkRaceRead regression gate exceeded' >&2
+            exit 1
+          }
+
+          benchstat base=base-purego.txt pr=pr-purego.txt > comparison.txt
+          grep -Eq '^[[:space:]]*(Benchmark)?RaceRead(-[0-9]+)?[[:space:]]' comparison.txt
+          {
+            echo '## Benchmark Comparison (PureGo)'
+            echo
+            echo 'One shared PR benchmark workload compiled by the respective attested base/PR fork toolchains, 10 paired samples at 1s with alternating order.'
+            echo
+            echo '```'
+            cat pr-raceread-ratio.txt
+            echo '```'
+            echo
+            echo '<details><summary>Full benchstat output</summary>'
+            echo
+            echo '```'
+            cat comparison.txt
+            echo '```'
+            echo '</details>'
+          } > comment.md
+          echo PASS > pr-benchmark-status.txt
+
+      - name: Publish validated comparison summary
+        run: |
+          [[ "$(cat pr-benchmark-status.txt)" == PASS ]]
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Mark incomplete evidence failed
+        if: failure()
+        run: echo FAIL > pr-benchmark-status.txt
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: benchmark-pr-${{ github.event.pull_request.number }}
+          path: |
+            pr-benchmark-status.txt
+            pr-environment.txt
+            pr-binary-manifest.txt
+            pr-binary-hashes.env
+            raw/**
+            base-purego.txt
+            pr-purego.txt
+            base.samples
+            pr.samples
+            base-raceread.sorted.txt
+            pr-raceread.sorted.txt
+            pr-raceread-ratio.txt
+            sample-order.txt
+            comparison.txt
+            comment.md
+            base/bin/go.benchmark-attestation
+            pr/bin/go.benchmark-attestation
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Remove benchmark binaries
+        if: always()
+        run: rm -f base-purego.test pr-purego.test

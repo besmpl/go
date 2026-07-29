@@ -35,42 +35,78 @@ func printRaceLineAddr(prefix string, addr uintptr) {
 	printstring("\n")
 }
 
-// spinlock for mutex replacement.
+//go:linkname runtimeKolkovSpinWait runtime.kolkovSpinWait
+func runtimeKolkovSpinWait(cycles uint32, yield bool)
+
+const detectorSpinlockMaxBackoff = uint32(64)
+
+// spinlock is the runtime-compatible detector lock. Failed acquisition polls
+// before CAS and uses bounded runtime backoff to avoid invalidating the owner’s
+// cache line continuously. runtimeKolkovSpinWait never enters the scheduler on
+// g0 and may yield a test/direct caller only at the saturated delay.
 type spinlock struct {
 	state atomic.Uint32
 }
 
+//go:nosplit
 func (s *spinlock) lock() {
-	for !s.state.CompareAndSwap(0, 1) {
-		// Spin
+	for delay := uint32(1); ; {
+		if s.state.Load() == 0 && s.state.CompareAndSwap(0, 1) {
+			return
+		}
+		runtimeKolkovSpinWait(delay, delay == detectorSpinlockMaxBackoff)
+		if delay < detectorSpinlockMaxBackoff {
+			delay <<= 1
+		}
 	}
 }
 
+//go:nosplit
 func (s *spinlock) unlock() {
 	s.state.Store(0)
 }
 
-// Simple sync.Map replacement for reportedRaces using CAS-based fixed-size array.
-type reportedRacesMap struct {
-	keys   [1024]atomic.Uint64
-	values [1024]atomic.Uint32
+type reportedRaceKey struct {
+	raceType  string
+	addr      uintptr
+	firstTID  uint32
+	secondTID uint32
+	firstPC   uintptr
+	secondPC  uintptr
+	lifecycle uint64
 }
 
-func (m *reportedRacesMap) loadOrStore(key uint64) (loaded bool) {
-	idx := key & 1023
+type reportedRaceEntry struct {
+	hash uint64
+	key  reportedRaceKey
+}
+
+// reportedRacesMap is a bounded, allocation-on-report deduplication set. Slots
+// retain the full key rather than only its hash, so a hash collision can cause
+// a duplicate report on probe overflow but can never suppress a distinct race.
+type reportedRacesMap struct {
+	entries [1024]atomic.Pointer[reportedRaceEntry]
+}
+
+func (m *reportedRacesMap) loadOrStore(hash uint64, key reportedRaceKey) (loaded bool) {
+	idx := hash & 1023
+	var candidate *reportedRaceEntry
 	for i := uint64(0); i < 8; i++ {
 		slot := (idx + i) & 1023
-		existing := m.keys[slot].Load()
-		if existing == key {
+		existing := m.entries[slot].Load()
+		if existing != nil && existing.hash == hash && existing.key == key {
 			return true // Already exists
 		}
-		if existing == 0 {
-			if m.keys[slot].CompareAndSwap(0, key) {
-				m.values[slot].Store(1)
+		if existing == nil {
+			if candidate == nil {
+				candidate = &reportedRaceEntry{hash: hash, key: key}
+			}
+			if m.entries[slot].CompareAndSwap(nil, candidate) {
 				return false // Newly stored
 			}
 			// CAS failed, check again
-			if m.keys[slot].Load() == key {
+			existing = m.entries[slot].Load()
+			if existing != nil && existing.hash == hash && existing.key == key {
 				return true
 			}
 		}
@@ -79,15 +115,12 @@ func (m *reportedRacesMap) loadOrStore(key uint64) (loaded bool) {
 }
 
 func (m *reportedRacesMap) reset() {
-	for i := range m.keys {
-		m.keys[i].Store(0)
-		m.values[i].Store(0)
+	for i := range m.entries {
+		m.entries[i].Store(nil)
 	}
 }
 
-var _ = unsafe.Sizeof(0) // Keep unsafe import used
-
-// DetectorOptions configures the race detector behavior (v0.3.0).
+// DetectorOptions configures the race detector behavior.
 //
 // Use NewDetectorWithOptions() to create a detector with custom options.
 // For default behavior, use NewDetector() which is equivalent to:
@@ -99,13 +132,13 @@ var _ = unsafe.Sizeof(0) // Keep unsafe import used
 //	// Default: Full detection (no sampling)
 //	d := NewDetector()
 //
-//	// With sampling: Check 1 in 10 accesses (~50% overhead reduction)
+//	// With sampling: check 1 in 10 accesses.
 //	d := NewDetectorWithOptions(DetectorOptions{
 //	    SamplingEnabled: true,
 //	    SampleRate:      10,
 //	})
 //
-//	// High sampling: Check 1 in 100 accesses (~70% overhead reduction)
+//	// Higher sampling: check 1 in 100 accesses.
 //	d := NewDetectorWithOptions(DetectorOptions{
 //	    SamplingEnabled: true,
 //	    SampleRate:      100,
@@ -113,50 +146,60 @@ var _ = unsafe.Sizeof(0) // Keep unsafe import used
 //
 //nolint:revive // DetectorOptions is more descriptive than Options for public API.
 type DetectorOptions struct {
-	// SamplingEnabled enables probabilistic sampling for performance (v0.3.0 P0).
-	// When enabled, only a fraction of memory accesses are checked.
-	// This trades detection rate for performance, suitable for CI/CD.
-	// Default: false (100% detection, backward compatible).
+	// SamplingEnabled enables probabilistic sampling. When enabled, only a
+	// fraction of memory accesses are checked, so races may be missed.
+	// The default is false.
 	SamplingEnabled bool
 
 	// SampleRate determines the sampling frequency when SamplingEnabled is true.
 	// - Rate=1: Check every access (no sampling, same as disabled)
-	// - Rate=10: Check 1 in 10 accesses (~50% overhead reduction)
-	// - Rate=100: Check 1 in 100 accesses (~70% overhead reduction)
-	// - Rate=1000: Check 1 in 1000 accesses (~90% overhead reduction)
+	// - Rate=10: Check 1 in 10 accesses
+	// - Rate=100: Check 1 in 100 accesses
+	// - Rate=1000: Check 1 in 1000 accesses
 	// Default: 1 (no sampling).
 	SampleRate uint64
 }
-
 
 // Detector implements the core FastTrack race detection algorithm.
 //
 // It maintains global state including shadow memory (tracking access history
 // for all memory locations) and goroutine contexts (tracking logical time
 // for each thread).
-//
-// Phase 3 adds adaptive VarState representation with promotion tracking.
-// Phase 4 adds synchronization primitive tracking (mutex, rwmutex, channels).
-// Phase 5 adds race deduplication to prevent duplicate reports.
-// v0.3.0 adds sampling-based detection for performance optimization.
 type Detector struct {
 	// shadowMemory stores VarState cells for all instrumented addresses.
 	// This is the core data structure that tracks the last write and read
 	// epochs for every memory location.
 	// Uses Shadow interface to allow swapping implementations.
-	// Default: PageTableShadow (two-level page table, direct-mapped).
-	// Fallback: CASBasedShadow (hash-based, lock-free).
+	// Default: PageTableShadow (direct primary pages plus sparse absolute
+	// blocks outside the primary window).
 	shadowMemory shadowmem.Shadow
+
+	// slotMemory is the concrete word-slot view used to isolate exact lanes
+	// before mutation and to traverse copy-on-write range groups.
+	slotMemory shadowmem.SlotShadow
+
+	// rangeMemory traverses bulk-equivalent ordinary histories without
+	// materializing one slot and state per application word. Keep the concrete
+	// type so escape analysis can prove that range visitors do not escape.
+	rangeMemory *shadowmem.PageTableShadow
 
 	// syncShadow stores SyncVar cells for all synchronization primitives.
 	// This tracks release clocks for mutexes, rwmutexes, channels, etc.
-	// Added in Phase 4 Task 4.1.
 	syncShadow *syncshadow.SyncShadow
 
-	// sampler implements probabilistic sampling for performance (v0.3.0 P0).
+	// sampler implements probabilistic sampling.
 	// When enabled, only a fraction of memory accesses are checked.
-	// This is nil when sampling is disabled for zero overhead.
+	// It is nil when sampling is disabled.
 	sampler *Sampler
+
+	// reportObserver is an optional deterministic test seam. Production leaves
+	// it nil and continues to emit reports through runtime.print*.
+	reportObserver func(*RaceReport)
+
+	// goroutineCreations retains creation sites for live logical goroutines and
+	// a bounded tail of finished ones. It is touched only by lifecycle/reporting
+	// paths, never ordinary memory accesses.
+	goroutineCreations goroutineCreationRegistry
 
 	// racesDetected counts the total number of races found.
 	// This is used for testing and reporting purposes.
@@ -164,12 +207,9 @@ type Detector struct {
 
 	// reportedRaces tracks which races have already been reported.
 	// This prevents duplicate reports for the same race location.
-	// Added in Phase 5 Task 5.3.
 	reportedRaces reportedRacesMap
 
-	// operationCount tracks total operations for periodic overflow checks (v0.2.0 Task 5).
-	// Incremented on every OnWrite/OnRead call. When it reaches overflowCheckInterval,
-	// we check for TID/clock overflows and report warnings if needed.
+	// operationCount tracks synchronization events for periodic overflow checks.
 	operationCount atomic.Uint64
 
 	// mu protects racesDetected counter and stats updates.
@@ -177,8 +217,8 @@ type Detector struct {
 }
 
 const (
-	// overflowCheckInterval defines how often to check for TID/clock overflows.
-	// Checking every 10,000 operations provides early warning with minimal overhead (<0.1%).
+	// overflowCheckInterval defines how often synchronization events check for
+	// TID or clock overflow.
 	overflowCheckInterval = 10000
 )
 
@@ -187,7 +227,7 @@ const (
 // The detector is ready to use immediately after creation.
 // It initializes:
 //   - Shadow memory for tracking variable access history
-//   - Sync shadow memory for tracking synchronization primitives (Phase 4)
+//   - Sync shadow memory for tracking synchronization primitives
 //
 // This is equivalent to NewDetectorWithOptions(DetectorOptions{}).
 // For custom configuration (e.g., sampling), use NewDetectorWithOptions.
@@ -196,16 +236,15 @@ const (
 //
 //	d := NewDetector()
 //	ctx := goroutine.Alloc(1)
-//	d.OnWrite(0x1234, ctx)  // Detect write to address
+//	d.OnWrite(0x1234, ctx, 0)  // Detect write to address
 //	d.OnAcquire(0x5678, ctx)  // Track mutex lock
 func NewDetector() *Detector {
 	return NewDetectorWithOptions(DetectorOptions{})
 }
 
-// NewDetectorWithOptions creates a race detector with custom configuration (v0.3.0).
+// NewDetectorWithOptions creates a race detector with custom configuration.
 //
-// This allows enabling performance optimizations like sampling that trade off
-// detection rate for reduced overhead, making race detection practical for CI/CD.
+// Sampling trades detection completeness for lower instrumentation work.
 //
 // Options:
 //   - SamplingEnabled: Enable probabilistic sampling
@@ -216,25 +255,27 @@ func NewDetector() *Detector {
 //	// Production: Full detection (default)
 //	d := NewDetectorWithOptions(DetectorOptions{})
 //
-//	// CI/CD: 50% overhead reduction with 90%+ detection
+//	// Check one in ten accesses.
 //	d := NewDetectorWithOptions(DetectorOptions{
 //	    SamplingEnabled: true,
 //	    SampleRate:      10,
 //	})
 //
-//	// Smoke tests: 70% overhead reduction with 70%+ detection
+//	// Check one in one hundred accesses.
 //	d := NewDetectorWithOptions(DetectorOptions{
 //	    SamplingEnabled: true,
 //	    SampleRate:      100,
 //	})
 func NewDetectorWithOptions(opts DetectorOptions) *Detector {
+	shadow := shadowmem.NewPageTableShadow()
 	d := &Detector{
-		shadowMemory: shadowmem.DefaultShadow(),
+		shadowMemory: shadow,
+		slotMemory:   shadow,
+		rangeMemory:  shadow,
 		syncShadow:   syncshadow.NewSyncShadow(),
 	}
 
-	// Initialize sampler only if sampling is enabled (v0.3.0 P0).
-	// When nil, ShouldSample check is skipped entirely (zero overhead).
+	// Keep the sampler nil when sampling is disabled.
 	if opts.SamplingEnabled {
 		d.sampler = NewSampler(SamplerConfig{
 			Enabled: true,
@@ -245,15 +286,8 @@ func NewDetectorWithOptions(opts DetectorOptions) *Detector {
 	return d
 }
 
-// checkOverflowPeriodically increments the operation counter and periodically
-// checks for TID/clock overflows (v0.2.0 Task 5).
-//
-// This is called on every OnWrite/OnRead operation. Every overflowCheckInterval
-// operations (10,000), it checks for overflow flags and reports warnings.
-//
-// Performance: Atomic increment (~5ns) on every call, reporting only every 10K ops.
-// Total overhead: <0.1% (acceptable for critical safety feature).
-//
+// checkOverflowPeriodically increments the synchronization-event counter and
+// periodically reports TID or clock overflow state.
 func (d *Detector) checkOverflowPeriodically() {
 	count := d.operationCount.Add(1)
 	if count%overflowCheckInterval == 0 {
@@ -264,7 +298,7 @@ func (d *Detector) checkOverflowPeriodically() {
 
 // reportOverflowsIfNeeded checks overflow flags and reports warnings to stderr.
 //
-// This is called every overflowCheckInterval operations (10,000) from hot path.
+// This is called every overflowCheckInterval synchronization events.
 // It checks epoch.CheckOverflows() and prints clear, actionable warnings.
 func (d *Detector) reportOverflowsIfNeeded() {
 	tidOverflow, clockOverflow, tidWarning, clockWarning := epoch.CheckOverflows()
@@ -300,9 +334,8 @@ func (d *Detector) reportOverflowsIfNeeded() {
 
 // captureCallerPC captures the program counter (PC) of the caller.
 //
-// This is the HOT PATH optimization for lazy stack capture (v0.3.0 Performance).
-// Instead of capturing full stack trace (~500ns via stackdepot.CaptureStack()),
-// we capture only the caller's PC (~5-10ns via runtime.Callers).
+// Memory-access hooks capture only the caller PC. A complete stack is resolved
+// only when reporting a race.
 //
 // The full stack is captured lazily when race is detected, using this PC
 // to identify the call site.
@@ -313,13 +346,6 @@ func (d *Detector) reportOverflowsIfNeeded() {
 // Returns:
 //   - uintptr: Program counter of the caller
 //   - 0: If unable to capture (shouldn't happen normally)
-//
-// Performance: ~5-10ns (single runtime.Callers call with depth=1).
-// Compare to: ~500ns for stackdepot.CaptureStack() (full stack + hashing).
-//
-// This provides a 50x performance improvement on the hot path!
-//
-// v0.7.2: Store PC of first user code frame, not internal racedetector frame.
 //
 // Call stack when captureCallerPC is invoked:
 //
@@ -334,9 +360,6 @@ func (d *Detector) reportOverflowsIfNeeded() {
 // We skip 6 frames to get directly to user code in the standard case.
 // For tests or direct API calls, the stack may be shorter, so we capture
 // multiple PCs and find the first non-internal frame.
-//
-// Performance: runtime.Callers(6, pcs[:1]) is ~145ns on Windows Go 1.25.3.
-// This is acceptable overhead for accurate stack traces.
 func captureCallerPC() uintptr {
 	// Try direct skip first (fastest path).
 	// Skip 6 frames: Callers, captureCallerPC, OnWrite, racewrite, RaceWrite, RaceWrite(wrapper)
@@ -357,37 +380,28 @@ func captureCallerPC() uintptr {
 
 // OnWrite handles write access to memory at the given address.
 //
-// This is the CRITICAL HOT PATH function - it is called on EVERY write access
-// in instrumented code. Performance is paramount!
+// This is the memory-write hot path in instrumented code.
 //
-// Algorithm: FastTrack [FT WRITE] + SmartTrack ownership tracking (v0.2.0 Task 3)
+// Algorithm: FastTrack write transition with exclusive-writer tracking.
 //
 //  1. Get current goroutine context
 //  2. Get or create shadow cell for address
 //  3. Get current epoch from context
-//  4. [FT WRITE SAME EPOCH] Fast path: If vs.W == currentEpoch, return (71% of writes)
-//  5. [SMARTTRACK OWNERSHIP] Fast path: If owned by same writer, skip HB checks (80% of variables)
+//  4. [FT WRITE SAME EPOCH] Fast path: If vs.W == currentEpoch, return
+//  5. [EXCLUSIVE WRITER] If owned by the same writer, skip redundant HB checks
 //  6. Check write-write race: If !vs.W.HappensBefore(ctx.C), report race
 //  7. Check read-write race (ADAPTIVE):
 //     a. If promoted: Check if readClock happened-before ctx.C
 //     b. If not promoted: Check if readEpoch happened-before ctx.C
 //  8. Update shadow memory: vs.W = currentEpoch
-//  9. [SMARTTRACK] Track ownership: First writer claims, second writer promotes to shared
+//  9. Track ownership: first writer claims, a distinct writer marks it shared
 //
 // 10. Clear read tracking and DEMOTE (write dominates all previous reads)
-//
-// Phase 3 Adaptive Optimization: Write clears read state and demotes back to fast path.
-// This means variables with alternating read/write patterns stay in fast path.
-//
-// SmartTrack Optimization (v0.2.0 Task 3): Skip expensive HB checks when same owner writes.
-// Expected impact: 10-20% reduction in HB comparisons (PLDI 2020).
 //
 // Parameters:
 //   - addr: Memory address being written to
 //
 // Thread Safety: Safe for concurrent calls from multiple goroutines.
-//
-// Performance Target: <100ns per call (MVP), <50ns ideal, <30ns with SmartTrack.
 //
 // Zero Allocations: This function MUST NOT allocate on the heap.
 // All required objects (VarState, RaceContext) are pre-allocated or
@@ -395,385 +409,182 @@ func captureCallerPC() uintptr {
 //
 //nolint:gocognit,nestif,gocyclo,cyclop // Complex race detection logic requires nested conditionals
 func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) {
-	// Step 0: Sampling check (v0.3.0 P0).
+	d.onWriteSized(addr, 1, ctx, pc)
+}
+
+// OnWriteSized handles a compiler-generated 2-, 4-, or 8-byte scalar write.
+// The logical FastTrack transition remains anchored at the scalar start and is
+// shared by every covered byte alias. A later partial access copy-on-write
+// splits only its subset while retaining the earlier scalar history.
+func (d *Detector) OnWriteSized(addr, size uintptr, ctx *goroutine.RaceContext, pc uintptr) {
+	if size != 2 && size != 4 && size != 8 {
+		return
+	}
+	d.onWriteSized(addr, size, ctx, pc)
+}
+
+func (d *Detector) onWriteSized(addr, size uintptr, ctx *goroutine.RaceContext, pc uintptr) {
+	if ctx == nil || size == 0 || size-1 > ^uintptr(0)-addr {
+		return
+	}
+	// Any local write may invalidate the read represented by the per-context
+	// redundant-read cache. Runtime fast paths perform the same invalidation
+	// before bypassing the detector.
+	ctx.InvalidateReadRange(addr, size)
+
+	// Step 0: Sampling check.
 	// If sampling is enabled and this access is not sampled, skip detection.
-	// This provides 50-90% overhead reduction with 70-90%+ detection rate.
 	if d.sampler != nil && !d.sampler.ShouldSample() {
 		return
 	}
 
-	// NOTE: Overflow check moved to sync events (OnAcquire/OnRelease/OnGoStart)
-	// in v0.9.0 Quick Win 3. TID/clock overflow only happens at goroutine creation
-	// or clock advancement, not during memory access. Saves ~8ns per access.
+	// Overflow checks run at synchronization events, where clocks advance.
 
-	// Step 1: Get or create shadow cell for this address.
-	// GetOrCreate is thread-safe and may allocate on first access.
-	vs := d.shadowMemory.GetOrCreate(addr)
-
-	// Step 2: Get current epoch (TID, Clock) for this goroutine.
-	currentEpoch := ctx.GetEpoch()
-	currentTID := int64(ctx.TID)
-
-	// Step 3: [FT WRITE SAME EPOCH] Fast path optimization.
-	// If we're writing to the same location in the same epoch, no race possible.
-	// This handles 71% of writes according to FastTrack paper.
-	// Now using lock-free atomic load for W field.
-	if vs.GetW().Same(currentEpoch) {
-		// Lazy stack capture optimization (v0.3.0 Performance):
-		// Store only caller PC (~5ns), not full stack (~500ns).
-		// Full stack is captured lazily when race is detected.
-		if pc != 0 {
-			vs.SetWritePC(pc)
-		} else {
-			vs.SetWritePC(captureCallerPC()) // fallback for tests
-		}
+	if pc == 0 {
+		pc = captureCallerPC()
+	}
+	if size != 1 {
+		d.applySizedScalarWrite(addr, size, ctx, pc)
+		return
+	}
+	// Fresh and otherwise simple exact histories stay block-compact. The
+	// preflight duplicates only allocation-free FastTrack transitions which it
+	// can prove conflict-free; every complex/ambiguous case falls through to the
+	// existing authoritative detector path.
+	if d.rangeMemory.TryCompactWrite(addr, ctx.GetEpoch(), ctx.C, pc) {
 		return
 	}
 
-	// Step 4: [SMARTTRACK OWNERSHIP] Check ownership state.
-	exclusiveWriter := vs.GetExclusiveWriter()
+	// Step 1: Get or create shadow cell for this address.
+	// GetOrCreate is thread-safe and may allocate on first access.
+	vs := d.slotMemory.GetOrCreateSlot(addr).Isolate(uint8(addr & 7))
+	var pending pendingRangeRace
+	captureAtomicWriteLocked(addr, 1, vs, ctx, pc, &pending)
+	d.applyOrdinaryWriteLocked(addr, vs, ctx, pc, &pending)
+	vs.UnlockAccess()
+	pending.report(d)
 
-	// SmartTrack fast paths:
-	if exclusiveWriter == currentTID && exclusiveWriter != 0 {
-		// Same owner writing again - POTENTIAL FAST PATH.
-		// But we must still check for races if previous write has a later clock
-		// (which would indicate time-travel bug or actual race condition).
-		// This check ensures correctness while optimizing the common case.
-		// Now using lock-free atomic load for W field.
-		prevW := vs.GetW()
-		if prevW != 0 {
-			prevTID, prevClock := prevW.Decode()
-			_, currentClock := currentEpoch.Decode()
-			if int64(prevTID) == currentTID && prevClock <= currentClock {
-				// Normal case: same owner, monotonic clock.
-				// FAST PATH (skip ALL HB checks!)
-				// Now using lock-free atomic store for W field.
-				vs.SetW(currentEpoch)
-				vs.IncrementWriteCount()
-				// Lazy stack capture (v0.3.0 Performance).
-				if pc != 0 {
-					vs.SetWritePC(pc)
-				} else {
-					vs.SetWritePC(captureCallerPC()) // fallback for tests
-				}
-				return
-			}
-			// Time-travel detected: prev write at later clock than current write.
-			// This indicates either clock rollback (bug) or actual race.
-			// Fall through to full FastTrack check.
-		} else {
-			// No previous write - FAST PATH.
-			// Now using lock-free atomic store for W field.
-			vs.SetW(currentEpoch)
-			vs.IncrementWriteCount()
-			// Lazy stack capture (v0.3.0 Performance).
-			if pc != 0 {
-				vs.SetWritePC(pc)
-			} else {
-				vs.SetWritePC(captureCallerPC()) // fallback for tests
-			}
-			return
-		}
-	}
-
-	if exclusiveWriter == 0 {
-		// First write ever - try to claim ownership atomically.
-		// CRITICAL: Use CAS to prevent TOCTOU race where two goroutines both
-		// see exclusiveWriter=0 and both think they're the first writer.
-		// If CAS fails, another goroutine claimed ownership first - fall through to race check.
-		if vs.CompareAndSwapExclusiveWriter(0, currentTID) {
-			// Successfully claimed ownership - now check for read races.
-			readEpoch := vs.GetReadEpoch()
-			if readEpoch == 0 && !vs.IsPromoted() {
-				// No previous read - safe to return early.
-				// Now using lock-free atomic store for W field.
-				vs.SetW(currentEpoch)
-				vs.IncrementWriteCount()
-				// Lazy stack capture (v0.3.0 Performance).
-				if pc != 0 {
-					vs.SetWritePC(pc)
-				} else {
-					vs.SetWritePC(captureCallerPC()) // fallback for tests
-				}
-				return
-			}
-			// There was a previous read - must check for read-write race below.
-			// Fall through to read-write race check.
-		} else {
-			// CAS failed - another goroutine claimed ownership.
-			// Refresh exclusiveWriter and fall through to handle as second writer.
-			exclusiveWriter = vs.GetExclusiveWriter()
-		}
-	}
-
-	if exclusiveWriter > 0 && exclusiveWriter != currentTID {
-		// Second writer detected - promote to shared state.
-		vs.SetExclusiveWriter(-1)
-		// Fall through to full FastTrack checks below.
-	}
-
-	// If we reach here, either:
-	//   - exclusiveWriter == -1 (already shared, multiple writers)
-	//   - exclusiveWriter was just promoted from single to shared
-	// Use full FastTrack algorithm (with HB checks).
-
-	// Step 5: Check write-write race.
-	// A race occurs if the previous write did NOT happen-before the current write.
-	// Now using lock-free atomic load for W field.
-	prevW := vs.GetW()
-	if !d.happensBeforeWrite(prevW, ctx) {
-		d.reportRaceV2("write-write", addr, vs, prevW, currentEpoch)
-		return // Stop on first race to avoid cascade of reports
-	}
-
-	// Step 6: Check read-write race (ADAPTIVE).
-	if !vs.IsPromoted() {
-		// FAST PATH: Check single reader epoch.
-		readEpoch := vs.GetReadEpoch()
-		if readEpoch != 0 && !d.happensBeforeRead(readEpoch, ctx) {
-			d.reportRaceV2("read-write", addr, vs, readEpoch, currentEpoch)
-			return // Stop on first race
-		}
-	} else {
-		// SLOW PATH: Check full read VectorClock.
-		readClock := vs.GetReadClock()
-		if readClock != nil && !readClock.HappensBefore(ctx.C) {
-			// Report race with first conflicting read (use epoch representation for reporting).
-			// For simplicity, we report a synthetic epoch from the VectorClock.
-			// TODO: Improve race reporting to show all conflicting reads in future version.
-			d.reportRaceV2("read-write", addr, vs, epoch.Epoch(0), currentEpoch)
-			return // Stop on first race
-		}
-	}
-
-	// Step 7: Update shadow memory write epoch.
-	// Record that this write occurred at currentEpoch.
-	// Now using lock-free atomic store for W field.
-	vs.SetW(currentEpoch)
-	vs.IncrementWriteCount()
-
-	// Step 7.1: Lazy stack capture (v0.3.0 Performance).
-	// Store only caller PC (~5ns) instead of full stack (~500ns).
-	// Full stack is captured lazily when race is detected.
-	// This is a 50x performance improvement on the hot path!
-	if pc != 0 {
-		vs.SetWritePC(pc)
-	} else {
-		vs.SetWritePC(captureCallerPC()) // fallback for tests
-	}
-
-	// Step 8: Clear read tracking and DEMOTE back to fast path.
-	// Write dominates all previous reads, so we reset read state.
-	// This is a key optimization: variables with alternating read/write stay in fast path.
-	vs.Demote()
-
-	// NOTE: Clock is NOT incremented on memory accesses per FastTrack (PLDI 2009, Section 3.2).
-	// Logical clocks advance only at synchronization events (acquire, release, fork, join).
-	// This is critical for the same-epoch fast path: consecutive accesses within the same
-	// sync-free region share the same epoch, enabling O(1) same-epoch checks.
 }
 
 // OnRead handles read access to memory at the given address.
 //
-// This is the CRITICAL HOT PATH function - it is called on EVERY read access
-// in instrumented code. Reads are typically MORE frequent than writes, making
-// this even more performance-critical than OnWrite.
+// This is the memory-read hot path in instrumented code.
 //
-// Algorithm: FastTrack [FT READ] + SmartTrack ownership tracking (v0.2.0 Task 3)
+// Algorithm: FastTrack read transition with exclusive-writer tracking.
 //
 //  1. Get current goroutine context
 //  2. Get or create shadow cell for address
 //  3. Get current epoch from context
-//  4. [SMARTTRACK OWNERSHIP] Fast path: If reading own writes, skip HB check (80% of reads)
+//  4. [EXCLUSIVE WRITER] If reading an own write, skip the redundant HB check
 //  5. Check read-write race: If vs.W != 0 && !vs.W.HappensBefore(ctx.C), report race
 //  6. Update read tracking (ADAPTIVE):
 //     a. If promoted (vs.IsPromoted()):
 //     - Merge current VC into read VC
 //     b. If not promoted (fast path):
-//     - If same epoch: return (63% of reads - FAST!)
+//     - If same epoch: return
 //     - If same TID: update epoch, return
 //     - If happens-before: replace epoch, return
 //     - Otherwise: PROMOTE to VectorClock
-//
-// Phase 3 Adaptive Optimization: Most reads (90%+) use epoch-only fast path.
-// Only concurrent reads from different threads trigger promotion to VectorClock.
-//
-// SmartTrack Optimization (v0.2.0 Task 3): Skip expensive HB checks when reading own writes.
-// Expected impact: 10-20% reduction in HB comparisons (PLDI 2020).
 //
 // Parameters:
 //   - addr: Memory address being read from
 //
 // Thread Safety: Safe for concurrent calls from multiple goroutines.
 //
-// Performance Target:
-//   - Fast path (unpromoted + owned): <30ns (handles 80%+ of reads)
-//   - Fast path (unpromoted): <50ns (handles 90%+ of reads)
-//   - Slow path (promoted): <300ns
-//   - Promotion overhead: <100ns (one-time cost)
-//
 // Zero Allocations: Fast path allocates nothing. Slow path may allocate VectorClock on promotion.
-//
 func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) {
-	// Step 0: Sampling check (v0.3.0 P0).
+	d.onReadSized(addr, 1, ctx, pc)
+}
+
+// OnReadSized is the read counterpart of OnWriteSized.
+func (d *Detector) OnReadSized(addr, size uintptr, ctx *goroutine.RaceContext, pc uintptr) {
+	if size != 2 && size != 4 && size != 8 {
+		return
+	}
+	d.onReadSized(addr, size, ctx, pc)
+}
+
+func (d *Detector) onReadSized(addr, size uintptr, ctx *goroutine.RaceContext, pc uintptr) {
+	if ctx == nil || size == 0 || size-1 > ^uintptr(0)-addr {
+		return
+	}
+	// Step 0: Sampling check.
 	// If sampling is enabled and this access is not sampled, skip detection.
-	// This provides 50-90% overhead reduction with 70-90%+ detection rate.
 	if d.sampler != nil && !d.sampler.ShouldSample() {
 		return
 	}
 
-	// NOTE: Overflow check moved to sync events (OnAcquire/OnRelease/OnGoStart)
-	// in v0.9.0 Quick Win 3. Saves ~8ns per access.
+	// Overflow checks run at synchronization events, where clocks advance.
+
+	if pc == 0 {
+		pc = captureCallerPC()
+	}
+	if size != 1 {
+		// internal/race RWMutex markers use the one-byte ABI. Sized compiler
+		// accesses can therefore use the physical-alias representation directly.
+		d.applySizedScalarRead(addr, size, ctx, pc)
+		return
+	}
+	marker := rwMutexMarkerPC(pc)
+	if !marker && ctx.HasWeakReadHintSized(addr, 1) {
+		d.applySizedScalarRead(addr, 1, ctx, pc)
+		return
+	}
+	// Marker reads require the mixed atomic/plain classification sidecar and
+	// must never enter the compact ordinary-only representation. A successful
+	// ordinary compact no-op may seed an address-only cache entry. Changed
+	// compact histories remain uncached so their unexposed state can be reused.
+	if !marker {
+		if cacheableNoop, ok := d.rangeMemory.TryCompactRead(addr, ctx.GetEpoch(), ctx.C, pc); ok {
+			if cacheableNoop {
+				ctx.RecordAddressOnlyReadRange(addr, size)
+			}
+			return
+		}
+	}
 
 	// Step 1: Get or create shadow cell for this address.
 	// GetOrCreate is thread-safe and may allocate on first access.
-	vs := d.shadowMemory.GetOrCreate(addr)
-
-	// Step 2: Get current epoch (TID, Clock) for this goroutine.
-	currentEpoch := ctx.GetEpoch()
-	currentTID := int64(ctx.TID)
-
-	// Step 3: [SMARTTRACK OWNERSHIP] Fast path for owned variables.
-	// If the reader is the exclusive writer, skip expensive HB check.
-	// This is the common case for thread-local or single-writer variables.
-	exclusiveWriter := vs.GetExclusiveWriter()
-	if exclusiveWriter == currentTID && exclusiveWriter > 0 {
-		// Reading own writes - FAST PATH (skip HB check!)
-		// This is safe because a thread's writes always happen-before its own reads.
-		vs.SetReadEpoch(currentEpoch)
-		return
+	vs := d.slotMemory.GetOrCreateSlot(addr).Isolate(uint8(addr & 7))
+	var pending pendingRangeRace
+	captureAtomicReadLocked(addr, 1, vs, ctx, pc, marker, &pending)
+	d.applyOrdinaryReadLocked(addr, vs, ctx, pc, &pending)
+	// Publish both the redundant-read address and the exact state generation
+	// while its access lock is retained. ClearRange drains that lock before
+	// removing the lane mapping, so a runtime cache hit either re-resolves this
+	// pointer before clear or observes the replacement and takes the slow path.
+	// This ordering is required even when the transition captured a conflict:
+	// reporting is deferred until after publication, and subsequent reads may be
+	// elided only once this read is represented in shadow memory.
+	// sync.RWMutex marker reads are a distinct reporting class. Caching one
+	// would let a later user read at the same address and epoch bypass the
+	// detector, leaving only the suppressible marker classification. Skipping
+	// publication also preserves an unrelated user entry which collided in the
+	// direct-mapped cache.
+	if !marker {
+		ctx.RecordReadSized(addr, size, unsafe.Pointer(vs))
 	}
-
-	// Step 4: Check read-write race.
-	// A race occurs if there was a write that did NOT happen-before this read.
-	// vs.W == 0 means no previous write, so skip check.
-	// Now using lock-free atomic load for W field.
-	prevW := vs.GetW()
-	if prevW != 0 && !d.happensBeforeWrite(prevW, ctx) {
-		d.reportRaceV2("write-read", addr, vs, prevW, currentEpoch)
-		return // Stop on first race to avoid cascade of reports
-	}
-
-	// Step 4: Update read tracking (ADAPTIVE).
-	//nolint:nestif // FastTrack adaptive algorithm requires nested conditions for performance
-	if !vs.IsPromoted() {
-		// FAST PATH: Single reader (common case, 90%+ of reads).
-
-		// [FT READ SAME EPOCH] Fast path optimization.
-		// If we're reading from the same location in the same epoch, no race possible.
-		// This handles 63% of reads according to FastTrack paper.
-		if vs.GetReadEpoch().Same(currentEpoch) {
-			return
-		}
-
-		// Check if new reader is same thread as existing reader.
-		existingReadEpoch := vs.GetReadEpoch()
-		if existingReadEpoch != 0 {
-			existingTID, _ := existingReadEpoch.Decode()
-			currentTID, _ := currentEpoch.Decode()
-
-			if existingTID == currentTID {
-				// Same reader thread - just update clock.
-				vs.SetReadEpoch(currentEpoch)
-				return
-			}
-
-			// Different reader detected - check if sequential (happens-before).
-			if existingReadEpoch.HappensBefore(ctx.C) {
-				// Sequential reads (happens-before) - replace epoch.
-				vs.SetReadEpoch(currentEpoch)
-				return
-			}
-
-			// CONCURRENT READS DETECTED - PROMOTE!
-			vs.PromoteToReadClock(ctx.C)
-			return
-		}
-
-		// No previous read - just set epoch.
-		vs.SetReadEpoch(currentEpoch)
-		return
-	}
-
-	// SLOW PATH: Multiple readers (already promoted, 0.1% of reads).
-	vs.GetReadClock().Join(ctx.C)
-
-	// Lazy stack capture for read-shared variables (v0.3.0 Performance).
-	// Store only caller PC (~5ns) instead of full stack (~500ns).
-	// Full stack is captured lazily when race is detected.
-	if pc != 0 {
-		vs.SetReadPC(pc)
-	} else {
-		vs.SetReadPC(captureCallerPC()) // fallback for tests
-	}
-
-	// NOTE: Clock is NOT incremented on memory accesses per FastTrack (PLDI 2009, Section 3.2).
-	// Logical clocks advance only at synchronization events (acquire, release, fork, join).
-	// This is critical for the same-epoch fast path: consecutive accesses within the same
-	// sync-free region share the same epoch, enabling O(1) same-epoch checks.
+	vs.UnlockAccess()
+	pending.report(d)
 }
 
-// happensBeforeWrite checks if a write epoch happened-before the current context.
-//
-// MVP Implementation: Simplified happens-before check for epoch-only mode.
-//
-// For a write epoch to happen-before the current write, the previous write's
-// clock must be <= the current context's clock for that thread.
-//
-// Full FastTrack Rule:
-//   - If prevWrite.TID == currentTID: prevWrite.Clock <= currentClock
-//   - Otherwise: prevWrite.HappensBefore(currentContext.C)
-//
-// For MVP (single thread), we use simplified logic:
-//   - If same TID: Compare clocks directly
-//   - If different TID: Use VectorClock.HappensBefore
-//
-// Parameters:
-//   - prevWrite: The previous write epoch from shadow memory
-//   - ctx: The current goroutine's RaceContext
-//
-// Returns:
-//   - true if prevWrite happened-before current operation
-//   - false if there's a potential race (concurrent access)
-//
+// happensBeforeWrite reports whether the write epoch is contained in the
+// current context's vector clock. It remains as a unit-test and microbenchmark
+// seam; production shadow transitions apply the same epoch predicate directly.
 func (d *Detector) happensBeforeWrite(prevWrite epoch.Epoch, ctx *goroutine.RaceContext) bool {
-	// Use the epoch's HappensBefore method which checks against vector clock.
-	// This handles both same-thread and cross-thread cases correctly.
 	return prevWrite.HappensBefore(ctx.C)
 }
 
-// happensBeforeRead checks if a read epoch happened-before the current context.
-//
-// This is identical to happensBeforeWrite for MVP (both use epoch-only tracking).
-// In Phase 3, this will become more complex when read epochs can be vector clocks
-// for read-shared variables.
-//
-// Parameters:
-//   - prevRead: The previous read epoch from shadow memory
-//   - ctx: The current goroutine's RaceContext
-//
-// Returns:
-//   - true if prevRead happened-before current operation
-//   - false if there's a potential race
-//
+// happensBeforeRead reports whether one read epoch is contained in the current
+// context's vector clock. It remains as a unit-test and microbenchmark seam;
+// production transitions check every witness in promoted read histories.
 func (d *Detector) happensBeforeRead(prevRead epoch.Epoch, ctx *goroutine.RaceContext) bool {
-	// MVP: Same logic as write happens-before.
-	// Phase 3: This will need to handle vector clock reads.
 	return prevRead.HappensBefore(ctx.C)
 }
 
-// reportRace reports a detected data race to stderr.
-//
-// Deprecated: Use reportRaceV2() instead. This function is kept for backward
-// compatibility with tests but will be removed in Phase 5 Task 5.2.
-//
-// This is the MVP implementation that prints race information to stderr.
-// In Phase 7 (Production Reporting), this will be replaced with:
-//   - Stack trace capture for both accesses
-//   - Detailed source location information
-//   - Race deduplication
-//   - Structured output formats (JSON, XML)
-//   - Configurable reporting behavior
+// reportRace preserves the legacy formatter and counter seam used by unit tests
+// and microbenchmarks. Production detection reports through reportRaceV2PC,
+// which carries access metadata and deduplicates reports.
 //
 // Parameters:
 //   - raceType: Type of race ("write-write" or "read-write")
@@ -803,17 +614,20 @@ func (d *Detector) reportRace(raceType string, addr uintptr, prevEpoch, currEpoc
 	// Notify the runtime so RaceErrors() returns the correct count.
 	kolkovIncrementErrors()
 
-	// Print race report to stderr.
-	printRaceLine("==================")
-	printRaceLine("WARNING: DATA RACE")
-	printstring("Type: ")
-	printRaceLine(raceType)
-	printRaceLineAddr("Address: ", addr)
-	printstring("Previous access: ")
-	printRaceLine(prevEpoch.String())
-	printstring("Current access:  ")
-	printRaceLine(currEpoch.String())
-	printRaceLine("==================")
+	// Print through the runtime-safe output boundary. The pure formatter is the
+	// deterministic seam used by tests; swapping os.Stderr cannot intercept
+	// runtime.printstring.
+	printstring(formatLegacyRace(raceType, addr, prevEpoch, currEpoch))
+}
+
+func formatLegacyRace(raceType string, addr uintptr, prevEpoch, currEpoch epoch.Epoch) string {
+	return "==================\n" +
+		"WARNING: DATA RACE\n" +
+		"Type: " + raceType + "\n" +
+		"Address: " + hexReport(addr) + "\n" +
+		"Previous access: " + prevEpoch.String() + "\n" +
+		"Current access:  " + currEpoch.String() + "\n" +
+		"==================\n"
 }
 
 // RacesDetected returns the total number of races detected.
@@ -831,7 +645,7 @@ func (d *Detector) RacesDetected() int {
 	return d.racesDetected
 }
 
-// OnAcquire handles mutex lock operations (Phase 4 Task 4.1).
+// OnAcquire handles synchronization acquire operations.
 //
 // This establishes a happens-before edge from the previous Unlock to this Lock.
 // The acquiring thread merges the mutex's release clock into its own clock.
@@ -849,28 +663,26 @@ func (d *Detector) RacesDetected() int {
 //
 // Thread Safety: Safe for concurrent calls from multiple goroutines.
 //
-// Performance Target: <500ns per call (VectorClock join overhead acceptable).
-//
 // Example:
 //
 //	mu.Lock()  // Compiler inserts: raceacquire(&mu)
 //	// OnAcquire merges previous Unlock's clock into current thread
 //	x = 42     // Now happens-after previous critical section
-//
 func (d *Detector) OnAcquire(addr uintptr, ctx *goroutine.RaceContext) {
-	// Periodic overflow detection (v0.9.0: moved from OnRead/OnWrite to sync events).
+	// Periodic overflow detection runs on synchronization events.
 	// TID/clock overflow happens at clock advancement, not memory access.
 	d.checkOverflowPeriodically()
 
 	// Step 1: Get or create SyncVar for this mutex address.
 	syncVar := d.syncShadow.GetOrCreate(addr)
 
-	// Step 2: If lock has a release clock, join it with current thread's clock.
-	// This establishes happens-before from the previous Unlock.
-	releaseClock := syncVar.GetReleaseClock()
-	if releaseClock != nil {
-		// Ct := Ct ⊔ Lm (thread clock joins lock clock).
-		ctx.C.Join(releaseClock)
+	// Step 2: Join the lock's release clock while holding the SyncVar lock.
+	// This establishes happens-before from the previous Unlock without racing
+	// an in-place Release or ReleaseMerge update.
+	if syncVar.JoinReleaseClock(ctx.C) {
+		// A sync acquire may import an arbitrary foreign projection. Record one
+		// conservative invalidation before advancing the context's own clock.
+		ctx.NoteForeignImport()
 	}
 
 	// Step 3: Increment logical clock to advance time.
@@ -878,7 +690,7 @@ func (d *Detector) OnAcquire(addr uintptr, ctx *goroutine.RaceContext) {
 	ctx.IncrementClock()
 }
 
-// OnRelease handles mutex unlock operations (Phase 4 Task 4.1).
+// OnRelease handles synchronization release operations.
 //
 // This creates a happens-before edge that future Lock operations will synchronize with.
 // The releasing thread captures its current clock into the mutex's release clock.
@@ -896,16 +708,13 @@ func (d *Detector) OnAcquire(addr uintptr, ctx *goroutine.RaceContext) {
 //
 // Thread Safety: Safe for concurrent calls from multiple goroutines.
 //
-// Performance Target: <300ns per call (VectorClock copy overhead acceptable).
-//
 // Example:
 //
 //	x = 42       // Write happens-before Unlock
 //	mu.Unlock()  // Compiler inserts: racerelease(&mu)
 //	// OnRelease captures current clock for next Lock to see
-//
 func (d *Detector) OnRelease(addr uintptr, ctx *goroutine.RaceContext) {
-	// Periodic overflow detection (v0.9.0: moved from OnRead/OnWrite to sync events).
+	// Periodic overflow detection runs on synchronization events.
 	d.checkOverflowPeriodically()
 
 	// Step 1: Get or create SyncVar for this mutex address.
@@ -921,9 +730,9 @@ func (d *Detector) OnRelease(addr uintptr, ctx *goroutine.RaceContext) {
 	ctx.IncrementClock()
 }
 
-// OnReleaseMerge handles RWMutex write unlock operations (Phase 4 Task 4.1).
+// OnReleaseMerge handles RWMutex read unlock operations.
 //
-// This is used for RWMutex.Unlock (write unlock) where multiple readers may have
+// This is used for RWMutex.RUnlock where multiple readers may have
 // overlapping critical sections. We merge the current thread's clock into the
 // lock's release clock to capture the union of all happens-before relationships.
 //
@@ -940,8 +749,6 @@ func (d *Detector) OnRelease(addr uintptr, ctx *goroutine.RaceContext) {
 //
 // Thread Safety: Safe for concurrent calls from multiple goroutines.
 //
-// Performance Target: <500ns per call (VectorClock merge overhead acceptable).
-//
 // Example (RWMutex scenario):
 //
 //	// Reader 1
@@ -957,7 +764,6 @@ func (d *Detector) OnRelease(addr uintptr, ctx *goroutine.RaceContext) {
 //	// Writer
 //	mu.Lock()    // Acquire (sees union of Reader 1 and Reader 2 clocks)
 //	x = 42       // Write happens-after both readers
-//
 func (d *Detector) OnReleaseMerge(addr uintptr, ctx *goroutine.RaceContext) {
 	// Step 1: Get or create SyncVar for this mutex address.
 	syncVar := d.syncShadow.GetOrCreate(addr)
@@ -968,346 +774,6 @@ func (d *Detector) OnReleaseMerge(addr uintptr, ctx *goroutine.RaceContext) {
 	syncVar.MergeReleaseClock(ctx.C)
 
 	// Step 3: Increment logical clock to advance time.
-	ctx.IncrementClock()
-}
-
-// === Channel Synchronization Methods (Phase 4 Task 4.2) ===
-
-// OnChannelSendBefore is called BEFORE a channel send operation.
-//
-// For MVP, this is a no-op placeholder. In future phases, this could be used
-// for detecting invalid operations (e.g., send on closed channel).
-//
-// Parameters:
-//   - ch: Address of the channel being sent to
-//   - ctx: Current goroutine's RaceContext
-//
-// Performance Target: <100ns (minimal overhead).
-//
-func (d *Detector) OnChannelSendBefore(ch uintptr, ctx *goroutine.RaceContext) {
-	// MVP: No-op. Future: could check if channel is closed.
-	_ = ch
-	_ = ctx
-}
-
-// OnChannelSendAfter is called AFTER a channel send operation completes.
-//
-// This establishes a happens-before edge from the sender to future receivers.
-// The sender's clock is captured into the channel's sendClock.
-//
-// Algorithm: FastTrack [FT CHANNEL SEND]
-//  1. Get channel's SyncVar from sync shadow memory
-//  2. Capture sender's clock: ch.sendClock := ctx.C (copy)
-//  3. ctx.IncrementClock()
-//
-// This implements the happens-before relationship:
-//   - Send happens-before Receive (for unbuffered and buffered channels)
-//
-// Parameters:
-//   - ch: Address of the channel being sent to
-//   - ctx: Current goroutine's RaceContext
-//
-// Thread Safety: Safe for concurrent calls from multiple goroutines.
-//
-// Performance Target: <500ns (VectorClock copy overhead acceptable).
-//
-// Example:
-//
-//	ch <- value  // Compiler inserts: racechansendbefore(&ch); ...; racechansendafter(&ch)
-//	// OnChannelSendAfter captures sender's clock for receiver to see
-//
-func (d *Detector) OnChannelSendAfter(ch uintptr, ctx *goroutine.RaceContext) {
-	// Step 1: Get or create SyncVar for this channel address.
-	syncVar := d.syncShadow.GetOrCreate(ch)
-
-	// Step 2: Capture sender's clock into channel's sendClock.
-	// This makes the sender's logical time visible to future receivers.
-	syncVar.SetChannelSendClock(ctx.C)
-
-	// Step 3: Increment logical clock to advance time.
-	// This must be done AFTER capturing the clock to maintain happens-before.
-	ctx.IncrementClock()
-}
-
-// OnChannelRecvBefore is called BEFORE a channel receive operation.
-//
-// For MVP, this is a no-op placeholder. In future phases, this could be used
-// for detecting invalid operations or optimizations.
-//
-// Parameters:
-//   - ch: Address of the channel being received from
-//   - ctx: Current goroutine's RaceContext
-//
-// Performance Target: <100ns (minimal overhead).
-//
-func (d *Detector) OnChannelRecvBefore(ch uintptr, ctx *goroutine.RaceContext) {
-	// MVP: No-op.
-	_ = ch
-	_ = ctx
-}
-
-// OnChannelRecvAfter is called AFTER a channel receive operation completes.
-//
-// This establishes a happens-before edge from the sender to the receiver.
-// The receiver merges the sender's clock to observe all the sender's work.
-//
-// Algorithm: FastTrack [FT CHANNEL RECV]
-//  1. Get channel's SyncVar from sync shadow memory
-//  2. If channel has sendClock: ctx.C.Join(ch.sendClock)
-//  3. If channel is closed: ctx.C.Join(ch.closeClock)
-//  4. ctx.IncrementClock()
-//
-// This implements the happens-before relationship:
-//   - Sender's work happens-before Receiver's subsequent work
-//
-// Parameters:
-//   - ch: Address of the channel being received from
-//   - ctx: Current goroutine's RaceContext
-//
-// Thread Safety: Safe for concurrent calls from multiple goroutines.
-//
-// Performance Target: <500ns (VectorClock join overhead acceptable).
-//
-// Example:
-//
-//	value := <-ch  // Compiler inserts: racechanrecvbefore(&ch); ...; racechanrecvafter(&ch)
-//	// OnChannelRecvAfter merges sender's clock into receiver
-//	// Receiver now happens-after sender
-//
-func (d *Detector) OnChannelRecvAfter(ch uintptr, ctx *goroutine.RaceContext) {
-	// Step 1: Get or create SyncVar for this channel address.
-	syncVar := d.syncShadow.GetOrCreate(ch)
-
-	// Step 2: If channel has a send clock, join it with receiver's clock.
-	// This establishes happens-before from the sender.
-	sendClock := syncVar.GetChannelSendClock()
-	if sendClock != nil {
-		// Ct := Ct ⊔ Csend (receiver clock joins sender clock).
-		ctx.C.Join(sendClock)
-	}
-
-	// Step 3: If channel is closed, join with close clock.
-	// close(ch) happens-before all receives that observe closure.
-	if syncVar.IsChannelClosed() {
-		closeClock := syncVar.GetChannelCloseClock()
-		if closeClock != nil {
-			ctx.C.Join(closeClock)
-		}
-	}
-
-	// Step 4: Optionally capture receiver's clock (for future bidirectional sync).
-	// MVP: Store recvClock but don't use it yet.
-	syncVar.SetChannelRecvClock(ctx.C)
-
-	// Step 5: Increment logical clock to advance time.
-	// This must be done AFTER joining to maintain happens-before invariant.
-	ctx.IncrementClock()
-}
-
-// OnChannelClose is called when a channel is closed via close(ch).
-//
-// This establishes a happens-before edge from the closer to all future receives.
-// The closer's clock is captured into the channel's closeClock.
-//
-// Algorithm: FastTrack [FT CHANNEL CLOSE]
-//  1. Get channel's SyncVar from sync shadow memory
-//  2. Capture closer's clock: ch.closeClock := ctx.C (copy)
-//  3. Set ch.isClosed = true
-//  4. ctx.IncrementClock()
-//
-// This implements the happens-before relationship:
-//   - close(ch) happens-before all receives that observe closure
-//
-// Parameters:
-//   - ch: Address of the channel being closed
-//   - ctx: Current goroutine's RaceContext
-//
-// Thread Safety: Safe for concurrent calls from multiple goroutines.
-//
-// Performance Target: <300ns (VectorClock copy overhead acceptable).
-//
-// Example:
-//
-//	close(ch)  // Compiler inserts: racechanclose(&ch)
-//	// OnChannelClose captures closer's clock
-//	// Future receives will merge this clock
-//
-func (d *Detector) OnChannelClose(ch uintptr, ctx *goroutine.RaceContext) {
-	// Step 1: Get or create SyncVar for this channel address.
-	syncVar := d.syncShadow.GetOrCreate(ch)
-
-	// Step 2: Capture closer's clock into channel's closeClock.
-	// This makes the closer's logical time visible to future receivers.
-	syncVar.SetChannelCloseClock(ctx.C)
-
-	// Step 3: Increment logical clock to advance time.
-	// This must be done AFTER capturing the clock to maintain happens-before.
-	ctx.IncrementClock()
-}
-
-// === WaitGroup Synchronization Methods (Phase 4 Task 4.3) ===
-
-// OnWaitGroupAdd handles WaitGroup.Add(delta) operations (Phase 4 Task 4.3).
-//
-// WaitGroup.Add(delta) increments the wait counter. This is typically called
-// before spawning goroutines to establish the expected number of Done() calls.
-//
-// For happens-before tracking, we only track the counter for optional validation.
-// The actual happens-before relationship is established by Done() → Wait().
-//
-// Algorithm:
-//  1. Get or create SyncVar for this WaitGroup address
-//  2. Increment the counter by delta
-//  3. Increment logical clock (WaitGroup operations are synchronization points)
-//
-// Parameters:
-//   - wg: Address of the sync.WaitGroup
-//   - delta: The delta to add (positive for Add, negative would be unusual but supported)
-//   - ctx: Current goroutine's RaceContext
-//
-// Thread Safety: Safe for concurrent calls from multiple goroutines.
-//
-// Performance Target: <200ns (minimal overhead, just counter increment).
-//
-// Example:
-//
-//	var wg sync.WaitGroup
-//	wg.Add(1)  // Compiler inserts: racewaitgroupadd(&wg, 1)
-//	// OnWaitGroupAdd increments counter to 1
-//
-func (d *Detector) OnWaitGroupAdd(wg uintptr, delta int, ctx *goroutine.RaceContext) {
-	// Step 1: Get or create SyncVar for this WaitGroup address.
-	syncVar := d.syncShadow.GetOrCreate(wg)
-
-	// Step 2: Increment the WaitGroup counter by delta.
-	// This is optional for validation but helps detect misuse patterns.
-	syncVar.WaitGroupAdd(delta)
-
-	// Step 3: Increment logical clock to advance time.
-	// WaitGroup operations are synchronization points.
-	ctx.IncrementClock()
-}
-
-// OnWaitGroupDone handles WaitGroup.Done() operations (Phase 4 Task 4.3).
-//
-// WaitGroup.Done() is equivalent to Add(-1). It signals that a goroutine has
-// completed its work. This creates a happens-before edge to the corresponding
-// Wait() return.
-//
-// Algorithm:
-//  1. Get or create SyncVar for this WaitGroup address
-//  2. Merge current thread's clock into the WaitGroup's doneClock
-//  3. Decrement the counter
-//  4. Increment logical clock
-//
-// The key insight: All Done() calls merge their clocks into a single doneClock.
-// When Wait() returns, the waiter merges this doneClock, seeing all prior work.
-//
-// Parameters:
-//   - wg: Address of the sync.WaitGroup
-//   - ctx: Current goroutine's RaceContext
-//
-// Thread Safety: Safe for concurrent calls from multiple goroutines.
-//
-// Performance Target: <500ns (VectorClock merge overhead acceptable).
-//
-// Example:
-//
-//	// Child goroutine
-//	data = 42          // Write
-//	wg.Done()          // Compiler inserts: racewaitgroupdone(&wg)
-//	// OnWaitGroupDone merges child's clock into doneClock
-//
-func (d *Detector) OnWaitGroupDone(wg uintptr, ctx *goroutine.RaceContext) {
-	// Step 1: Get or create SyncVar for this WaitGroup address.
-	syncVar := d.syncShadow.GetOrCreate(wg)
-
-	// Step 2: Merge current thread's clock into doneClock.
-	// This accumulates the happens-before relationship from this goroutine.
-	syncVar.MergeWaitGroupDoneClock(ctx.C)
-
-	// Step 3: Decrement the counter (Done is Add(-1)).
-	syncVar.WaitGroupAdd(-1)
-
-	// Step 4: Increment logical clock to advance time.
-	ctx.IncrementClock()
-}
-
-// OnWaitGroupWaitBefore handles WaitGroup.Wait() BEFORE it blocks (Phase 4 Task 4.3).
-//
-// This is called before Wait() blocks waiting for all Done() calls.
-// For MVP, this is primarily a placeholder for future optimizations or validation.
-//
-// We could use this to:
-//   - Validate that counter > 0 (wait with counter 0 is a no-op)
-//   - Track wait start time for performance monitoring
-//   - Prepare for happens-before merge
-//
-// For now, we just increment the clock to mark this synchronization point.
-//
-// Parameters:
-//   - wg: Address of the sync.WaitGroup
-//   - ctx: Current goroutine's RaceContext
-//
-// Thread Safety: Safe for concurrent calls from multiple goroutines.
-//
-// Performance Target: <100ns (minimal overhead).
-//
-// Example:
-//
-//	wg.Wait()  // Compiler inserts: racewaitgroupwaitbefore(&wg); ...; racewaitgroupwaitafter(&wg)
-//
-func (d *Detector) OnWaitGroupWaitBefore(_ uintptr, ctx *goroutine.RaceContext) {
-	// For MVP, just increment the clock to mark the synchronization point.
-	// Future phases could add validation or monitoring here.
-	// Note: wg parameter unused in MVP, but retained for API consistency and future use
-	ctx.IncrementClock()
-}
-
-// OnWaitGroupWaitAfter handles WaitGroup.Wait() AFTER it returns (Phase 4 Task 4.3).
-//
-// This is called after Wait() returns, meaning all Done() calls have completed.
-// This is the critical happens-before establishment: the waiter merges all
-// accumulated Done() clocks into its own clock.
-//
-// Algorithm:
-//  1. Get SyncVar for this WaitGroup address
-//  2. Get the accumulated doneClock from all Done() calls
-//  3. Merge doneClock into waiter's clock (happens-before)
-//  4. Increment logical clock
-//
-// After this merge, the waiter's clock reflects all work done by goroutines
-// that called Done(), establishing happens-before from all children to parent.
-//
-// Parameters:
-//   - wg: Address of the sync.WaitGroup
-//   - ctx: Current goroutine's RaceContext
-//
-// Thread Safety: Safe for concurrent calls from multiple goroutines.
-//
-// Performance Target: <500ns (VectorClock merge overhead acceptable).
-//
-// Example:
-//
-//	wg.Wait()          // Blocks until all Done() calls
-//	// OnWaitGroupWaitAfter merges doneClock into parent's clock
-//	_ = data           // Parent can now safely read child's writes (no race)
-//
-func (d *Detector) OnWaitGroupWaitAfter(wg uintptr, ctx *goroutine.RaceContext) {
-	// Step 1: Get or create SyncVar for this WaitGroup address.
-	syncVar := d.syncShadow.GetOrCreate(wg)
-
-	// Step 2: Get the accumulated doneClock from all Done() calls.
-	doneClock := syncVar.GetWaitGroupDoneClock()
-
-	// Step 3: Merge doneClock into waiter's clock (happens-before).
-	// If doneClock is nil, no Done() calls have occurred yet (unusual but valid).
-	if doneClock != nil {
-		ctx.C.Join(doneClock)
-	}
-
-	// Step 4: Increment logical clock to advance time.
-	// This must be done AFTER merging the doneClock to maintain happens-before.
 	ctx.IncrementClock()
 }
 
@@ -1332,18 +798,19 @@ func (d *Detector) GetShadow() shadowmem.Shadow {
 // ClearShadowRange clears shadow memory for the given address range.
 // Called during memory allocation/free to prevent false positives from
 // stale shadow state when the allocator reuses addresses.
-//
 func (d *Detector) ClearShadowRange(addr, size uintptr) {
 	d.shadowMemory.ClearRange(addr, size)
+	d.syncShadow.ClearRange(addr, size)
 }
 
 // Reset resets the detector state for testing.
 //
 // This clears:
 //   - All shadow memory cells
-//   - All sync shadow memory cells (Phase 4)
+//   - All sync shadow memory cells
 //   - Race counter
-//   - Reported races deduplication map (Phase 5)
+//   - Reported races deduplication map
+//   - Goroutine creation metadata
 //   - Promotion statistics
 //
 // Thread Safety: NOT safe for concurrent access.
@@ -1353,22 +820,23 @@ func (d *Detector) ClearShadowRange(addr, size uintptr) {
 func (d *Detector) Reset() {
 	d.mu.lock()
 	defer d.mu.unlock()
+	d.goroutineCreations.reset()
 
 	// Clear shadow memory.
 	d.shadowMemory.Reset()
 
-	// Clear sync shadow memory (Phase 4).
+	// Clear sync shadow memory.
 	d.syncShadow.Reset()
 
 	// Reset race counter.
 	d.racesDetected = 0
 
-	// Clear reported races map (Phase 5 Task 5.3).
+	// Clear reported races map.
 	d.reportedRaces.reset()
 
 }
 
-// IsSamplingEnabled returns true if sampling is enabled (v0.3.0).
+// IsSamplingEnabled returns true if sampling is enabled.
 //
 // When sampling is enabled, only a fraction of memory accesses are checked.
 // This trades detection rate for performance.
@@ -1378,7 +846,7 @@ func (d *Detector) IsSamplingEnabled() bool {
 	return d.sampler != nil && d.sampler.IsEnabled()
 }
 
-// GetSamplerStats returns sampling statistics (v0.3.0).
+// GetSamplerStats returns sampling statistics.
 //
 // Returns nil if sampling is disabled.
 //
@@ -1391,7 +859,7 @@ func (d *Detector) GetSamplerStats() *SamplerStats {
 	return &stats
 }
 
-// GetSampleRate returns the current sampling rate (v0.3.0).
+// GetSampleRate returns the current sampling rate.
 //
 // Returns 1 if sampling is disabled (all accesses checked).
 //

@@ -1,6 +1,7 @@
 package detector
 
 import (
+	"sync"
 	"testing"
 	"unsafe"
 
@@ -21,6 +22,27 @@ func TestOnAcquire_FirstAcquire(t *testing.T) {
 	if ctx.C.Get(0) != initialClock+1 {
 		t.Errorf("Expected clock to increment from %d to %d, got %d",
 			initialClock, initialClock+1, ctx.C.Get(0))
+	}
+}
+
+func TestOnAcquireInvalidatesOnlyStrongAtomicReleaseProof(t *testing.T) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(70_001)
+	source := goroutine.Alloc(70_002)
+	var releaseRoot byte
+	release := unsafe.Pointer(&releaseRoot)
+	ctx.RecordAtomicRelease(release, 3, 5, 1, true)
+
+	const syncAddr = uintptr(0x12f0)
+	d.OnRelease(syncAddr, source)
+	before := ctx.ForeignGeneration
+	d.OnAcquire(syncAddr, ctx)
+	if ctx.ForeignGeneration != before+1 {
+		t.Fatalf("sync acquire foreign generation = %d, want %d", ctx.ForeignGeneration, before+1)
+	}
+	seen, strong, ok := ctx.LookupAtomicRelease(release, 3, 1)
+	if !ok || strong || seen != 5 {
+		t.Fatalf("sync acquire cache proof = (%d,%v,%v), want weak version 5", seen, strong, ok)
 	}
 }
 
@@ -138,13 +160,13 @@ func TestMutexProtectedNoRace(t *testing.T) {
 	// Thread 0: Lock, write, Unlock.
 	ctx0 := goroutine.Alloc(0)
 	d.OnAcquire(mutexAddr, ctx0) // Lock
-	d.OnWrite(varAddr, ctx0, 0)     // Write x = 42
+	d.OnWrite(varAddr, ctx0, 0)  // Write x = 42
 	d.OnRelease(mutexAddr, ctx0) // Unlock
 
 	// Thread 1: Lock, read, Unlock.
 	ctx1 := goroutine.Alloc(1)
 	d.OnAcquire(mutexAddr, ctx1) // Lock (sees Thread 0's clock!)
-	d.OnRead(varAddr, ctx1, 0)      // Read x (should NOT race)
+	d.OnRead(varAddr, ctx1, 0)   // Read x (should NOT race)
 	d.OnRelease(mutexAddr, ctx1) // Unlock
 
 	// Verify no races detected.
@@ -324,6 +346,27 @@ func TestDetectorReset_ClearsSyncShadow(t *testing.T) {
 	}
 }
 
+// TestClearShadowRange_ClearsSyncLifecycle verifies that an allocator-reused
+// address does not inherit happens-before state from its previous object.
+func TestClearShadowRange_ClearsSyncLifecycle(t *testing.T) {
+	d := NewDetector()
+	addr := uintptr(0x4320)
+	outsideAddr := addr + 8
+	oldState := d.syncShadow.GetOrCreate(addr)
+	outsideState := d.syncShadow.GetOrCreate(outsideAddr)
+
+	d.ClearShadowRange(addr, 8)
+	if d.syncShadow.HasEntry(addr) {
+		t.Fatal("ClearShadowRange retained synchronization state")
+	}
+	if got := d.syncShadow.GetOrCreate(outsideAddr); got != outsideState {
+		t.Fatal("ClearShadowRange removed adjacent sync state")
+	}
+	if fresh := d.syncShadow.GetOrCreate(addr); fresh == oldState {
+		t.Fatal("ClearShadowRange retained stale happens-before state")
+	}
+}
+
 // === BENCHMARKS ===
 
 // BenchmarkOnAcquire benchmarks mutex lock tracking.
@@ -383,723 +426,140 @@ func BenchmarkMutexProtectedAccess(b *testing.B) {
 	}
 }
 
-// === Channel Synchronization Tests (Phase 4 Task 4.2) ===
+// Channels and WaitGroups do not have detector-specific callbacks. The Go
+// runtime models them with the same acquire/release primitives as locks:
+// buffered channels use one synchronization address per buffer slot, close
+// uses the channel address, and WaitGroup.Done uses ReleaseMerge.
 
-// TestOnChannelSendAfter_FirstSend verifies OnChannelSendAfter on first send.
-func TestOnChannelSendAfter_FirstSend(t *testing.T) {
+// channelSlotExchange mirrors runtime.racereleaseacquire: consume the clock
+// left by the prior slot user, then publish this context for the next user.
+func channelSlotExchange(d *Detector, slot uintptr, ctx *goroutine.RaceContext) {
+	d.OnAcquire(slot, ctx)
+	d.OnRelease(slot, ctx)
+}
+
+func TestBufferedChannelSlotsPreserveSendPairing(t *testing.T) {
 	d := NewDetector()
-	ctx := goroutine.Alloc(0)
-	chAddr := uintptr(0x2000)
+	const (
+		slot0 = uintptr(0x2000)
+		slot1 = uintptr(0x2008)
+	)
+	sender0 := goroutine.Alloc(0)
+	sender1 := goroutine.Alloc(1)
+	receiver := goroutine.Alloc(2)
 
-	// Set some clock values.
-	ctx.C.Set(0, 10)
-	ctx.Epoch = ctx.GetEpoch() // Sync epoch
+	channelSlotExchange(d, slot0, sender0)
+	channelSlotExchange(d, slot1, sender1)
+	sender0AtSend := sender0.C.Get(sender0.TID) - 1
+	sender1AtSend := sender1.C.Get(sender1.TID) - 1
 
-	// First send - should capture clock.
-	d.OnChannelSendAfter(chAddr, ctx)
-
-	// Verify send clock was captured.
-	syncVar := d.syncShadow.GetOrCreate(chAddr)
-	sendClock := syncVar.GetChannelSendClock()
-
-	if sendClock == nil {
-		t.Fatal("Expected send clock to be set")
+	// The first receive from a capacity-two channel consumes slot zero. It must
+	// not accidentally join the later send stored in slot one.
+	channelSlotExchange(d, slot0, receiver)
+	if got := receiver.C.Get(sender0.TID); got != sender0AtSend {
+		t.Fatalf("slot-zero receive saw sender-zero clock %d, want %d", got, sender0AtSend)
+	}
+	if got := receiver.C.Get(sender1.TID); got != 0 {
+		t.Fatalf("slot-zero receive spuriously saw slot-one sender clock %d", got)
 	}
 
-	// Send clock should have the clock value at time of send (before increment).
-	if sendClock.Get(0) != 10 {
-		t.Errorf("Expected send clock[0]=10, got %d", sendClock.Get(0))
-	}
-
-	// Context clock should be incremented after send.
-	if ctx.C.Get(0) != 11 {
-		t.Errorf("Expected context clock[0]=11 (incremented), got %d", ctx.C.Get(0))
+	channelSlotExchange(d, slot1, receiver)
+	if got := receiver.C.Get(sender1.TID); got != sender1AtSend {
+		t.Fatalf("slot-one receive saw sender-one clock %d, want %d", got, sender1AtSend)
 	}
 }
 
-// TestOnChannelRecvAfter_RecvAfterSend verifies happens-before from Send to Recv.
-func TestOnChannelRecvAfter_RecvAfterSend(t *testing.T) {
+func TestBufferedReceiveAfterCloseDoesNotObserveClose(t *testing.T) {
 	d := NewDetector()
-	chAddr := uintptr(0x2000)
-
-	// Thread 0 (sender): Send on channel.
+	const (
+		slot      = uintptr(0x3000)
+		closeAddr = uintptr(0x4000)
+	)
 	sender := goroutine.Alloc(0)
-	sender.IncrementClock()              // Do some work
-	sender.IncrementClock()              // More work
-	d.OnChannelSendAfter(chAddr, sender) // Send (captures clock)
+	closer := goroutine.Alloc(1)
+	receiver := goroutine.Alloc(2)
 
-	senderClockAtSend := sender.C.Get(0) - 1 // -1 because OnChannelSendAfter incremented
+	channelSlotExchange(d, slot, sender)
+	d.OnRelease(closeAddr, closer)
+	senderAtSend := sender.C.Get(sender.TID) - 1
+	closerAtClose := closer.C.Get(closer.TID) - 1
 
-	// Thread 1 (receiver): Receive from channel.
-	receiver := goroutine.Alloc(1)
-	initialReceiverClock := receiver.C.Get(1) // Should be 0
-
-	d.OnChannelRecvAfter(chAddr, receiver) // Receive (merges sender's clock)
-
-	// Receiver should have joined with sender's clock.
-	// receiver.C[0] should now equal sender's clock at send.
-	if receiver.C.Get(0) != senderClockAtSend {
-		t.Errorf("Expected Receiver to see Sender's clock %d, got %d",
-			senderClockAtSend, receiver.C.Get(0))
+	// A receive of a value already buffered before close synchronizes with that
+	// value's send, not with close. Only the later empty receive observes close.
+	channelSlotExchange(d, slot, receiver)
+	if got := receiver.C.Get(sender.TID); got != senderAtSend {
+		t.Fatalf("buffered receive saw sender clock %d, want %d", got, senderAtSend)
+	}
+	if got := receiver.C.Get(closer.TID); got != 0 {
+		t.Fatalf("buffered receive spuriously observed close clock %d", got)
 	}
 
-	// Receiver's own clock should be incremented.
-	if receiver.C.Get(1) != initialReceiverClock+1 {
-		t.Errorf("Expected Receiver's clock to increment to %d, got %d",
-			initialReceiverClock+1, receiver.C.Get(1))
+	d.OnAcquire(closeAddr, receiver)
+	if got := receiver.C.Get(closer.TID); got != closerAtClose {
+		t.Fatalf("closed-empty receive saw close clock %d, want %d", got, closerAtClose)
 	}
 }
 
-// TestChannelSynchronizedNoRace verifies channel-synchronized code does NOT report races.
-func TestChannelSynchronizedNoRace(t *testing.T) {
+func TestConcurrentWaitGroupDoneCallbacksMergeEveryClock(t *testing.T) {
+	const workers = 32
 	d := NewDetector()
-	chAddr := uintptr(0x2000)
-	varAddr := uintptr(0x3000)
+	const waitGroupAddr = uintptr(0x5000)
+	children := make([]*goroutine.RaceContext, workers)
+	start := make(chan struct{})
+	var callbacks sync.WaitGroup
+	callbacks.Add(workers)
+	for i := range children {
+		children[i] = goroutine.Alloc(uint32(i))
+		children[i].IncrementClock()
+		go func(ctx *goroutine.RaceContext) {
+			defer callbacks.Done()
+			<-start
+			// sync.WaitGroup.Add(-1) calls race.ReleaseMerge on the WaitGroup.
+			d.OnReleaseMerge(waitGroupAddr, ctx)
+		}(children[i])
+	}
+	close(start)
+	callbacks.Wait()
 
-	// Thread 0 (sender): Write, then send.
-	sender := goroutine.Alloc(0)
-	d.OnWrite(varAddr, sender, 0)           // Write x = 42
-	d.OnChannelSendAfter(chAddr, sender) // Send on ch
-
-	// Thread 1 (receiver): Receive, then read.
-	receiver := goroutine.Alloc(1)
-	d.OnChannelRecvAfter(chAddr, receiver) // Receive from ch (sees sender's clock!)
-	d.OnRead(varAddr, receiver, 0)            // Read x (should NOT race)
-
-	// Verify no races detected.
-	if d.RacesDetected() != 0 {
-		t.Errorf("Expected 0 races (channel synchronized), got %d", d.RacesDetected())
+	waiter := goroutine.Alloc(workers)
+	d.OnAcquire(waitGroupAddr, waiter)
+	for _, child := range children {
+		want := child.C.Get(child.TID) - 1
+		if got := waiter.C.Get(child.TID); got != want {
+			t.Fatalf("waiter saw child %d clock %d, want %d", child.TID, got, want)
+		}
 	}
 }
 
-// TestUnprotectedChannelRaceStillDetected verifies unprotected concurrent access still reports races.
-func TestUnprotectedChannelRaceStillDetected(t *testing.T) {
+func TestConcurrentChannelSlotCallbacksRemainIsolated(t *testing.T) {
+	const workers = 16
 	d := NewDetector()
-	varAddr := uintptr(0x3000)
-
-	// Thread 0: Write (no channel synchronization).
-	sender := goroutine.Alloc(0)
-	for i := 0; i < 5; i++ {
-		sender.IncrementClock() // Advance sender's clock to 5
+	const slotsBase = uintptr(0x6000)
+	senders := make([]*goroutine.RaceContext, workers)
+	start := make(chan struct{})
+	var callbacks sync.WaitGroup
+	callbacks.Add(workers)
+	for i := range senders {
+		senders[i] = goroutine.Alloc(uint32(i))
+		go func(i int, ctx *goroutine.RaceContext) {
+			defer callbacks.Done()
+			<-start
+			channelSlotExchange(d, slotsBase+uintptr(i)*8, ctx)
+		}(i, senders[i])
 	}
-	d.OnWrite(varAddr, sender, 0) // Write at clock 5 (will increment to 6)
-
-	// Thread 1: Read WITHOUT seeing Thread 0's write (no channel sync).
-	// Thread 1's vector clock for Thread 0 should be 0 (hasn't seen Thread 0's work).
-	// ctx1.C[0] = 0, but write was at clock 6.
-	// Since ctx1.C[0] (0) < write.clock (6), happens-before check fails → RACE!
-	receiver := goroutine.Alloc(1)
-	d.OnRead(varAddr, receiver, 0)
-
-	// Verify race was detected.
-	if d.RacesDetected() != 1 {
-		t.Errorf("Expected 1 race (unprotected), got %d", d.RacesDetected())
-	}
-}
-
-// TestChannelClose_RecvAfterClose verifies happens-before from Close to Recv.
-func TestChannelClose_RecvAfterClose(t *testing.T) {
-	d := NewDetector()
-	chAddr := uintptr(0x2000)
-	varAddr := uintptr(0x3000)
-
-	// Thread 0 (closer): Write, then close channel.
-	closer := goroutine.Alloc(0)
-	d.OnWrite(varAddr, closer, 0)       // Write x = 42
-	d.OnChannelClose(chAddr, closer) // Close ch (captures clock)
-
-	// Thread 1 (receiver): Receive from closed channel, then read.
-	receiver := goroutine.Alloc(1)
-	d.OnChannelRecvAfter(chAddr, receiver) // Receive from closed ch (sees closer's clock!)
-	d.OnRead(varAddr, receiver, 0)            // Read x (should NOT race)
-
-	// Verify no races detected.
-	if d.RacesDetected() != 0 {
-		t.Errorf("Expected 0 races (channel close synchronized), got %d", d.RacesDetected())
-	}
-}
-
-// TestMultipleChannels verifies different channels don't interfere.
-func TestMultipleChannels(t *testing.T) {
-	d := NewDetector()
-	ch1Addr := uintptr(0x2000)
-	ch2Addr := uintptr(0x3000)
-	var1Addr := uintptr(0x4000)
-	var2Addr := uintptr(0x5000)
-
-	ctx0 := goroutine.Alloc(0)
-	ctx1 := goroutine.Alloc(1)
-
-	// Thread 0: Write var1, send on ch1.
-	d.OnWrite(var1Addr, ctx0, 0)
-	d.OnChannelSendAfter(ch1Addr, ctx0)
-
-	// Thread 1: Write var2, send on ch2.
-	d.OnWrite(var2Addr, ctx1, 0)
-	d.OnChannelSendAfter(ch2Addr, ctx1)
-
-	// Thread 1: Receive from ch1 (different channel), read var1 - should NOT race.
-	d.OnChannelRecvAfter(ch1Addr, ctx1)
-	d.OnRead(var1Addr, ctx1, 0)
-
-	// Thread 0: Receive from ch2, read var2 - should NOT race.
-	d.OnChannelRecvAfter(ch2Addr, ctx0)
-	d.OnRead(var2Addr, ctx0, 0)
-
-	// Verify no races (both variables properly synchronized by their channels).
-	if d.RacesDetected() != 0 {
-		t.Errorf("Expected 0 races (multiple channels), got %d", d.RacesDetected())
-	}
-}
-
-// TestChannelSequentialSends verifies sequential send/recv pairs.
-func TestChannelSequentialSends(t *testing.T) {
-	d := NewDetector()
-	chAddr := uintptr(0x2000)
-	varAddr := uintptr(0x3000)
-	ctx := goroutine.Alloc(0)
-
-	// First send/recv cycle (same thread for simplicity).
-	d.OnWrite(varAddr, ctx, 0)
-	d.OnChannelSendAfter(chAddr, ctx)
-	d.OnChannelRecvAfter(chAddr, ctx)
-	d.OnRead(varAddr, ctx, 0)
-
-	// Second send/recv cycle.
-	d.OnWrite(varAddr, ctx, 0)
-	d.OnChannelSendAfter(chAddr, ctx)
-	d.OnChannelRecvAfter(chAddr, ctx)
-	d.OnRead(varAddr, ctx, 0)
-
-	// Third send/recv cycle.
-	d.OnWrite(varAddr, ctx, 0)
-	d.OnChannelSendAfter(chAddr, ctx)
-	d.OnChannelRecvAfter(chAddr, ctx)
-	d.OnRead(varAddr, ctx, 0)
-
-	// Verify no races (sequential access, same thread).
-	if d.RacesDetected() != 0 {
-		t.Errorf("Expected 0 races (sequential sends), got %d", d.RacesDetected())
-	}
-}
-
-// TestChannelAndMutexTogether verifies channels and mutexes work independently.
-func TestChannelAndMutexTogether(t *testing.T) {
-	d := NewDetector()
-	mutexAddr := uintptr(0x1000)
-	chAddr := uintptr(0x2000)
-	var1Addr := uintptr(0x3000)
-	var2Addr := uintptr(0x4000)
-
-	ctx0 := goroutine.Alloc(0)
-	ctx1 := goroutine.Alloc(1)
-
-	// Thread 0: Lock mutex, write var1, unlock.
-	d.OnAcquire(mutexAddr, ctx0)
-	d.OnWrite(var1Addr, ctx0, 0)
-	d.OnRelease(mutexAddr, ctx0)
-
-	// Thread 0: Write var2, send on channel.
-	d.OnWrite(var2Addr, ctx0, 0)
-	d.OnChannelSendAfter(chAddr, ctx0)
-
-	// Thread 1: Receive from channel, read var2 - should NOT race.
-	d.OnChannelRecvAfter(chAddr, ctx1)
-	d.OnRead(var2Addr, ctx1, 0)
-
-	// Thread 1: Lock mutex, read var1 - should NOT race.
-	d.OnAcquire(mutexAddr, ctx1)
-	d.OnRead(var1Addr, ctx1, 0)
-	d.OnRelease(mutexAddr, ctx1)
-
-	// Verify no races (both mutex and channel work correctly together).
-	if d.RacesDetected() != 0 {
-		t.Errorf("Expected 0 races (channel + mutex), got %d", d.RacesDetected())
-	}
-}
-
-// TestDetectorReset_ClearesChannelState verifies Reset clears channel state.
-func TestDetectorReset_ClearsChannelState(t *testing.T) {
-	d := NewDetector()
-	chAddr := uintptr(0x2000)
-	ctx := goroutine.Alloc(0)
-
-	// Create channel state.
-	d.OnChannelSendAfter(chAddr, ctx)
-
-	// Verify send clock exists.
-	syncVar := d.syncShadow.GetOrCreate(chAddr)
-	if syncVar.GetChannelSendClock() == nil {
-		t.Fatal("Expected send clock to exist before reset")
-	}
-
-	// Reset detector.
-	d.Reset()
-
-	// After reset, sync shadow should be cleared.
-	// GetOrCreate will return a NEW SyncVar with nil send clock.
-	syncVarAfterReset := d.syncShadow.GetOrCreate(chAddr)
-	if syncVarAfterReset.GetChannelSendClock() != nil {
-		t.Error("Expected send clock to be nil after reset")
-	}
-}
-
-// === BENCHMARKS (Phase 4 Task 4.2) ===
-
-// BenchmarkOnChannelSendBefore benchmarks channel send before tracking.
-// Target: <100ns/op (minimal overhead).
-func BenchmarkOnChannelSendBefore(b *testing.B) {
-	d := NewDetector()
-	ctx := goroutine.Alloc(0)
-	chAddr := uintptr(unsafe.Pointer(&d)) // Use detector's address as channel
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		d.OnChannelSendBefore(chAddr, ctx)
-	}
-}
-
-// BenchmarkOnChannelSendAfter benchmarks channel send after tracking.
-// Target: <500ns/op (VectorClock copy overhead acceptable).
-func BenchmarkOnChannelSendAfter(b *testing.B) {
-	d := NewDetector()
-	ctx := goroutine.Alloc(0)
-	chAddr := uintptr(unsafe.Pointer(&d))
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		d.OnChannelSendAfter(chAddr, ctx)
-	}
-}
-
-// BenchmarkOnChannelRecvBefore benchmarks channel receive before tracking.
-// Target: <100ns/op (minimal overhead).
-func BenchmarkOnChannelRecvBefore(b *testing.B) {
-	d := NewDetector()
-	ctx := goroutine.Alloc(0)
-	chAddr := uintptr(unsafe.Pointer(&d))
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		d.OnChannelRecvBefore(chAddr, ctx)
-	}
-}
-
-// BenchmarkOnChannelRecvAfter benchmarks channel receive after tracking.
-// Target: <500ns/op (VectorClock join overhead acceptable).
-func BenchmarkOnChannelRecvAfter(b *testing.B) {
-	d := NewDetector()
-	ctx := goroutine.Alloc(0)
-	chAddr := uintptr(unsafe.Pointer(&d))
-
-	// Set up a send clock (channel has been sent before).
-	d.OnChannelSendAfter(chAddr, ctx)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		d.OnChannelRecvAfter(chAddr, ctx)
-	}
-}
-
-// BenchmarkOnChannelClose benchmarks channel close tracking.
-// Target: <300ns/op (VectorClock copy overhead acceptable).
-func BenchmarkOnChannelClose(b *testing.B) {
-	d := NewDetector()
-	ctx := goroutine.Alloc(0)
-	chAddr := uintptr(unsafe.Pointer(&d))
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		// Reset channel state for each iteration (close is one-time operation).
-		d.syncShadow.Reset()
-		d.OnChannelClose(chAddr, ctx)
-	}
-}
-
-// BenchmarkChannelSynchronizedAccess benchmarks full send/recv cycle.
-func BenchmarkChannelSynchronizedAccess(b *testing.B) {
-	d := NewDetector()
-	ctx := goroutine.Alloc(0)
-	chAddr := uintptr(0x2000)
-	varAddr := uintptr(0x3000)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		d.OnWrite(varAddr, ctx, 0)
-		d.OnChannelSendAfter(chAddr, ctx)
-		d.OnChannelRecvAfter(chAddr, ctx)
-		d.OnRead(varAddr, ctx, 0)
-	}
-}
-
-// === WaitGroup Tests (Phase 4 Task 4.3) ===
-
-// TestOnWaitGroupAdd_Basic verifies OnWaitGroupAdd increments counter.
-func TestOnWaitGroupAdd_Basic(t *testing.T) {
-	d := NewDetector()
-	ctx := goroutine.Alloc(0)
-	wgAddr := uintptr(0x1234)
-
-	initialClock := ctx.C.Get(0)
-
-	// OnWaitGroupAdd(1) should increment counter.
-	d.OnWaitGroupAdd(wgAddr, 1, ctx)
-
-	// Verify clock was incremented.
-	if ctx.C.Get(0) != initialClock+1 {
-		t.Errorf("Expected clock to increment from %d to %d, got %d",
-			initialClock, initialClock+1, ctx.C.Get(0))
-	}
-
-	// Verify counter was set.
-	syncVar := d.syncShadow.GetOrCreate(wgAddr)
-	if syncVar.GetWaitGroupCounter() != 1 {
-		t.Errorf("Expected counter=1, got %d", syncVar.GetWaitGroupCounter())
-	}
-}
-
-// TestOnWaitGroupDone_Basic verifies OnWaitGroupDone merges clock.
-func TestOnWaitGroupDone_Basic(t *testing.T) {
-	d := NewDetector()
-	ctx := goroutine.Alloc(0)
-	wgAddr := uintptr(0x1234)
-
-	// First, Add(1) to set counter.
-	d.OnWaitGroupAdd(wgAddr, 1, ctx)
-
-	// Advance clock to simulate work.
-	ctx.IncrementClock()
-	ctx.IncrementClock()
-	clockBeforeDone := ctx.C.Get(0)
-
-	// OnWaitGroupDone should merge clock into doneClock.
-	d.OnWaitGroupDone(wgAddr, ctx)
-
-	// Verify clock was incremented.
-	if ctx.C.Get(0) != clockBeforeDone+1 {
-		t.Errorf("Expected clock to increment from %d to %d, got %d",
-			clockBeforeDone, clockBeforeDone+1, ctx.C.Get(0))
-	}
-
-	// Verify doneClock was set.
-	syncVar := d.syncShadow.GetOrCreate(wgAddr)
-	doneClock := syncVar.GetWaitGroupDoneClock()
-	if doneClock == nil {
-		t.Fatal("Expected doneClock to be set")
-	}
-	// doneClock should have the clock value BEFORE Done incremented it.
-	if doneClock.Get(0) != clockBeforeDone {
-		t.Errorf("Expected doneClock[0]=%d, got %d", clockBeforeDone, doneClock.Get(0))
-	}
-
-	// Verify counter was decremented.
-	if syncVar.GetWaitGroupCounter() != 0 {
-		t.Errorf("Expected counter=0 after Done, got %d", syncVar.GetWaitGroupCounter())
-	}
-}
-
-// TestOnWaitGroupWaitAfter_MergesDoneClock verifies Wait merges doneClock.
-func TestOnWaitGroupWaitAfter_MergesDoneClock(t *testing.T) {
-	d := NewDetector()
-	wgAddr := uintptr(0x1234)
-
-	// Child goroutine: Add(1), do work, Done().
-	childCtx := goroutine.Alloc(1)
-	d.OnWaitGroupAdd(wgAddr, 1, childCtx)
-	for i := 0; i < 5; i++ {
-		childCtx.IncrementClock()
-	}
-	childClockBeforeDone := childCtx.C.Get(1)
-	d.OnWaitGroupDone(wgAddr, childCtx)
-
-	// Parent goroutine: Wait().
-	parentCtx := goroutine.Alloc(0)
-	initialParentClock := parentCtx.C.Get(0)
-
-	d.OnWaitGroupWaitBefore(wgAddr, parentCtx)
-	d.OnWaitGroupWaitAfter(wgAddr, parentCtx)
-
-	// Parent should now see child's clock.
-	if parentCtx.C.Get(1) != childClockBeforeDone {
-		t.Errorf("Expected parent to see child's clock %d, got %d",
-			childClockBeforeDone, parentCtx.C.Get(1))
-	}
-
-	// Parent's own clock should have incremented (WaitBefore + WaitAfter).
-	// WaitBefore: +1, WaitAfter: +1 = +2 total.
-	expectedParentClock := initialParentClock + 2
-	if parentCtx.C.Get(0) != expectedParentClock {
-		t.Errorf("Expected parent clock %d, got %d",
-			expectedParentClock, parentCtx.C.Get(0))
-	}
-}
-
-// TestWaitGroupProtectedNoRace verifies WaitGroup-protected code does NOT report races.
-func TestWaitGroupProtectedNoRace(t *testing.T) {
-	d := NewDetector()
-	wgAddr := uintptr(0x1234)
-	varAddr := uintptr(0x5678)
-
-	// Child goroutine: write, then Done().
-	childCtx := goroutine.Alloc(1)
-	d.OnWaitGroupAdd(wgAddr, 1, childCtx)
-	d.OnWrite(varAddr, childCtx, 0) // Child writes
-	d.OnWaitGroupDone(wgAddr, childCtx)
-
-	// Parent goroutine: Wait(), then read.
-	parentCtx := goroutine.Alloc(0)
-	d.OnWaitGroupWaitBefore(wgAddr, parentCtx)
-	d.OnWaitGroupWaitAfter(wgAddr, parentCtx) // Parent sees child's clock
-	d.OnRead(varAddr, parentCtx, 0)              // Parent reads (should NOT race)
-
-	// Verify no races detected.
-	if d.RacesDetected() != 0 {
-		t.Errorf("Expected 0 races (WaitGroup protected), got %d", d.RacesDetected())
-	}
-}
-
-// TestWaitGroupMultipleChildren verifies multiple children synchronize correctly.
-func TestWaitGroupMultipleChildren(t *testing.T) {
-	d := NewDetector()
-	wgAddr := uintptr(0x1234)
-	var1Addr := uintptr(0x5000)
-	var2Addr := uintptr(0x6000)
-	var3Addr := uintptr(0x7000)
-
-	// Parent: Add(3).
-	parentCtx := goroutine.Alloc(0)
-	d.OnWaitGroupAdd(wgAddr, 3, parentCtx)
-
-	// Child 1: Write var1, Done().
-	child1Ctx := goroutine.Alloc(1)
-	d.OnWrite(var1Addr, child1Ctx, 0)
-	d.OnWaitGroupDone(wgAddr, child1Ctx)
-
-	// Child 2: Write var2, Done().
-	child2Ctx := goroutine.Alloc(2)
-	d.OnWrite(var2Addr, child2Ctx, 0)
-	d.OnWaitGroupDone(wgAddr, child2Ctx)
-
-	// Child 3: Write var3, Done().
-	child3Ctx := goroutine.Alloc(3)
-	d.OnWrite(var3Addr, child3Ctx, 0)
-	d.OnWaitGroupDone(wgAddr, child3Ctx)
-
-	// Parent: Wait(), then read all variables.
-	d.OnWaitGroupWaitBefore(wgAddr, parentCtx)
-	d.OnWaitGroupWaitAfter(wgAddr, parentCtx)
-	d.OnRead(var1Addr, parentCtx, 0) // Should NOT race
-	d.OnRead(var2Addr, parentCtx, 0) // Should NOT race
-	d.OnRead(var3Addr, parentCtx, 0) // Should NOT race
-
-	// Verify no races detected.
-	if d.RacesDetected() != 0 {
-		t.Errorf("Expected 0 races (3 children synchronized), got %d", d.RacesDetected())
-	}
-
-	// Verify parent sees all children's clocks.
-	if parentCtx.C.Get(1) == 0 || parentCtx.C.Get(2) == 0 || parentCtx.C.Get(3) == 0 {
-		t.Error("Parent did not see all children's clocks")
-	}
-}
-
-// TestWaitGroupUnprotectedStillDetectsRace verifies unprotected access still races.
-func TestWaitGroupUnprotectedStillDetectsRace(t *testing.T) {
-	d := NewDetector()
-	varAddr := uintptr(0x5678)
-
-	// Child goroutine: Write (NO WaitGroup Done).
-	childCtx := goroutine.Alloc(1)
-	for i := 0; i < 5; i++ {
-		childCtx.IncrementClock()
-	}
-	d.OnWrite(varAddr, childCtx, 0)
-
-	// Parent goroutine: Read (NO WaitGroup Wait).
-	parentCtx := goroutine.Alloc(0)
-	d.OnRead(varAddr, parentCtx, 0)
-
-	// Verify race was detected (no happens-before established).
-	if d.RacesDetected() != 1 {
-		t.Errorf("Expected 1 race (unprotected), got %d", d.RacesDetected())
-	}
-}
-
-// TestWaitGroupNestedUsage verifies nested WaitGroup patterns.
-func TestWaitGroupNestedUsage(t *testing.T) {
-	d := NewDetector()
-	wg1Addr := uintptr(0x1000)
-	wg2Addr := uintptr(0x2000)
-	varAddr := uintptr(0x5678)
-
-	// Parent: Add(1) for wg1.
-	parentCtx := goroutine.Alloc(0)
-	d.OnWaitGroupAdd(wg1Addr, 1, parentCtx)
-
-	// Child: Add(1) for wg2, write, Done(wg2), Done(wg1).
-	childCtx := goroutine.Alloc(1)
-	d.OnWaitGroupAdd(wg2Addr, 1, childCtx)
-
-	// Grandchild: Write, Done(wg2).
-	grandchildCtx := goroutine.Alloc(2)
-	d.OnWrite(varAddr, grandchildCtx, 0)
-	d.OnWaitGroupDone(wg2Addr, grandchildCtx)
-
-	// Child: Wait(wg2), Done(wg1).
-	d.OnWaitGroupWaitBefore(wg2Addr, childCtx)
-	d.OnWaitGroupWaitAfter(wg2Addr, childCtx)
-	d.OnWaitGroupDone(wg1Addr, childCtx)
-
-	// Parent: Wait(wg1), read.
-	d.OnWaitGroupWaitBefore(wg1Addr, parentCtx)
-	d.OnWaitGroupWaitAfter(wg1Addr, parentCtx)
-	d.OnRead(varAddr, parentCtx, 0)
-
-	// Verify no races (transitivity of happens-before).
-	if d.RacesDetected() != 0 {
-		t.Errorf("Expected 0 races (nested WaitGroups), got %d", d.RacesDetected())
-	}
-}
-
-// TestWaitGroupReadAfterWaitNoRace verifies read after Wait does not race.
-func TestWaitGroupReadAfterWaitNoRace(t *testing.T) {
-	d := NewDetector()
-	wgAddr := uintptr(0x1234)
-	varAddr := uintptr(0x5678)
-
-	// Parent: Add(2).
-	parentCtx := goroutine.Alloc(0)
-	d.OnWaitGroupAdd(wgAddr, 2, parentCtx)
-
-	// Child 1: Write, Done().
-	child1Ctx := goroutine.Alloc(1)
-	d.OnWrite(varAddr, child1Ctx, 0)
-	d.OnWaitGroupDone(wgAddr, child1Ctx)
-
-	// Child 2: Done() (no write).
-	child2Ctx := goroutine.Alloc(2)
-	d.OnWaitGroupDone(wgAddr, child2Ctx)
-
-	// Parent: Wait(), read.
-	d.OnWaitGroupWaitBefore(wgAddr, parentCtx)
-	d.OnWaitGroupWaitAfter(wgAddr, parentCtx)
-	d.OnRead(varAddr, parentCtx, 0)
-
-	// Verify no races.
-	if d.RacesDetected() != 0 {
-		t.Errorf("Expected 0 races, got %d", d.RacesDetected())
-	}
-}
-
-// TestWaitGroupMultipleWaits verifies multiple Wait() calls work correctly.
-func TestWaitGroupMultipleWaits(t *testing.T) {
-	d := NewDetector()
-	wgAddr := uintptr(0x1234)
-	varAddr := uintptr(0x5678)
-
-	// Child: Add(1), Write, Done().
-	childCtx := goroutine.Alloc(1)
-	d.OnWaitGroupAdd(wgAddr, 1, childCtx)
-	d.OnWrite(varAddr, childCtx, 0)
-	d.OnWaitGroupDone(wgAddr, childCtx)
-
-	// Parent 1: Wait(), read.
-	parent1Ctx := goroutine.Alloc(0)
-	d.OnWaitGroupWaitBefore(wgAddr, parent1Ctx)
-	d.OnWaitGroupWaitAfter(wgAddr, parent1Ctx)
-	d.OnRead(varAddr, parent1Ctx, 0)
-
-	// Parent 2: Wait(), read (should also be safe).
-	parent2Ctx := goroutine.Alloc(2)
-	d.OnWaitGroupWaitBefore(wgAddr, parent2Ctx)
-	d.OnWaitGroupWaitAfter(wgAddr, parent2Ctx)
-	d.OnRead(varAddr, parent2Ctx, 0)
-
-	// Verify no races (both parents see child's write).
-	if d.RacesDetected() != 0 {
-		t.Errorf("Expected 0 races (multiple waits), got %d", d.RacesDetected())
-	}
-}
-
-// BenchmarkOnWaitGroupAdd benchmarks WaitGroup Add tracking.
-// Target: <200ns/op (minimal overhead).
-func BenchmarkOnWaitGroupAdd(b *testing.B) {
-	d := NewDetector()
-	ctx := goroutine.Alloc(0)
-	wgAddr := uintptr(unsafe.Pointer(&d))
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		d.OnWaitGroupAdd(wgAddr, 1, ctx)
-	}
-}
-
-// BenchmarkOnWaitGroupDone benchmarks WaitGroup Done tracking.
-// Target: <500ns/op (VectorClock merge overhead acceptable).
-func BenchmarkOnWaitGroupDone(b *testing.B) {
-	d := NewDetector()
-	ctx := goroutine.Alloc(0)
-	wgAddr := uintptr(unsafe.Pointer(&d))
-
-	// Set up Add(1) first.
-	d.OnWaitGroupAdd(wgAddr, 1, ctx)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		d.OnWaitGroupDone(wgAddr, ctx)
-		// Reset counter for next iteration.
-		d.syncShadow.GetOrCreate(wgAddr).WaitGroupAdd(1)
-	}
-}
-
-// BenchmarkOnWaitGroupWaitBefore benchmarks WaitGroup WaitBefore tracking.
-// Target: <100ns/op (minimal overhead).
-func BenchmarkOnWaitGroupWaitBefore(b *testing.B) {
-	d := NewDetector()
-	ctx := goroutine.Alloc(0)
-	wgAddr := uintptr(unsafe.Pointer(&d))
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		d.OnWaitGroupWaitBefore(wgAddr, ctx)
-	}
-}
-
-// BenchmarkOnWaitGroupWaitAfter benchmarks WaitGroup WaitAfter tracking.
-// Target: <500ns/op (VectorClock merge overhead acceptable).
-func BenchmarkOnWaitGroupWaitAfter(b *testing.B) {
-	d := NewDetector()
-	ctx := goroutine.Alloc(0)
-	wgAddr := uintptr(unsafe.Pointer(&d))
-
-	// Set up Done() first so there's a doneClock to merge.
-	childCtx := goroutine.Alloc(1)
-	d.OnWaitGroupAdd(wgAddr, 1, childCtx)
-	d.OnWaitGroupDone(wgAddr, childCtx)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		d.OnWaitGroupWaitAfter(wgAddr, ctx)
-	}
-}
-
-// BenchmarkWaitGroupSynchronizedAccess benchmarks full WaitGroup cycle.
-func BenchmarkWaitGroupSynchronizedAccess(b *testing.B) {
-	d := NewDetector()
-	parentCtx := goroutine.Alloc(0)
-	childCtx := goroutine.Alloc(1)
-	wgAddr := uintptr(0x1234)
-	varAddr := uintptr(0x5678)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		d.OnWaitGroupAdd(wgAddr, 1, parentCtx)
-		d.OnWrite(varAddr, childCtx, 0)
-		d.OnWaitGroupDone(wgAddr, childCtx)
-		d.OnWaitGroupWaitBefore(wgAddr, parentCtx)
-		d.OnWaitGroupWaitAfter(wgAddr, parentCtx)
-		d.OnRead(varAddr, parentCtx, 0)
-		// Reset for next iteration.
-		d.Reset()
+	close(start)
+	callbacks.Wait()
+
+	for i, sender := range senders {
+		receiver := goroutine.Alloc(uint32(workers + i))
+		d.OnAcquire(slotsBase+uintptr(i)*8, receiver)
+		want := sender.C.Get(sender.TID) - 1
+		if got := receiver.C.Get(sender.TID); got != want {
+			t.Fatalf("slot %d saw sender clock %d, want %d", i, got, want)
+		}
+		other := senders[(i+1)%workers]
+		if got := receiver.C.Get(other.TID); got != 0 {
+			t.Fatalf("slot %d spuriously saw slot %d sender clock %d", i, (i+1)%workers, got)
+		}
 	}
 }

@@ -129,6 +129,7 @@ func TestGetGoroutineID(t *testing.T) {
 
 // TestGetCurrentContext_FirstCall verifies context allocation on first call.
 func TestGetCurrentContext_FirstCall(t *testing.T) {
+	base := nextTID.Load()
 	// Reset state to ensure clean test.
 	Reset()
 
@@ -138,17 +139,18 @@ func TestGetCurrentContext_FirstCall(t *testing.T) {
 		t.Fatal("getCurrentContext() returned nil")
 	}
 
-	// TID should be 0 (first allocated from pool after Reset).
-	if ctx.TID != 0 {
-		t.Errorf("First context TID = %d, want 0", ctx.TID)
+	// TID 0 is reserved and Reset does not recycle process-lifetime IDs.
+	wantTID := base + 1
+	if ctx.TID != wantTID {
+		t.Errorf("First context TID = %d, want %d", ctx.TID, wantTID)
 	}
 
-	// Epoch should be initialized to 0@1.
+	// Epoch should be initialized to 1@1.
 	// CRITICAL: Clock must start at 1, not 0, to detect unsynchronized races.
 	// Clock 0 means "never happened" in HappensBefore check (0 <= 0 is TRUE).
 	tid, clock := ctx.Epoch.Decode()
-	if tid != 0 {
-		t.Errorf("First context Epoch TID = %d, want 0", tid)
+	if tid != wantTID {
+		t.Errorf("First context Epoch TID = %d, want %d", tid, wantTID)
 	}
 	if clock != 1 {
 		t.Errorf("First context Epoch Clock = %d, want 1", clock)
@@ -179,8 +181,8 @@ func TestGetCurrentContext_Concurrent(t *testing.T) {
 
 	// Launch 100 goroutines concurrently.
 	var wg sync.WaitGroup
-	contexts := make([]uint16, numGoroutines) // Store TIDs instead of contexts
-	tids := make([]uint16, numGoroutines)
+	contexts := make([]uint32, numGoroutines) // Store TIDs instead of contexts
+	tids := make([]uint32, numGoroutines)
 
 	for i := 0; i < numGoroutines; i++ {
 		wg.Add(1)
@@ -197,9 +199,9 @@ func TestGetCurrentContext_Concurrent(t *testing.T) {
 	// All contexts should have been allocated (TIDs should be set).
 	// This is verified by TID uniqueness check below.
 
-	// Verify TIDs are unique (within uint16 range 0-65535).
+	// Verify monotonic logical IDs are unique.
 	// Since we have 100 goroutines, all should be unique.
-	tidSet := make(map[uint16]bool)
+	tidSet := make(map[uint32]bool)
 	for i, tid := range tids {
 		if tidSet[tid] {
 			t.Errorf("Duplicate TID %d at index %d", tid, i)
@@ -207,20 +209,20 @@ func TestGetCurrentContext_Concurrent(t *testing.T) {
 		tidSet[tid] = true
 	}
 
-	// Verify we allocated 100 unique TIDs (0-99).
+	// Verify we allocated 100 unique logical IDs.
 	if len(tidSet) != numGoroutines {
 		t.Errorf("Expected %d unique TIDs, got %d", numGoroutines, len(tidSet))
 	}
 }
 
-// TestGetCurrentContext_TIDPoolAllocation verifies TID pool allocation.
-// Phase 2 Task 2.2: TIDs are now allocated from a reuse pool, not by wrapping.
-func TestGetCurrentContext_TIDPoolAllocation(t *testing.T) {
+// TestGetCurrentContext_MonotonicTIDAllocation verifies logical-ID allocation.
+func TestGetCurrentContext_MonotonicTIDAllocation(t *testing.T) {
 	Reset()
+	base := nextTID.Load()
 
 	// Allocate 5 contexts in new goroutines.
-	// With TID pool, they should get TIDs: 0, 1, 2, 3, 4 (sequential from pool).
-	tids := make([]uint16, 5)
+	// They should receive the first five non-zero logical IDs.
+	tids := make([]uint32, 5)
 	var wg sync.WaitGroup
 
 	for i := 0; i < 5; i++ {
@@ -235,17 +237,19 @@ func TestGetCurrentContext_TIDPoolAllocation(t *testing.T) {
 
 	wg.Wait()
 
-	// Expected TIDs: 0, 1, 2, 3, 4 (in some order due to concurrency).
-	// With TID pool initialized to [0, 1, 2, ..., 65535], we allocate from front (FIFO).
-	expected := map[uint16]bool{0: true, 1: true, 2: true, 3: true, 4: true}
+	// Expect the next five process-lifetime IDs in some order due to concurrency.
+	expected := make(map[uint32]bool, len(tids))
+	for i := uint32(1); i <= uint32(len(tids)); i++ {
+		expected[base+i] = true
+	}
 	for i, tid := range tids {
 		if !expected[tid] {
-			t.Errorf("TID at index %d = %d, expected one of {0, 1, 2, 3, 4}", i, tid)
+			t.Errorf("TID at index %d = %d, expected range [%d,%d]", i, tid, base+1, base+uint32(len(tids)))
 		}
 	}
 
 	// Verify all TIDs are unique.
-	tidSet := make(map[uint16]bool)
+	tidSet := make(map[uint32]bool)
 	for _, tid := range tids {
 		if tidSet[tid] {
 			t.Errorf("Duplicate TID %d", tid)
@@ -387,13 +391,14 @@ func TestReset(t *testing.T) {
 	// Do some operations to create state.
 	racewrite(uintptr(0x6000), 0)
 	getCurrentContext() // Allocate context
+	highWater := nextTID.Load()
 
 	// Reset.
 	Reset()
 
-	// Verify nextTID reset to 0.
-	if got := nextTID.Load(); got != 0 {
-		t.Errorf("After Reset(), nextTID = %d, want 0", got)
+	// Reset clears state without recycling a logical ID.
+	if got := nextTID.Load(); got != highWater {
+		t.Errorf("After Reset(), nextTID = %d, want preserved high-water %d", got, highWater)
 	}
 
 	// Verify races counter reset.
@@ -402,10 +407,10 @@ func TestReset(t *testing.T) {
 	}
 
 	// Verify contexts cleared.
-	// Allocate context - should get TID 0 again.
+	// Allocate context - should get the next process-lifetime TID.
 	ctx := getCurrentContext()
-	if ctx.TID != 0 {
-		t.Errorf("After Reset(), first context TID = %d, want 0", ctx.TID)
+	if ctx.TID != highWater+1 {
+		t.Errorf("After Reset(), first context TID = %d, want %d", ctx.TID, highWater+1)
 	}
 }
 
@@ -521,7 +526,7 @@ func TestMultipleGoroutinesUniqueContexts(t *testing.T) {
 	Reset()
 
 	const numGoroutines = 20
-	tids := make([]uint16, numGoroutines)
+	tids := make([]uint32, numGoroutines)
 	var wg sync.WaitGroup
 
 	for i := 0; i < numGoroutines; i++ {
@@ -537,7 +542,7 @@ func TestMultipleGoroutinesUniqueContexts(t *testing.T) {
 	wg.Wait()
 
 	// Verify all TIDs are unique.
-	tidSet := make(map[uint16]bool)
+	tidSet := make(map[uint32]bool)
 	for i, tid := range tids {
 		if tidSet[tid] {
 			t.Errorf("TID %d at index %d is duplicate", tid, i)
@@ -641,6 +646,7 @@ func TestContextCaching_Performance(t *testing.T) {
 
 // TestInitFunctionality verifies Init() correctly initializes the detector.
 func TestInitFunctionality(t *testing.T) {
+	highWater := nextTID.Load()
 	// Call Init to reset everything.
 	Init()
 
@@ -649,23 +655,19 @@ func TestInitFunctionality(t *testing.T) {
 		t.Error("Init() did not enable detector")
 	}
 
-	// Verify nextTID is set to 2 after Init().
-	// Init() allocates TID=1 for the main goroutine (TID=0 is reserved as sentinel
-	// meaning "no exclusive writer" in SmartTrack), then sets nextTID to 2
-	// to ensure subsequent goroutines get TID >= 2.
-	expectedNextTID := uint32(2)
+	// Init allocates a fresh main context without recycling prior IDs.
+	expectedNextTID := highWater + 1
 	if got := nextTID.Load(); got != expectedNextTID {
 		t.Errorf("After Init(), nextTID = %d, want %d", got, expectedNextTID)
 	}
 
-	// Verify main goroutine has TID=1.
-	// TID=0 is reserved as sentinel value in SmartTrack.
+	// Verify the main context owns the newly allocated logical ID.
 	ctx := getCurrentContext()
 	if ctx == nil {
 		t.Fatal("getCurrentContext() returned nil after Init()")
 	}
-	if ctx.TID != 1 {
-		t.Errorf("Main goroutine TID = %d, want 1", ctx.TID)
+	if ctx.TID != expectedNextTID {
+		t.Errorf("Main goroutine TID = %d, want %d", ctx.TID, expectedNextTID)
 	}
 
 	// Verify detector instance is not nil.
@@ -683,6 +685,7 @@ func TestInitFunctionality(t *testing.T) {
 func TestInitIdempotent(t *testing.T) {
 	// First Init.
 	Init()
+	firstMainTID := getCurrentContext().TID
 
 	// Do some operations to create state.
 	addr := uintptr(0x9000)
@@ -697,11 +700,10 @@ func TestInitIdempotent(t *testing.T) {
 		t.Errorf("After second Init(), RacesDetected() = %d, want 0", got)
 	}
 
-	// Verify main goroutine still has TID=1.
-	// TID=0 is reserved as sentinel value in SmartTrack.
+	// Reinitialization creates a fresh lifetime rather than reusing the first.
 	ctx := getCurrentContext()
-	if ctx.TID != 1 {
-		t.Errorf("After second Init(), main goroutine TID = %d, want 1", ctx.TID)
+	if ctx.TID <= firstMainTID {
+		t.Errorf("After second Init(), main goroutine TID = %d, want > %d", ctx.TID, firstMainTID)
 	}
 
 	// Verify enabled.
@@ -710,21 +712,20 @@ func TestInitIdempotent(t *testing.T) {
 	}
 }
 
-// TestInitMainGoroutineTID verifies main goroutine always gets TID=1.
-// TID=0 is reserved as sentinel value in SmartTrack meaning "no exclusive writer".
+// TestInitMainGoroutineTID verifies the main goroutine gets a non-zero logical
+// ID and a spawned lifetime gets a later distinct ID.
 func TestInitMainGoroutineTID(t *testing.T) {
 	// Reset and Init.
 	Init()
 
-	// Main goroutine (this test) should have TID=1.
 	// TID=0 is reserved as sentinel value.
 	mainCtx := getCurrentContext()
-	if mainCtx.TID != 1 {
-		t.Errorf("Main goroutine TID = %d, want 1", mainCtx.TID)
+	if mainCtx.TID == 0 {
+		t.Error("Main goroutine TID = 0, reserved as sentinel")
 	}
 
 	// Spawn a new goroutine - should get TID=2 (or higher).
-	var spawnedTID uint16
+	var spawnedTID uint32
 	done := make(chan bool)
 	go func() {
 		spawnedCtx := getCurrentContext()
@@ -733,21 +734,26 @@ func TestInitMainGoroutineTID(t *testing.T) {
 	}()
 	<-done
 
-	// Spawned goroutine should NOT have TID=0 or TID=1.
-	// TID=0 is reserved as sentinel, TID=1 is reserved for main.
+	// Spawned goroutine should have a later process-lifetime ID.
 	if spawnedTID == 0 {
 		t.Error("Spawned goroutine incorrectly has TID=0 (reserved as sentinel)")
 	}
-	if spawnedTID == 1 {
-		t.Error("Spawned goroutine incorrectly has TID=1 (reserved for main)")
+	if spawnedTID <= mainCtx.TID {
+		t.Errorf("Spawned goroutine TID = %d, want > main TID %d", spawnedTID, mainCtx.TID)
 	}
 }
 
-// TestFiniOutput verifies Fini() prints correct summary.
+// TestFiniOutput verifies the deterministic formatter used by Fini and the
+// runtime.printstring output boundary.
 func TestFiniOutput(t *testing.T) {
-	// This test captures stderr output to verify Fini() output.
-	// We'll use a simpler approach: just verify Fini() doesn't panic.
-	// Actual output format can be manually verified.
+	const noRace = "\n==================\nRace Detector Report\n==================\nNo data races detected.\n==================\n\n"
+	if got := formatFiniSummary(0); got != noRace {
+		t.Errorf("zero-race summary mismatch:\n got %q\nwant %q", got, noRace)
+	}
+	const racy = "\n==================\nRace Detector Report\n==================\nWARNING: 3 data race(s) detected!\n\nSee above for details.\n==================\n\n"
+	if got := formatFiniSummary(3); got != racy {
+		t.Errorf("racy summary mismatch:\n got %q\nwant %q", got, racy)
+	}
 
 	Init()
 
@@ -758,9 +764,6 @@ func TestFiniOutput(t *testing.T) {
 		}
 	}()
 
-	// Note: Fini() prints to stderr, which is hard to capture in tests.
-	// For MVP, we just verify it doesn't crash.
-	// In Phase 7, we could add output redirection for testing.
 	Fini()
 
 	// Verify detector is disabled after Fini.
@@ -862,14 +865,15 @@ func TestInitResetsState(t *testing.T) {
 		addr := uintptr(0xc000 + i)
 		racewrite(addr, 0)
 	}
+	highWater := nextTID.Load()
 
 	// Now Init again - should reset everything.
 	Init()
 
-	// Verify nextTID is back to 2 after Init().
-	// Init() allocates TID=1 for main (TID=0 is sentinel), then sets nextTID to 2.
-	if got := nextTID.Load(); got != 2 {
-		t.Errorf("After Init() reset, nextTID = %d, want 2", got)
+	// Init allocates a fresh main lifetime above the preserved high-water mark.
+	wantMainTID := highWater + 1
+	if got := nextTID.Load(); got != wantMainTID {
+		t.Errorf("After Init() reset, nextTID = %d, want %d", got, wantMainTID)
 	}
 
 	// Verify RacesDetected is 0.
@@ -877,11 +881,10 @@ func TestInitResetsState(t *testing.T) {
 		t.Errorf("After Init() reset, RacesDetected() = %d, want 0", got)
 	}
 
-	// Verify main goroutine has TID=1 again.
-	// TID=0 is reserved as sentinel value in SmartTrack.
+	// Verify main goroutine owns the fresh logical ID.
 	ctx := getCurrentContext()
-	if ctx.TID != 1 {
-		t.Errorf("After Init() reset, main goroutine TID = %d, want 1", ctx.TID)
+	if ctx.TID != wantMainTID {
+		t.Errorf("After Init() reset, main goroutine TID = %d, want %d", ctx.TID, wantMainTID)
 	}
 }
 
@@ -915,6 +918,7 @@ func TestInitAfterAutoInit(t *testing.T) {
 	// Before Init(), detector should be in some state.
 	// Let's do an operation.
 	racewrite(uintptr(0xd000), 0)
+	highWater := nextTID.Load()
 
 	// Now call Init().
 	Init()
@@ -924,10 +928,9 @@ func TestInitAfterAutoInit(t *testing.T) {
 		t.Errorf("After explicit Init(), RacesDetected() = %d, want 0", got)
 	}
 
-	// Main goroutine should have TID=1.
-	// TID=0 is reserved as sentinel value in SmartTrack.
+	// Main goroutine should get the next non-zero process-lifetime ID.
 	ctx := getCurrentContext()
-	if ctx.TID != 1 {
-		t.Errorf("After explicit Init(), main goroutine TID = %d, want 1", ctx.TID)
+	if ctx.TID != highWater+1 {
+		t.Errorf("After explicit Init(), main goroutine TID = %d, want %d", ctx.TID, highWater+1)
 	}
 }

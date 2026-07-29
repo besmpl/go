@@ -51,11 +51,7 @@ func TestVarState_MultipleReaders_Promotion(t *testing.T) {
 
 	// Second concurrent reader (TID=3) - different thread.
 	// This should trigger promotion.
-	vc := vectorclock.New()
-	vc.Set(3, 50)
-	vc.Set(5, 90) // Happens before first reader's clock (100).
-
-	vs.PromoteToReadClock(vc)
+	vs.PromoteToReadClock(epoch.NewEpoch(3, 50), nil)
 
 	// Should now be promoted.
 	if !vs.IsPromoted() {
@@ -118,10 +114,8 @@ func TestVarState_WriteDemotesReadClock(t *testing.T) {
 	vs := NewVarState()
 
 	// Promote to VectorClock.
-	vc := vectorclock.New()
-	vc.Set(5, 100)
-	vc.Set(3, 50)
-	vs.PromoteToReadClock(vc)
+	vs.PromoteToReadClock(epoch.NewEpoch(5, 100), nil)
+	vs.JoinReadClock(epoch.NewEpoch(3, 50), nil)
 
 	if !vs.IsPromoted() {
 		t.Fatal("Should be promoted after PromoteToReadClock")
@@ -161,9 +155,7 @@ func TestVarState_PromotionStats(t *testing.T) {
 	}
 
 	// Step 2: Promotion (concurrent readers).
-	vc := vectorclock.New()
-	vc.Set(3, 50)
-	vs.PromoteToReadClock(vc)
+	vs.PromoteToReadClock(epoch.NewEpoch(3, 50), nil)
 	if !vs.IsPromoted() {
 		t.Error("Step 2: Should be promoted")
 	}
@@ -176,9 +168,7 @@ func TestVarState_PromotionStats(t *testing.T) {
 
 	// Step 4: Re-promotion (new concurrent readers).
 	vs.SetReadEpoch(epoch.NewEpoch(7, 200))
-	vc2 := vectorclock.New()
-	vc2.Set(1, 150)
-	vs.PromoteToReadClock(vc2)
+	vs.PromoteToReadClock(epoch.NewEpoch(1, 150), nil)
 	if !vs.IsPromoted() {
 		t.Error("Step 4: Should be re-promoted")
 	}
@@ -202,13 +192,11 @@ func TestVarState_PromotionStats(t *testing.T) {
 func TestVarState_ConcurrentReads_1000Goroutines(t *testing.T) {
 	vs := NewVarState()
 
-	// Simulate 256 concurrent readers (max threads).
-	vc := vectorclock.New()
-	for tid := 0; tid < 256; tid++ {
-		vc.Set(uint16(tid), uint32(tid*10))
+	// Simulate 256 concurrent readers.
+	vs.PromoteToReadClock(epoch.NewEpoch(1, 10), nil)
+	for tid := 2; tid <= 256; tid++ {
+		vs.JoinReadClock(epoch.NewEpoch(uint32(tid), uint64(tid*10)), nil)
 	}
-
-	vs.PromoteToReadClock(vc)
 
 	if !vs.IsPromoted() {
 		t.Fatal("Should be promoted with 256 concurrent readers")
@@ -216,10 +204,10 @@ func TestVarState_ConcurrentReads_1000Goroutines(t *testing.T) {
 
 	// Verify all readers are tracked.
 	rc := vs.GetReadClock()
-	for tid := 0; tid < 256; tid++ {
+	for tid := 1; tid <= 256; tid++ {
 		expected := uint32(tid * 10)
-		if rc.Get(uint16(tid)) != expected {
-			t.Errorf("ReadClock[%d] = %d, want %d", tid, rc.Get(uint16(tid)), expected)
+		if rc.Get(uint32(tid)) != expected {
+			t.Errorf("ReadClock[%d] = %d, want %d", tid, rc.Get(uint32(tid)), expected)
 		}
 	}
 
@@ -245,11 +233,7 @@ func TestVarState_PromotionTrigger_SecondReader(t *testing.T) {
 	}
 
 	// Reader 2 (TID=3, Clock=50) - concurrent (not happens-before reader 1).
-	vc := vectorclock.New()
-	vc.Set(3, 50)
-	// Note: vc[5] = 0, which is < 100, so this read is concurrent with reader 1.
-
-	vs.PromoteToReadClock(vc)
+	vs.PromoteToReadClock(epoch.NewEpoch(3, 50), nil)
 
 	// After promotion.
 	if !vs.IsPromoted() {
@@ -324,10 +308,7 @@ func TestVarState_String_PromotedFormat(t *testing.T) {
 	}
 
 	// Promoted.
-	vc := vectorclock.New()
-	vc.Set(3, 50)
-	vc.Set(7, 60)
-	vs.PromoteToReadClock(vc)
+	vs.PromoteToReadClock(epoch.NewEpoch(7, 60), nil)
 
 	promoted := vs.String()
 	// Should contain "PROMOTED" and VectorClock representation.
@@ -344,7 +325,7 @@ func TestVarState_InlineSlots_4Readers(t *testing.T) {
 	vs := NewVarState()
 
 	// Add 4 readers (should all fit in inline slots, no VectorClock allocation).
-	for i := uint16(1); i <= 4; i++ {
+	for i := uint32(1); i <= 4; i++ {
 		added := vs.AddReader(epoch.NewEpoch(i, uint64(100*i)))
 		if !added {
 			t.Errorf("AddReader(%d) should succeed for inline slot", i)
@@ -375,9 +356,7 @@ func TestVarState_InlineSlots_4Readers(t *testing.T) {
 	}
 
 	// Now promote to VectorClock.
-	vc := vectorclock.New()
-	vc.Set(5, 500)
-	vs.PromoteToReadClock(vc)
+	vs.PromoteToReadClock(epoch.NewEpoch(5, 500), nil)
 
 	// Should now be promoted.
 	if !vs.IsPromoted() {
@@ -390,7 +369,7 @@ func TestVarState_InlineSlots_4Readers(t *testing.T) {
 		t.Fatal("ReadClock should not be nil after promotion")
 	}
 
-	for i := uint16(1); i <= 4; i++ {
+	for i := uint32(1); i <= 4; i++ {
 		if rc.Get(i) != uint32(100*int(i)) {
 			t.Errorf("ReadClock[%d] = %d, want %d", i, rc.Get(i), 100*i)
 		}
@@ -437,9 +416,7 @@ func TestVarState_Reset_ClearsPromotion(t *testing.T) {
 	vs := NewVarState()
 
 	// Promote.
-	vc := vectorclock.New()
-	vc.Set(5, 100)
-	vs.PromoteToReadClock(vc)
+	vs.PromoteToReadClock(epoch.NewEpoch(5, 100), nil)
 
 	if !vs.IsPromoted() {
 		t.Fatal("Setup failed: should be promoted")
@@ -475,9 +452,7 @@ func TestVarState_PromoteZeroEpoch(t *testing.T) {
 	}
 
 	// Promote with new reader.
-	vc := vectorclock.New()
-	vc.Set(5, 100)
-	vs.PromoteToReadClock(vc)
+	vs.PromoteToReadClock(epoch.NewEpoch(5, 100), nil)
 
 	if !vs.IsPromoted() {
 		t.Error("Should be promoted even when readEpoch was 0")
@@ -490,7 +465,7 @@ func TestVarState_PromoteZeroEpoch(t *testing.T) {
 	}
 
 	// Other threads should be 0.
-	for tid := uint16(0); tid < 65535; tid++ {
+	for tid := uint32(0); tid < vectorclock.MaxThreads; tid++ {
 		if tid != 5 && rc.Get(tid) != 0 {
 			t.Errorf("ReadClock[%d] = %d, want 0", tid, rc.Get(tid))
 		}
@@ -499,20 +474,19 @@ func TestVarState_PromoteZeroEpoch(t *testing.T) {
 	t.Logf("Promoted from zero epoch: %s", vs.String())
 }
 
-// TestVarState_SetReadEpoch_WhenPromoted tests that SetReadEpoch is no-op when promoted.
+// TestVarState_SetReadEpoch_WhenPromoted tests that SetReadEpoch joins the
+// promoted representation without demoting it.
 func TestVarState_SetReadEpoch_WhenPromoted(t *testing.T) {
 	vs := NewVarState()
 
 	// Promote.
-	vc := vectorclock.New()
-	vc.Set(5, 100)
-	vs.PromoteToReadClock(vc)
+	vs.PromoteToReadClock(epoch.NewEpoch(5, 100), nil)
 
 	if !vs.IsPromoted() {
 		t.Fatal("Setup failed: should be promoted")
 	}
 
-	// Try to set read epoch (should be no-op).
+	// Record another read in the promoted representation.
 	vs.SetReadEpoch(epoch.NewEpoch(3, 50))
 
 	// Should remain promoted.
@@ -520,16 +494,19 @@ func TestVarState_SetReadEpoch_WhenPromoted(t *testing.T) {
 		t.Error("SetReadEpoch should not demote promoted state")
 	}
 
-	// ReadEpoch should still be 0 (SetReadEpoch is no-op when promoted).
+	// The lock-free inline epoch remains retired while promoted.
 	if vs.GetReadEpoch() != 0 {
-		t.Error("SetReadEpoch should be no-op when promoted")
+		t.Error("SetReadEpoch should not revive inline state when promoted")
 	}
 
-	// ReadClock should be unchanged.
+	// ReadClock retains the original reader and joins the new one.
 	rc := vs.GetReadClock()
 	if rc.Get(5) != 100 {
-		t.Error("ReadClock should be unchanged after SetReadEpoch")
+		t.Error("ReadClock lost original reader after SetReadEpoch")
+	}
+	if rc.Get(3) != 50 {
+		t.Errorf("ReadClock[3] = %d, want 50", rc.Get(3))
 	}
 
-	t.Logf("SetReadEpoch no-op when promoted: %s", vs.String())
+	t.Logf("SetReadEpoch joined promoted state: %s", vs.String())
 }

@@ -51,6 +51,15 @@ TEXT	runtime·raceread<ABIInternal>(SB), NOSPLIT, $0-8
 	MOVQ	$__tsan_read(SB), AX
 	JMP	racecalladdr<>(SB)
 
+// func runtime·racereadn(addr, size uintptr)
+// The Pure-Go backend uses size for exact scalar overlap tracking. TSAN keeps
+// its established scalar access and caller-PC semantics, so size is ignored.
+TEXT	runtime·racereadn<ABIInternal>(SB), NOSPLIT, $0-16
+	MOVQ	AX, RARG1
+	MOVQ	(SP), RARG2
+	MOVQ	$__tsan_read(SB), AX
+	JMP	racecalladdr<>(SB)
+
 // func runtime·RaceRead(addr uintptr)
 TEXT	runtime·RaceRead(SB), NOSPLIT, $0-8
 	// This needs to be a tail call, because raceread reads caller pc.
@@ -74,6 +83,14 @@ TEXT	runtime·racewrite<ABIInternal>(SB), NOSPLIT, $0-8
 	MOVQ	AX, RARG1
 	MOVQ	(SP), RARG2
 	// void __tsan_write(ThreadState *thr, void *addr, void *pc);
+	MOVQ	$__tsan_write(SB), AX
+	JMP	racecalladdr<>(SB)
+
+// func runtime·racewriten(addr, size uintptr)
+// See racereadn above.
+TEXT	runtime·racewriten<ABIInternal>(SB), NOSPLIT, $0-16
+	MOVQ	AX, RARG1
+	MOVQ	(SP), RARG2
 	MOVQ	$__tsan_write(SB), AX
 	JMP	racecalladdr<>(SB)
 

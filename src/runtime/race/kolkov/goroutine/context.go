@@ -1,9 +1,59 @@
 package goroutine
 
 import (
+	"internal/runtime/atomic"
 	"runtime/race/kolkov/epoch"
 	"runtime/race/kolkov/vectorclock"
+	"unsafe"
 )
+
+//go:linkname runtimeThrow runtime.throw
+func runtimeThrow(s string)
+
+// ReadCacheSlots bounds the exact-address working set. Each entry also carries
+// one GC-visible shadow-generation pointer. Atomic-release cache fields are
+// appended after this ABI-sensitive group; the runtime depends on the offsets
+// of the fields through ReadCacheWidths remaining stable.
+const ReadCacheSlots = 4
+
+// AtomicReleaseCacheSlots bounds the fully-associative release working set.
+// Collisions only force a canonical join/checkpoint; they never weaken the
+// happens-before relation.
+const AtomicReleaseCacheSlots = 2
+
+// AtomicLoadCacheSlots bounds the exact atomic-load working set. A miss is a
+// performance-only event and takes the detector's locked transaction path.
+const AtomicLoadCacheSlots = 2
+
+// AtomicReleaseCacheEntry is context-owned metadata for one exact atomic
+// release binding. Release is a GC root rather than a uintptr so explicit
+// atomic-release recycling cannot create an untracked pointer identity. A
+// matching SeenVersion is weak evidence that the represented snapshot is
+// already below the context clock. ExactGeneration is strong evidence only
+// while it equals RaceContext.ForeignGeneration.
+type AtomicReleaseCacheEntry struct {
+	Release         unsafe.Pointer
+	Stream          uint64
+	SeenVersion     uint64
+	ExactGeneration uint64
+	Membership      uint8
+}
+
+// AtomicLoadCacheEntry is detector-owned metadata for one exact enrolled load
+// path. Every pointer is a GC root: Fast retains the immutable lifecycle
+// capability identity, State the atomic overlay identity, and Frontier the
+// registered per-TID read witness. The detector is the only package which
+// interprets these opaque pointers.
+type AtomicLoadCacheEntry struct {
+	Fast       unsafe.Pointer
+	State      unsafe.Pointer
+	Frontier   unsafe.Pointer
+	Revision   uint64
+	Generation uint64
+	PC         uintptr
+	Mask       uint8
+	Internal   bool
+}
 
 // RaceContext represents the race detection state for a single goroutine.
 //
@@ -15,16 +65,24 @@ import (
 // (96%+) only need the epoch value, avoiding expensive vector clock operations.
 //
 // Layout:
-//   - TID: Thread/Goroutine ID (0-65535, uint16)
-//   - C: Full vector clock [65536]uint32 tracking all threads
+//   - TID: monotonic logical goroutine ID
+//   - C: hybrid dense/sparse vector clock tracking observed logical IDs
 //   - Epoch: Cached value of C[TID] as compact 64-bit epoch
 //
 // Invariant: Epoch must ALWAYS equal epoch.NewEpoch(TID, C[TID]).
 // This invariant is maintained by IncrementClock() which atomically updates both.
 type RaceContext struct {
-	// TID is the thread/goroutine identifier (0-65535).
-	// 16-bit uint for production (65,536 concurrent goroutines max).
-	TID uint16
+	// TID is a process-lifetime monotonic logical goroutine identifier. IDs
+	// are never recycled, because collapsing unrelated lifetimes onto one
+	// vector-clock coordinate creates false happens-before edges.
+	TID uint32
+
+	// ReadCacheInvalidatedClock is the latest epoch of this context observed by
+	// an external one-way synchronization such as finalizer handoff. The cache
+	// is usable only at a strictly newer clock. External observers update this
+	// marker atomically instead of racing with the context-owned cache fields.
+	// It occupies the alignment padding before C on 64-bit systems.
+	ReadCacheInvalidatedClock atomic.Uint32
 
 	// C is the full vector clock tracking logical time for all threads.
 	// C[i] represents the logical time for thread i.
@@ -38,6 +96,55 @@ type RaceContext struct {
 	// CRITICAL: This field is on the hot path for every memory access!
 	// Must be kept in sync with C[TID] at all times.
 	Epoch epoch.Epoch
+
+	// ReadCache retains successfully represented exact read addresses in this
+	// synchronization epoch. Re-reading a matching slot is redundant: a
+	// concurrent writer must conflict with the represented read, while a
+	// happens-before-safe writer requires a synchronization event that clears
+	// the cache in IncrementClock. ReadCacheStates roots the exact shadow
+	// generation which represents each read. The runtime re-resolves the address
+	// and elides a read only while that same pointer remains authoritative, so an
+	// allocator clear cannot revive an address-only entry. Collisions only reduce
+	// optimization coverage.
+	ReadCache [ReadCacheSlots]uintptr
+
+	// ReadCacheStates is parallel to ReadCache. unsafe.Pointer keeps a detached
+	// generation GC-visible until its owning cache entry is invalidated or
+	// replaced; the runtime compares it but never dereferences a stale mapping.
+	ReadCacheStates [ReadCacheSlots]unsafe.Pointer
+
+	// ReadCacheWidths is parallel to ReadCache. Compiler scalar hooks use it to
+	// distinguish an exact byte read from a 2-, 4-, or 8-byte read at the same
+	// start address. The ordinary FastTrack history and lifecycle identity stay
+	// anchored at that start; the width describes mixed atomic overlap and local
+	// write invalidation.
+	ReadCacheWidths [ReadCacheSlots]uint8
+
+	// AtomicReleaseCache is appended after the existing read-cache fields to
+	// preserve their runtime ABI offsets. Entries are fully associative and
+	// context-owned; eviction is a conservative performance-only fallback.
+	AtomicReleaseCache [AtomicReleaseCacheSlots]AtomicReleaseCacheEntry
+
+	// AtomicLoadCache is context-owned and may be read only by the executing
+	// logical goroutine. The pointed-to frontier is updated atomically because
+	// an ordinary writer later consumes it under the address transaction lock.
+	AtomicLoadCache [AtomicLoadCacheSlots]AtomicLoadCacheEntry
+
+	// ForeignGeneration advances for every actual or conservative import into
+	// the context's non-own projection. IncrementClock changes only the owning
+	// coordinate and deliberately leaves this generation unchanged.
+	ForeignGeneration uint64
+
+	atomicReleaseCacheNext uint8
+	AtomicLoadCacheNext    uint8
+	freshOnlyOwn           bool
+}
+
+// initializeAtomicReleaseTracking establishes the non-zero generation used to
+// distinguish an uninitialized weak cache entry from a strong entry.
+func (rc *RaceContext) initializeAtomicReleaseTracking(freshOnlyOwn bool) {
+	rc.ForeignGeneration = 1
+	rc.freshOnlyOwn = freshOnlyOwn
 }
 
 // Alloc creates and initializes a new RaceContext for the given thread ID.
@@ -63,11 +170,12 @@ type RaceContext struct {
 //	// ctx.TID = 5
 //	// ctx.C = {5:1, others:0}
 //	// ctx.Epoch = 1@5 (clock=1, tid=5)
-func Alloc(tid uint16) *RaceContext {
+func Alloc(tid uint32) *RaceContext {
 	ctx := &RaceContext{
 		TID: tid,
 		C:   vectorclock.NewFromPool(),
 	}
+	ctx.initializeAtomicReleaseTracking(true)
 	// Initialize epoch cache to TID@1 (clock 1 for new goroutine).
 	// CRITICAL: Clock must start at 1, not 0, to detect unsynchronized races.
 	// Clock 0 means "never happened" in HappensBefore check (0 <= 0 is TRUE).
@@ -103,12 +211,145 @@ func Alloc(tid uint16) *RaceContext {
 //	ctx.IncrementClock()
 //	// ctx.C[5] = 3, ctx.Epoch = 3@5
 func (rc *RaceContext) IncrementClock() {
+	// A new synchronization epoch makes prior reads non-redundant, but retains
+	// their address and width as non-semantic hints. The detector can use a
+	// matching hint to materialize a compact history on the next read without
+	// making the runtime fast path accept the old epoch's entry.
+	rc.WeakenReadCache()
+
 	// Step 1: Increment the vector clock for this thread.
 	rc.C.Increment(rc.TID)
+	clock := rc.C.Get(rc.TID)
 
 	// Step 2: Update the cached epoch to match C[TID].
 	// This maintains the invariant: Epoch == epoch.NewEpoch(TID, C[TID]).
-	rc.Epoch = epoch.NewEpoch(rc.TID, uint64(rc.C.Get(rc.TID)))
+	atomic.Store64((*uint64)(unsafe.Pointer(&rc.Epoch)), uint64(epoch.NewEpoch(rc.TID, uint64(clock))))
+
+	// An observation of an older epoch cannot order accesses in this new one.
+	// Clear its marker when possible, while preserving an observation racing
+	// with this increment that already sampled the newly published epoch.
+	rc.clearOlderReadCacheInvalidation(clock)
+}
+
+// NoteForeignImport invalidates strong atomic-release cache markers while
+// preserving their weak dominated-snapshot evidence. Logical generations may
+// not wrap: equality after wrap could otherwise revive an obsolete proof.
+func (rc *RaceContext) NoteForeignImport() {
+	if rc.ForeignGeneration == ^uint64(0) {
+		runtimeThrow("race detector foreign-clock generation overflow")
+	}
+	rc.ForeignGeneration++
+	rc.freshOnlyOwn = false
+}
+
+// FreshOnlyOwn reports whether the context was constructed with no inherited
+// foreign projection and has not imported one since. It is consumed only as a
+// proof for the first canonical atomic-release join.
+func (rc *RaceContext) FreshOnlyOwn() bool {
+	if !rc.freshOnlyOwn {
+		return false
+	}
+	onlyOwn := true
+	rc.C.RangeRuns(func(first, last, _ uint32) bool {
+		if first != rc.TID || last != rc.TID {
+			onlyOwn = false
+			return false
+		}
+		return true
+	})
+	if onlyOwn {
+		rc.C.RangeRetired(func(_, _ uint32) bool {
+			onlyOwn = false
+			return false
+		})
+	}
+	if !onlyOwn {
+		rc.freshOnlyOwn = false
+	}
+	return onlyOwn
+}
+
+// LookupAtomicRelease finds an exact release binding. The pointer, non-ABA
+// stream, and current lane membership are all part of the key.
+func (rc *RaceContext) LookupAtomicRelease(release unsafe.Pointer, stream uint64, membership uint8) (seenVersion uint64, strong, ok bool) {
+	for i := range rc.AtomicReleaseCache {
+		entry := &rc.AtomicReleaseCache[i]
+		if entry.Release == release && entry.Stream == stream && entry.Membership == membership {
+			return entry.SeenVersion, entry.ExactGeneration == rc.ForeignGeneration, true
+		}
+	}
+	return 0, false, false
+}
+
+// RecordAtomicRelease updates or inserts one exact binding. Strong records the
+// exact foreign-projection proof at the context's current generation; weak
+// records retain only the dominated-snapshot invariant.
+func (rc *RaceContext) RecordAtomicRelease(release unsafe.Pointer, stream, seenVersion uint64, membership uint8, strong bool) {
+	index := -1
+	for i := range rc.AtomicReleaseCache {
+		entry := &rc.AtomicReleaseCache[i]
+		if entry.Release == release && entry.Stream == stream && entry.Membership == membership {
+			index = i
+			break
+		}
+		if index < 0 && entry.Release == nil {
+			index = i
+		}
+	}
+	if index < 0 {
+		index = int(rc.atomicReleaseCacheNext % AtomicReleaseCacheSlots)
+		rc.atomicReleaseCacheNext = (rc.atomicReleaseCacheNext + 1) % AtomicReleaseCacheSlots
+	}
+	entry := &rc.AtomicReleaseCache[index]
+	entry.Release = release
+	entry.Stream = stream
+	entry.SeenVersion = seenVersion
+	entry.Membership = membership
+	entry.ExactGeneration = 0
+	if strong {
+		entry.ExactGeneration = rc.ForeignGeneration
+	}
+}
+
+// InvalidateReadCacheAt prevents cache hits in the observed epoch and every
+// earlier epoch. It is safe to call from another goroutine: only this atomic
+// marker is externally mutated; ReadCache and its metadata remain owned by rc.
+//
+// The max publication is important when multiple observers snapshot rc at
+// different clocks and finish out of order.
+//
+//go:nosplit
+func (rc *RaceContext) InvalidateReadCacheAt(observed epoch.Epoch) {
+	tid, clock64 := observed.Decode()
+	if tid != rc.TID || clock64 == 0 {
+		return
+	}
+	clock := uint32(clock64)
+	for {
+		old := rc.ReadCacheInvalidatedClock.Load()
+		if old >= clock {
+			return
+		}
+		if rc.ReadCacheInvalidatedClock.CompareAndSwap(old, clock) {
+			return
+		}
+	}
+}
+
+// clearOlderReadCacheInvalidation restores the zero-marker common case after
+// synchronization advances the owner beyond an external observation.
+//
+//go:nosplit
+func (rc *RaceContext) clearOlderReadCacheInvalidation(clock uint32) {
+	for {
+		invalidated := rc.ReadCacheInvalidatedClock.Load()
+		if invalidated == 0 || invalidated >= clock {
+			return
+		}
+		if rc.ReadCacheInvalidatedClock.CompareAndSwap(invalidated, 0) {
+			return
+		}
+	}
 }
 
 // GetEpoch returns the cached epoch for this goroutine.
@@ -120,8 +361,8 @@ func (rc *RaceContext) IncrementClock() {
 //   - Inline-candidate (no function call overhead)
 //   - //go:nosplit to prevent stack growth
 //
-// The cached epoch represents the current logical time for this goroutine
-// as a compact 32-bit value (TID in top 8 bits, clock in bottom 24 bits).
+// The cached epoch represents the current logical time for this goroutine as
+// a compact 64-bit value (32-bit TID and 32-bit clock).
 //
 // Performance: Target <1ns/op (single field read).
 //
@@ -137,21 +378,172 @@ func (rc *RaceContext) GetEpoch() epoch.Epoch {
 	return rc.Epoch
 }
 
+// RecordRead makes subsequent reads of addr redundant while state remains the
+// authoritative exact shadow mapping and until the context advances or writes.
+// addr is intentionally exact rather than word-aligned so adjacent fields
+// retain independent instrumentation.
+//
+//go:nosplit
+func (rc *RaceContext) RecordRead(addr uintptr, state unsafe.Pointer) {
+	rc.RecordReadSized(addr, 1, state)
+}
+
+// RecordReadSized publishes an exact compiler scalar cache entry. state is the
+// authoritative start-address generation; width distinguishes compatible hook
+// reuse and lets writes invalidate any overlapping represented atomic lanes.
+//
+//go:nosplit
+func (rc *RaceContext) RecordReadSized(addr, size uintptr, state unsafe.Pointer) {
+	if size == 0 || size >= uintptr(ReadCacheWeakWidth) || size-1 > ^uintptr(0)-addr {
+		return
+	}
+	slot := (addr >> 3) & (ReadCacheSlots - 1)
+	// Publish the GC root before the address discriminator. The context has one
+	// logical owner, but this order also keeps raw runtime readers from ever
+	// accepting an address paired with the previous slot's state.
+	rc.ReadCacheStates[slot] = state
+	rc.ReadCacheWidths[slot] = uint8(size)
+	rc.ReadCache[slot] = addr
+}
+
+// RecordAddressOnlyRead records a redundant compact read no-op without rooting
+// its shadow state. This form is valid only after the exact read was already
+// represented; runtime address-only elision is consequently limited to storage
+// whose lifetime cannot be recycled.
+//
+//go:nosplit
+func (rc *RaceContext) RecordAddressOnlyRead(addr uintptr) {
+	rc.RecordRead(addr, nil)
+}
+
+// RecordAddressOnlyReadRange records a completed compiler scalar read. Runtime
+// fast paths consume this form only for non-reclaimable first-module storage,
+// for which allocator-generation revalidation is unnecessary.
+//
+//go:nosplit
+func (rc *RaceContext) RecordAddressOnlyReadRange(addr, size uintptr) {
+	if size == 0 || size >= uintptr(ReadCacheWeakWidth) || size-1 > ^uintptr(0)-addr {
+		return
+	}
+	slot := (addr >> 3) & (ReadCacheSlots - 1)
+	rc.ReadCacheStates[slot] = nil
+	rc.ReadCacheWidths[slot] = uint8(size)
+	rc.ReadCache[slot] = addr
+}
+
+// InvalidateRead removes addr from the cache before a write to that address.
+// Writes to other addresses do not invalidate their represented reads.
+//
+//go:nosplit
+func (rc *RaceContext) InvalidateRead(addr uintptr) {
+	rc.InvalidateReadRange(addr, 1)
+}
+
+// InvalidateReadRange removes only cached exact addresses that overlap
+// [addr, addr+size). The subtraction form avoids computing a wrapping end.
+// Invalid or wrapping ranges do not mutate the cache.
+//
+//go:nosplit
+func (rc *RaceContext) InvalidateReadRange(addr, size uintptr) {
+	if size == 0 || size-1 > ^uintptr(0)-addr {
+		return
+	}
+	for i := range rc.ReadCache {
+		cached := rc.ReadCache[i]
+		width := uintptr(rc.ReadCacheWidths[i] &^ ReadCacheWeakWidth)
+		if cached != 0 && width != 0 && readCacheRangesOverlap(cached, width, addr, size) {
+			rc.ReadCache[i] = 0
+			rc.ReadCacheStates[i] = nil
+			rc.ReadCacheWidths[i] = 0
+		}
+	}
+}
+
+// ReadCacheWeakWidth is the non-semantic-hint marker mirrored by the runtime
+// fast path. Compiler scalar widths are always below this reserved bit.
+const ReadCacheWeakWidth = uint8(1 << 7)
+
+// HasReadHintSized reports whether the direct-mapped slot retains this exact
+// address and width. Both current-epoch entries and weakened prior-epoch hints
+// qualify; callers must never treat this as proof that the read is redundant.
+//
+//go:nosplit
+func (rc *RaceContext) HasReadHintSized(addr, size uintptr) bool {
+	if size == 0 || size >= uintptr(ReadCacheWeakWidth) {
+		return false
+	}
+	slot := (addr >> 3) & (ReadCacheSlots - 1)
+	return rc.ReadCache[slot] == addr &&
+		uintptr(rc.ReadCacheWidths[slot]&^ReadCacheWeakWidth) == size
+}
+
+// HasWeakReadHintSized reports whether the exact hint came from a prior
+// synchronization epoch rather than the current epoch's semantic cache.
+//
+//go:nosplit
+func (rc *RaceContext) HasWeakReadHintSized(addr, size uintptr) bool {
+	if !rc.HasReadHintSized(addr, size) {
+		return false
+	}
+	slot := (addr >> 3) & (ReadCacheSlots - 1)
+	return rc.ReadCacheWidths[slot]&ReadCacheWeakWidth != 0
+}
+
+// WeakenReadCache preserves only non-semantic address/width hints across a
+// synchronization epoch. Clearing the rooted state and marking the width's
+// high bit guarantees that runtime exact-width checks cannot accept the entry.
+//
+//go:nosplit
+func (rc *RaceContext) WeakenReadCache() {
+	for i := range rc.ReadCache {
+		width := rc.ReadCacheWidths[i] &^ ReadCacheWeakWidth
+		if rc.ReadCache[i] == 0 || width == 0 {
+			rc.ReadCache[i] = 0
+			rc.ReadCacheStates[i] = nil
+			rc.ReadCacheWidths[i] = 0
+			continue
+		}
+		rc.ReadCacheStates[i] = nil
+		rc.ReadCacheWidths[i] = width | ReadCacheWeakWidth
+	}
+}
+
+// readCacheRangesOverlap reports whether two valid, non-empty half-open ranges
+// overlap without computing either potentially wrapping end address.
+//
+//go:nosplit
+func readCacheRangesOverlap(first, firstSize, second, secondSize uintptr) bool {
+	if first <= second {
+		return second-first < firstSize
+	}
+	return first-second < secondSize
+}
+
+// ClearReadCache invalidates redundant-read elimination.
+//
+//go:nosplit
+func (rc *RaceContext) ClearReadCache() {
+	for i := range rc.ReadCache {
+		rc.ReadCache[i] = 0
+		rc.ReadCacheStates[i] = nil
+		rc.ReadCacheWidths[i] = 0
+	}
+}
+
 // AllocWithStartClock creates a RaceContext with a specific start clock.
 //
-// This is used for TID recycling: when a TID is reused, the new goroutine
-// must start its clock ABOVE the previous incarnation's maximum clock.
-// This ensures stale VarState entries are always seen as "concurrent"
-// (conservative), preventing false negatives from TID reuse.
+// Logical IDs are never recycled. The explicit start value is retained for
+// tests and context restoration; normal goroutine lifetimes start at one.
 //
 // Parameters:
 //   - tid: Thread ID for this goroutine
-//   - startClock: Initial clock value (must be > 0; typically 1 for fresh, >1 for recycled)
-func AllocWithStartClock(tid uint16, startClock uint32) *RaceContext {
+//   - startClock: Initial non-zero clock value (zero is normalized to one)
+func AllocWithStartClock(tid uint32, startClock uint32) *RaceContext {
 	ctx := &RaceContext{
 		TID: tid,
 		C:   vectorclock.NewFromPool(),
 	}
+	ctx.initializeAtomicReleaseTracking(true)
 	if startClock == 0 {
 		startClock = 1
 	}
@@ -167,10 +559,6 @@ func AllocWithStartClock(tid uint16, startClock uint32) *RaceContext {
 //  2. child.C[child.TID] = startClock (Initialize child's own component)
 //  3. child.Epoch = NewEpoch(tid, startClock)
 //
-// The startClock parameter supports TID recycling: when a recycled TID is
-// assigned, startClock is set above the previous incarnation's maximum clock
-// to prevent false negatives from stale shadow memory entries.
-//
 // After this, any operation in child "sees" all operations that happened
 // in parent before the fork (go func() statement).
 //
@@ -180,7 +568,7 @@ func AllocWithStartClock(tid uint16, startClock uint32) *RaceContext {
 // Parameters:
 //   - tid: Thread ID allocated for this child goroutine
 //   - parentClock: Snapshot of parent's VectorClock at fork time
-//   - startClock: Initial clock value for this TID (1 for fresh, >1 for recycled)
+//   - startClock: Initial non-zero clock value for this logical ID
 //
 // Returns:
 //   - *RaceContext: Context ready for race detection with inherited HB
@@ -193,11 +581,12 @@ func AllocWithStartClock(tid uint16, startClock uint32) *RaceContext {
 //	        ^ inherited from parent
 //	             ^ child's own component initialized to startClock
 //	                  ^ inherited from parent
-func AllocWithParentClock(tid uint16, parentClock *vectorclock.VectorClock, startClock uint32) *RaceContext {
+func AllocWithParentClock(tid uint32, parentClock *vectorclock.VectorClock, startClock uint32) *RaceContext {
 	ctx := &RaceContext{
 		TID: tid,
 		C:   vectorclock.NewFromPool(),
 	}
+	ctx.initializeAtomicReleaseTracking(false)
 
 	// Step 1: Inherit parent's clock (HB edge: parent fork -> child start).
 	// This copies all components from parent's clock to child's clock.
@@ -206,7 +595,7 @@ func AllocWithParentClock(tid uint16, parentClock *vectorclock.VectorClock, star
 	}
 
 	// Step 2: Initialize child's own clock component.
-	// Use startClock (>= 1) to support TID recycling safety.
+	// Clock zero means "no event", so every live context starts non-zero.
 	if startClock == 0 {
 		startClock = 1
 	}

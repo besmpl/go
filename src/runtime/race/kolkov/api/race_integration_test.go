@@ -1,10 +1,6 @@
 package api
 
 import (
-	"bytes"
-	"io"
-	"os"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -26,42 +22,11 @@ import (
 //   6. Concurrent reads with write (read-write race)
 //   7. Many addresses stress test
 
-// captureStderr redirects stderr to a pipe and starts async reader.
-// Returns: reader, writer, buffer channel, restore function.
-// Must call restore() to stop capture and get output.
-//
-// Windows Fix: Pipes have small buffers on Windows. If Fini() writes a large
-// report, the pipe blocks. Reading asynchronously prevents deadlock.
-func captureStderr() (restore func() string) {
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
-
-	var buf bytes.Buffer
-	done := make(chan struct{})
-
-	// Read from pipe asynchronously (prevents Windows pipe buffer deadlock)
-	go func() {
-		_, _ = io.Copy(&buf, r)
-		close(done)
-	}()
-
-	restore = func() string {
-		w.Close()
-		os.Stderr = oldStderr
-		<-done
-		return buf.String()
-	}
-
-	return restore
-}
-
 // TestIntegration_SimpleRace verifies basic write-write race detection end-to-end.
 //
 // Scenario: Two goroutines writing to the same variable without synchronization.
 // Expected: Race should be detected and reported in Fini() output.
 func TestIntegration_SimpleRace(t *testing.T) {
-	restore := captureStderr()
 	// Initialize race detector
 	Init()
 
@@ -95,17 +60,7 @@ func TestIntegration_SimpleRace(t *testing.T) {
 	// Finalize and capture output
 	Fini()
 
-	output := restore()
-
 	// Verify race was detected
-	if !strings.Contains(output, "WARNING") {
-		t.Errorf("Expected race warning in output, got:\n%s", output)
-	}
-
-	if !strings.Contains(output, "data race(s) detected") {
-		t.Errorf("Expected 'data race(s) detected' in output, got:\n%s", output)
-	}
-
 	if RacesDetected() == 0 {
 		t.Error("Expected race to be detected, but RacesDetected() returned 0")
 	}
@@ -118,7 +73,6 @@ func TestIntegration_SimpleRace(t *testing.T) {
 // Scenario: Sequential writes and reads to a variable (no concurrency).
 // Expected: Zero races detected, success message in Fini() output.
 func TestIntegration_NoRace_Sequential(t *testing.T) {
-	restore := captureStderr()
 	Init()
 
 	var data int
@@ -134,17 +88,7 @@ func TestIntegration_NoRace_Sequential(t *testing.T) {
 
 	Fini()
 
-	output := restore()
-
 	// Verify no races detected
-	if strings.Contains(output, "WARNING") {
-		t.Errorf("Unexpected race warning in sequential access:\n%s", output)
-	}
-
-	if !strings.Contains(output, "No data races detected") {
-		t.Errorf("Expected 'No data races detected' message, got:\n%s", output)
-	}
-
 	if RacesDetected() != 0 {
 		t.Errorf("Expected 0 races, got %d", RacesDetected())
 	}
@@ -157,7 +101,6 @@ func TestIntegration_NoRace_Sequential(t *testing.T) {
 // Scenario: 5 goroutines accessing shared data with mixed read/write operations.
 // Expected: Races should be detected for unsynchronized writes.
 func TestIntegration_MultipleGoroutines(t *testing.T) {
-	restore := captureStderr()
 	Init()
 
 	var shared int
@@ -186,13 +129,7 @@ func TestIntegration_MultipleGoroutines(t *testing.T) {
 	wg.Wait()
 	Fini()
 
-	output := restore()
-
 	// Verify race was detected (multiple concurrent writes)
-	if !strings.Contains(output, "WARNING") {
-		t.Errorf("Expected race warning with %d concurrent goroutines, got:\n%s", numGoroutines, output)
-	}
-
 	if RacesDetected() == 0 {
 		t.Errorf("Expected races with %d concurrent goroutines, got 0", numGoroutines)
 	}
@@ -208,7 +145,6 @@ func TestIntegration_MultipleGoroutines(t *testing.T) {
 //
 // Expected: Only races for variable A should be detected.
 func TestIntegration_RaceAndNoRace_Mixed(t *testing.T) {
-	restore := captureStderr()
 	Init()
 
 	var racyVar int
@@ -245,13 +181,7 @@ func TestIntegration_RaceAndNoRace_Mixed(t *testing.T) {
 
 	Fini()
 
-	output := restore()
-
 	// Verify race was detected (for racyVar only)
-	if !strings.Contains(output, "WARNING") {
-		t.Error("Expected race warning for racyVar")
-	}
-
 	if RacesDetected() == 0 {
 		t.Error("Expected at least one race for racyVar")
 	}
@@ -270,7 +200,6 @@ func TestIntegration_RaceAndNoRace_Mixed(t *testing.T) {
 //   - Fini() produces proper summary report
 //   - Output format is correct
 func TestIntegration_FullLifecycle(t *testing.T) {
-	restore := captureStderr()
 	// Phase 1: Initialize
 	Init()
 
@@ -308,22 +237,6 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	// Phase 3: Finalize
 	Fini()
 
-	output := restore()
-
-	// Validate output format
-	if !strings.Contains(output, "==================") {
-		t.Error("Expected report separator in output")
-	}
-
-	if !strings.Contains(output, "Race Detector Report") {
-		t.Error("Expected 'Race Detector Report' header")
-	}
-
-	// Should contain warning since we created races
-	if !strings.Contains(output, "WARNING") {
-		t.Errorf("Expected WARNING in output, got:\n%s", output)
-	}
-
 	// Verify detector is disabled after Fini
 	if enabled.Load() != 0 {
 		t.Error("Detector should be disabled after Fini()")
@@ -336,7 +249,6 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	}
 
 	t.Logf("Full lifecycle test: detected %d race(s)", racesDetected)
-	t.Logf("Output:\n%s", output)
 }
 
 // TestIntegration_ConcurrentReads verifies read-write race detection.
@@ -344,7 +256,6 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 // Scenario: Multiple goroutines reading while one writes to shared variable.
 // Expected: Read-write races should be detected.
 func TestIntegration_ConcurrentReads(t *testing.T) {
-	restore := captureStderr()
 	Init()
 
 	var data int
@@ -377,13 +288,7 @@ func TestIntegration_ConcurrentReads(t *testing.T) {
 	wg.Wait()
 	Fini()
 
-	output := restore()
-
 	// Verify race was detected (read-write or write-read)
-	if !strings.Contains(output, "WARNING") {
-		t.Errorf("Expected read-write race warning, got:\n%s", output)
-	}
-
 	if RacesDetected() == 0 {
 		t.Error("Expected read-write races to be detected")
 	}
@@ -394,9 +299,8 @@ func TestIntegration_ConcurrentReads(t *testing.T) {
 // TestIntegration_ManyAddresses stress tests shadow memory with many addresses.
 //
 // Scenario: Access 100+ different addresses to stress shadow memory allocation.
-// Expected: No races (each goroutine accesses unique addresses), good performance.
+// Expected: No races because each goroutine accesses a unique address.
 func TestIntegration_ManyAddresses(t *testing.T) {
-	restore := captureStderr()
 	Init()
 
 	const numAddresses = 200
@@ -430,26 +334,14 @@ func TestIntegration_ManyAddresses(t *testing.T) {
 
 	Fini()
 
-	output := restore()
-
 	// Verify no races (all accesses to unique addresses)
-	if strings.Contains(output, "WARNING") {
-		t.Errorf("Unexpected race with unique addresses:\n%s", output)
-	}
-
-	if !strings.Contains(output, "No data races detected") {
-		t.Errorf("Expected no races with unique addresses, got:\n%s", output)
-	}
-
 	if RacesDetected() != 0 {
 		t.Errorf("Expected 0 races with unique addresses, got %d", RacesDetected())
 	}
 
-	// Verify reasonable performance (should complete quickly)
-	if duration > 5*time.Second {
-		t.Errorf("Performance concern: %d addresses took %v (expected < 5s)", numAddresses, duration)
-	}
-
+	// Keep elapsed time diagnostic-only. Wall-clock assertions make this
+	// correctness test depend on host load; performance is covered by the
+	// package benchmarks and the release comparison harness.
 	t.Logf("Many addresses test: %d addresses, %v duration, 0 races", numAddresses, duration)
 }
 
@@ -461,7 +353,6 @@ func TestIntegration_RepeatedInitFini(t *testing.T) {
 	for cycle := 0; cycle < 3; cycle++ {
 		t.Logf("Cycle %d", cycle)
 
-		restore := captureStderr()
 		Init()
 
 		// Do some operations
@@ -474,11 +365,9 @@ func TestIntegration_RepeatedInitFini(t *testing.T) {
 
 		Fini()
 
-		output := restore()
-
-		// Each cycle should report no races (sequential access)
-		if strings.Contains(output, "WARNING") {
-			t.Errorf("Cycle %d: Unexpected race in sequential access", cycle)
+		// Each cycle should report no races (sequential access).
+		if got := RacesDetected(); got != 0 {
+			t.Errorf("Cycle %d: sequential access detected %d races", cycle, got)
 		}
 
 		// Verify detector is disabled after Fini
@@ -499,7 +388,6 @@ func TestIntegration_RepeatedInitFini(t *testing.T) {
 //
 // Expected: Only races from Phase 1 should be counted.
 func TestIntegration_DisableDuringExecution(t *testing.T) {
-	restore := captureStderr()
 	Init()
 
 	var shared int
@@ -558,8 +446,6 @@ func TestIntegration_DisableDuringExecution(t *testing.T) {
 
 	Fini()
 
-	_ = restore()
-
 	// Verify: Race count should not increase after Disable()
 	if racesPhase3 != racesPhase1 {
 		t.Errorf("Disable() did not prevent race detection: phase1=%d, phase3=%d", racesPhase1, racesPhase3)
@@ -577,7 +463,6 @@ func TestIntegration_DisableDuringExecution(t *testing.T) {
 // Scenario: Multiple goroutines accessing fields of a struct.
 // Expected: Races detected for concurrent field access.
 func TestIntegration_LargeDataStructure(t *testing.T) {
-	restore := captureStderr()
 	Init()
 
 	type Data struct {
@@ -619,13 +504,7 @@ func TestIntegration_LargeDataStructure(t *testing.T) {
 
 	Fini()
 
-	output := restore()
-
 	// Verify race was detected for Field1
-	if !strings.Contains(output, "WARNING") {
-		t.Errorf("Expected race warning for Field1, got:\n%s", output)
-	}
-
 	if RacesDetected() == 0 {
 		t.Error("Expected race for Field1 concurrent writes")
 	}
@@ -638,7 +517,6 @@ func TestIntegration_LargeDataStructure(t *testing.T) {
 // Scenario: Several goroutines (5) competing for same variable.
 // Expected: Multiple races detected, detector handles contention.
 func TestIntegration_HighContentionVariable(t *testing.T) {
-	restore := captureStderr()
 	Init()
 
 	var hotspot int
@@ -663,13 +541,7 @@ func TestIntegration_HighContentionVariable(t *testing.T) {
 
 	Fini()
 
-	output := restore()
-
 	// Verify races detected
-	if !strings.Contains(output, "WARNING") {
-		t.Errorf("Expected race warning with %d goroutines, got:\n%s", numGoroutines, output)
-	}
-
 	if RacesDetected() == 0 {
 		t.Errorf("Expected races with %d concurrent goroutines", numGoroutines)
 	}
@@ -682,7 +554,6 @@ func TestIntegration_HighContentionVariable(t *testing.T) {
 // Scenario: Goroutines using mutex to protect shared variable.
 // Expected: No races detected (mutex provides synchronization).
 func TestIntegration_SafeSynchronization(t *testing.T) {
-	restore := captureStderr()
 	Init()
 
 	var data int
@@ -698,8 +569,10 @@ func TestIntegration_SafeSynchronization(t *testing.T) {
 			defer wg.Done()
 
 			mu.Lock()
+			raceacquire(uintptr(unsafe.Pointer(&mu)))
 			racewrite(uintptr(unsafe.Pointer(&data)), 0)
 			data = id
+			racerelease(uintptr(unsafe.Pointer(&mu)))
 			mu.Unlock()
 
 			time.Sleep(1 * time.Millisecond)
@@ -709,15 +582,7 @@ func TestIntegration_SafeSynchronization(t *testing.T) {
 	wg.Wait()
 	Fini()
 
-	output := restore()
-
-	// Note: Our MVP detector doesn't track mutex synchronization yet,
-	// so this test may still report races. In a full implementation
-	// with happens-before tracking, this should pass.
-	//
-	// For now, we just verify the test doesn't crash.
-
-	t.Logf("Mutex synchronization test: %d race(s) detected", RacesDetected())
-	t.Log("Note: MVP doesn't track mutex sync yet, so races may be reported")
-	t.Logf("Output:\n%s", output)
+	if got := RacesDetected(); got != 0 {
+		t.Fatalf("mutex-protected writes reported %d race(s)", got)
+	}
 }

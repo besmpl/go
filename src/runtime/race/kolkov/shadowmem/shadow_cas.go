@@ -5,6 +5,15 @@ import (
 	"internal/runtime/atomic"
 )
 
+const (
+	casTableSize      = 1 << 16
+	casHashMask       = casTableSize - 1
+	casMaxProbes      = 8
+	casOverflowSize   = 256
+	casHashMultiplier = uint64(0x9E3779B97F4A7C15)
+	casNoSlot         = uint64(0xFFFFFFFF)
+)
+
 // CASCell represents a single cell in the CAS-based shadow memory array.
 //
 // Each cell stores:
@@ -19,9 +28,9 @@ import (
 //   - Offset 8-15: varState pointer (8 bytes)
 //   - Offset 16-23: padding (8 bytes, reserved for future use)
 type CASCell struct {
-	addr     uintptr   // Memory address this cell tracks.
-	varState *VarState // Access state for this address.
-	_        [8]byte   // Padding to 24 bytes for cache alignment.
+	addr     uintptr     // Aligned application word this cell tracks.
+	varState *ShadowSlot // Exact-address lane states for this word.
+	_        [8]byte     // Padding to 24 bytes for cache alignment.
 }
 
 // tombstoneCell is a sentinel value marking a deleted slot in the CAS hash table.
@@ -30,6 +39,16 @@ type CASCell struct {
 // Without this, clearAddr(X) would break the chain for entries Y stored after X,
 // causing LoadOrStore(Y) to return stale VarState from a previous goroutine.
 var tombstoneCell = &CASCell{}
+
+// casOverflowCell is the stable correctness fallback for probe chains longer
+// than casMaxProbes. The runtime's inline lookup intentionally checks only the
+// bounded primary probes; a miss takes the detector slow path, which also
+// consults these immutable CAS-published chains.
+type casOverflowCell struct {
+	addr uintptr
+	slot *ShadowSlot
+	next *casOverflowCell
+}
 
 // CASBasedShadow implements shadow memory using CAS (Compare-And-Swap) operations.
 //
@@ -58,15 +77,18 @@ var tombstoneCell = &CASCell{}
 //   - LoadOrStore (miss): ~25ns, 2 allocs
 //
 // Thread Safety: All operations are lock-free and safe for concurrent access.
-//
-// See design document: docs/dev/v0.2.0-cas-shadow-memory-design.md.
 type CASBasedShadow struct {
 	// Fixed-size array of atomic pointers to CASCell.
 	// Using atomic.Pointer provides type-safe CAS operations (Go 1.19+).
 	//
 	// Array size: 65536 (2^16) slots
 	// Memory: 65536 × 8 bytes = 524,288 bytes (512KB)
-	cells [65536]atomic.Pointer[CASCell]
+	cells [casTableSize]atomic.Pointer[CASCell]
+
+	// overflow preserves tracking when the bounded primary probe window is
+	// saturated. Appending this after cells keeps the runtime-mirrored cells
+	// offset unchanged.
+	overflow [casOverflowSize]atomic.Pointer[casOverflowCell]
 
 	// v0.3.0: Address compression flag.
 	// When true, addresses are aligned to 8-byte boundaries before hashing.
@@ -159,11 +181,7 @@ func alignAddr(addr uintptr) uintptr {
 //
 //go:nosplit
 func fastHash(addr uintptr) uint64 {
-	// Golden ratio constant for multiplicative hashing.
-	// This constant has excellent avalanche properties.
-	const goldenRatio = 0x9E3779B97F4A7C15
-
-	hash := uint64(addr) * goldenRatio
+	hash := uint64(addr) * casHashMultiplier
 
 	// Take top 16 bits (right shift by 48).
 	// This gives us range [0, 65535] without modulo.
@@ -203,40 +221,112 @@ func fastHash(addr uintptr) uint64 {
 //
 //go:nosplit
 func (s *CASBasedShadow) Load(addr uintptr) *VarState {
-	// v0.3.0: Apply address compression if enabled.
-	if s.compressAddresses {
-		addr = alignAddr(addr)
+	slot := s.GetSlot(addr)
+	if slot == nil {
+		return nil
 	}
+	return slot.State(s.lane(addr))
+}
 
-	hash := fastHash(addr)
+// lane returns the scalar lane selected by the public compressed/exact API.
+// SlotShadow users always address exact lanes directly.
+//
+//go:nosplit
+func (s *CASBasedShadow) lane(addr uintptr) uint8 {
+	if s.compressAddresses {
+		return 0
+	}
+	return uint8(addr & 7)
+}
 
-	// Linear probing: try up to 8 slots.
-	// 8 probes covers 99.99% of cases for load factor <0.8.
-	for i := uint64(0); i < 8; i++ {
-		idx := (hash + i) & 0xFFFF // Wrap around (equivalent to % 65536).
-		cellPtr := s.cells[idx].Load()
-
-		if cellPtr == nil {
-			// Empty slot → end of chain, address not found.
+// GetSlot returns the word slot containing addr without creating it.
+//
+//go:nosplit
+func (s *CASBasedShadow) GetSlot(addr uintptr) *ShadowSlot {
+	word := alignAddr(addr)
+	hash := fastHash(word)
+	for i := uint64(0); i < casMaxProbes; i++ {
+		cell := s.cells[(hash+i)&casHashMask].Load()
+		if cell == nil {
 			return nil
 		}
-
-		if cellPtr == tombstoneCell {
-			// Deleted slot → chain continues past tombstone.
+		if cell == tombstoneCell {
 			continue
 		}
-
-		if cellPtr.addr == addr {
-			// Found matching address.
-			return cellPtr.varState
+		if cell.addr == word {
+			return cell.varState
 		}
+	}
+	for cell := s.overflow[hash&(casOverflowSize-1)].Load(); cell != nil; cell = cell.next {
+		if cell.addr == word {
+			return cell.slot
+		}
+	}
+	return nil
+}
 
-		// Collision: this slot occupied by different address, try next.
+// loadOrStoreSlot returns the slot for one aligned word.
+func (s *CASBasedShadow) loadOrStoreSlot(addr uintptr) (*ShadowSlot, bool) {
+	word := alignAddr(addr)
+	if slot := s.GetSlot(word); slot != nil {
+		return slot, false
 	}
 
-	// Collision overflow after 8 probes (extremely rare, <0.01%).
-	// Return nil to indicate "not found".
-	return nil
+	newSlot := new(ShadowSlot)
+	newCell := &CASCell{addr: word, varState: newSlot}
+	hash := fastHash(word)
+	for {
+		firstAvail := casNoSlot
+		for i := uint64(0); i < casMaxProbes; i++ {
+			idx := (hash + i) & casHashMask
+			cell := s.cells[idx].Load()
+			if cell == nil {
+				if firstAvail == casNoSlot {
+					firstAvail = idx
+				}
+				break
+			}
+			if cell == tombstoneCell {
+				if firstAvail == casNoSlot {
+					firstAvail = idx
+				}
+				continue
+			}
+			if cell.addr == word {
+				return cell.varState, false
+			}
+		}
+		if firstAvail == casNoSlot {
+			break
+		}
+		old := s.cells[firstAvail].Load()
+		if (old == nil || old == tombstoneCell) && s.cells[firstAvail].CompareAndSwap(old, newCell) {
+			return newSlot, true
+		}
+	}
+
+	// The primary fast-path window is full. Publish into a stable overflow
+	// chain, retrying the lookup after every competing insertion so one word
+	// can never acquire two independently mutable histories.
+	bucket := &s.overflow[hash&(casOverflowSize-1)]
+	for {
+		head := bucket.Load()
+		for cell := head; cell != nil; cell = cell.next {
+			if cell.addr == word {
+				return cell.slot, false
+			}
+		}
+		newOverflow := &casOverflowCell{addr: word, slot: newSlot, next: head}
+		if bucket.CompareAndSwap(head, newOverflow) {
+			return newSlot, true
+		}
+	}
+}
+
+// GetOrCreateSlot returns the exact-lane slot for the word containing addr.
+func (s *CASBasedShadow) GetOrCreateSlot(addr uintptr) *ShadowSlot {
+	slot, _ := s.loadOrStoreSlot(addr)
+	return slot
 }
 
 // Store stores a VarState for the given address, creating a new CASCell.
@@ -270,69 +360,9 @@ func (s *CASBasedShadow) Load(addr uintptr) *VarState {
 //
 // Note: This is NOT marked //go:nosplit because it allocates (CASCell creation).
 func (s *CASBasedShadow) Store(addr uintptr, vs *VarState) *VarState {
-	// v0.3.0: Apply address compression if enabled.
-	if s.compressAddresses {
-		addr = alignAddr(addr)
-	}
-
-	// Allocate new cell (happens outside the CAS loop for efficiency).
-	newCell := &CASCell{
-		addr:     addr,
-		varState: vs,
-	}
-
-	hash := fastHash(addr)
-
-	// First pass: find existing entry or first available slot (nil or tombstone).
-	firstAvail := uint64(0xFFFFFFFF) // Sentinel: no available slot found yet.
-
-	for i := uint64(0); i < 8; i++ {
-		idx := (hash + i) & 0xFFFF
-		cellPtr := s.cells[idx].Load()
-
-		if cellPtr == nil {
-			// End of chain. Record as insertion point if none found yet.
-			if firstAvail == 0xFFFFFFFF {
-				firstAvail = idx
-			}
-			break
-		}
-
-		if cellPtr == tombstoneCell {
-			// Deleted slot. Record as insertion point if none found yet.
-			if firstAvail == 0xFFFFFFFF {
-				firstAvail = idx
-			}
-			continue
-		}
-
-		if cellPtr.addr == addr {
-			// Address already exists (lost the race), return existing VarState.
-			return cellPtr.varState
-		}
-
-		// Collision: this slot occupied by different address, try next.
-	}
-
-	// Try to insert at first available slot (tombstone or nil).
-	if firstAvail != 0xFFFFFFFF {
-		old := s.cells[firstAvail].Load()
-		if old == nil || old == tombstoneCell {
-			if s.cells[firstAvail].CompareAndSwap(old, newCell) {
-				return vs
-			}
-			// CAS failed, someone else stored. Reload and check.
-			cellPtr := s.cells[firstAvail].Load()
-			if cellPtr != nil && cellPtr != tombstoneCell && cellPtr.addr == addr {
-				return cellPtr.varState
-			}
-		}
-	}
-
-	// Collision overflow after 8 probes.
-	// This is extremely rare (<0.01%) but we handle it gracefully:
-	// Return the VarState we tried to store (caller can use it locally).
-	return vs
+	slot := s.GetOrCreateSlot(addr)
+	state, _ := slot.loadOrStoreLane(s.lane(addr), vs)
+	return state
 }
 
 // LoadOrStore retrieves or creates the VarState for the given address.
@@ -378,23 +408,8 @@ func (s *CASBasedShadow) Store(addr uintptr, vs *VarState) *VarState {
 //
 // Note: This is NOT marked //go:nosplit because it calls Store which allocates.
 func (s *CASBasedShadow) LoadOrStore(addr uintptr) (*VarState, bool) {
-	// Fast path: Try to load existing cell (zero allocations).
-	if vs := s.Load(addr); vs != nil {
-		return vs, false // Found existing.
-	}
-
-	// Slow path: Cell doesn't exist, allocate new VarState.
-	newVS := NewVarState()
-
-	// Store the new VarState (CAS-based insertion).
-	// If another goroutine stores the same address concurrently,
-	// Store() will return the winner's VarState.
-	finalVS := s.Store(addr, newVS)
-
-	// Check if we won the race (our VarState was stored).
-	created := (finalVS == newVS)
-
-	return finalVS, created
+	slot := s.GetOrCreateSlot(addr)
+	return slot.loadOrStoreLane(s.lane(addr), nil)
 }
 
 // GetOrCreate retrieves or creates the VarState for the given address.
@@ -449,6 +464,9 @@ func (s *CASBasedShadow) Reset() {
 	for i := range s.cells {
 		s.cells[i].Store(nil)
 	}
+	for i := range s.overflow {
+		s.overflow[i].Store(nil)
+	}
 }
 
 // ClearRange clears all shadow cells in [addr, addr+size).
@@ -463,24 +481,26 @@ func (s *CASBasedShadow) Reset() {
 // Performance: O(size/8) hash lookups, each with up to 8 probes.
 // For typical Go allocations (< 32KB): < 50us.
 func (s *CASBasedShadow) ClearRange(addr, size uintptr) {
-	if size == 0 {
+	if size == 0 || size-1 > ^uintptr(0)-addr {
 		return
 	}
 
-	// Apply address compression (same as Load/Store).
-	step := uintptr(1)
-	start := addr
-	end := addr + size
-	if s.compressAddresses {
-		start = alignAddr(start)
-		// Round up end to next 8-byte boundary.
-		end = alignAddr(end + 7)
-		step = 8
-	}
-
-	// Clear each address in the range.
-	for a := start; a < end; a += step {
-		s.clearAddr(a)
+	for a, remaining := addr, size; remaining != 0; {
+		lane := a & 7
+		count := uintptr(8) - lane
+		if count > remaining {
+			count = remaining
+		}
+		if slot := s.GetSlot(a); slot != nil {
+			if s.compressAddresses {
+				slot.ClearMask(1)
+			} else {
+				mask := uint8(((uint16(1) << count) - 1) << lane)
+				slot.ClearMask(mask)
+			}
+		}
+		a += count
+		remaining -= count
 	}
 }
 
@@ -488,9 +508,10 @@ func (s *CASBasedShadow) ClearRange(addr, size uintptr) {
 //
 //go:nosplit
 func (s *CASBasedShadow) clearAddr(addr uintptr) {
+	addr = alignAddr(addr)
 	hash := fastHash(addr)
-	for i := uint64(0); i < 8; i++ {
-		idx := (hash + i) & 0xFFFF
+	for i := uint64(0); i < casMaxProbes; i++ {
+		idx := (hash + i) & casHashMask
 		cell := s.cells[idx].Load()
 		if cell == nil {
 			return // Empty slot — end of chain, address not tracked.

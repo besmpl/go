@@ -425,7 +425,9 @@ func racefuncenter(callpc uintptr)
 func racefuncenterfp(fp uintptr)
 func racefuncexit()
 func raceread(addr uintptr)
+func racereadn(addr, size uintptr)
 func racewrite(addr uintptr)
+func racewriten(addr, size uintptr)
 func racereadrange(addr, size uintptr)
 func racewriterange(addr, size uintptr)
 func racereadrangepc1(addr, size, pc uintptr)
@@ -562,10 +564,11 @@ func racegostart(pc uintptr) uintptr {
 }
 
 //go:nosplit
-func racegosetchildid(childGoid uint64) uintptr {
+func racegosetchildid(childGoid uint64, spawnctx uintptr) uintptr {
 	// TSAN: not needed, racectx already handles child identification.
-	// Return 0 so proc.go keeps the racectx from racegostart.
-	return 0
+	// Return it so proc.go can publish the final context without temporarily
+	// storing the racegostart result in g.racectx.
+	return spawnctx
 }
 
 //go:nosplit

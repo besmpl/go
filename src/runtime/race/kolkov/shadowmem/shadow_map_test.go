@@ -78,7 +78,7 @@ func TestShadowMemoryGetOrCreate_MultipleAddresses(t *testing.T) {
 	// Create cells for multiple addresses.
 	for i, addr := range addresses {
 		cells[i] = sm.GetOrCreate(addr)
-		cells[i].SetW(epoch.NewEpoch(uint16(i+1), uint64((i+1)*100)))
+		cells[i].SetW(epoch.NewEpoch(uint32(i+1), uint64((i+1)*100)))
 	}
 
 	// Verify each cell is independent.
@@ -89,7 +89,7 @@ func TestShadowMemoryGetOrCreate_MultipleAddresses(t *testing.T) {
 			t.Errorf("GetOrCreate(0x%x) returned different instance", addr)
 		}
 
-		expectedW := epoch.NewEpoch(uint16(i+1), uint64((i+1)*100))
+		expectedW := epoch.NewEpoch(uint32(i+1), uint64((i+1)*100))
 		if vs.GetW() != expectedW {
 			t.Errorf("VarState[0x%x].W = %v, want %v", addr, vs.GetW(), expectedW)
 		}
@@ -297,7 +297,7 @@ func TestShadowMemoryConcurrent_MultipleAddresses(t *testing.T) {
 				vs := sm.GetOrCreate(addr)
 
 				// Update the cell.
-				vs.SetW(epoch.NewEpoch(uint16(gid), uint64(j)))
+				vs.SetW(epoch.NewEpoch(uint32(gid), uint64(j)))
 			}
 		}(i)
 	}
@@ -319,81 +319,83 @@ func TestShadowMemoryConcurrent_MultipleAddresses(t *testing.T) {
 
 // TestShadowMemoryConcurrent_GetAndGetOrCreate tests mixed Get/GetOrCreate.
 func TestShadowMemoryConcurrent_GetAndGetOrCreate(t *testing.T) {
-	t.Skip("Known issue v0.1.0: Test has data race in concurrent access - fix in v0.2.0")
-
 	sm := NewShadowMemory()
 	addr := uintptr(0xFACE)
 
 	const numReaders = 50
-	const numWriters = 10
+	const numCreators = 10
 
 	var wg sync.WaitGroup
-	wg.Add(numReaders + numWriters)
+	wg.Add(numReaders + numCreators)
+	created := make([]*VarState, numCreators)
+	read := make([]*VarState, numReaders)
 
-	// Writers create or update the cell.
-	for i := 0; i < numWriters; i++ {
-		go func(wid int) {
+	// Creators race to install the cell.
+	for i := 0; i < numCreators; i++ {
+		go func(id int) {
 			defer wg.Done()
-
-			vs := sm.GetOrCreate(addr)
-			vs.SetW(epoch.NewEpoch(uint16(wid), uint64(wid*10)))
+			created[id] = sm.GetOrCreate(addr)
 		}(i)
 	}
 
-	// Readers try to get the cell (may be nil initially).
+	// Readers may run before the cell is installed.
 	for i := 0; i < numReaders; i++ {
-		go func() {
+		go func(id int) {
 			defer wg.Done()
-
-			// Get may return nil or a valid VarState.
-			_ = sm.Get(addr)
-		}()
+			read[id] = sm.Get(addr)
+		}(i)
 	}
 
 	wg.Wait()
 
-	// After all goroutines finish, the cell should exist.
-	vs := sm.Get(addr)
-	if vs == nil {
+	// Every non-nil lookup must observe the one installed pointer.
+	want := sm.Get(addr)
+	if want == nil {
 		t.Fatal("Cell should exist after concurrent Get/GetOrCreate")
 	}
+	for i, vs := range created {
+		if vs != want {
+			t.Errorf("GetOrCreate result %d = %p, want %p", i, vs, want)
+		}
+	}
+	for i, vs := range read {
+		if vs != nil && vs != want {
+			t.Errorf("Get result %d = %p, want nil or %p", i, vs, want)
+		}
+	}
 
-	t.Logf("Concurrent Get/GetOrCreate from %d goroutines succeeded", numReaders+numWriters)
+	t.Logf("Concurrent Get/GetOrCreate from %d goroutines returned one instance", numReaders+numCreators)
 }
 
-// TestShadowMemoryConcurrent_ReadWrite simulates realistic race detector workload.
-func TestShadowMemoryConcurrent_ReadWrite(t *testing.T) {
-	t.Skip("Known issue v0.1.0: Test has data race in VarState access - fix in v0.2.0")
-
+// TestShadowMemoryConcurrent_MixedLookups exercises Get and GetOrCreate across
+// multiple addresses without mutating the returned VarState values.
+func TestShadowMemoryConcurrent_MixedLookups(t *testing.T) {
 	sm := NewShadowMemory()
 
 	const numGoroutines = 20
 	const numOpsPerGoroutine = 1000
 
-	// Pre-populate some addresses.
 	addresses := make([]uintptr, 100)
 	for i := range addresses {
 		addresses[i] = uintptr(0x20000 + i*8)
 	}
+	created := make([][]*VarState, numGoroutines)
+	read := make([][]*VarState, numGoroutines)
 
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines)
 
 	for gid := 0; gid < numGoroutines; gid++ {
-		go func(goroutineID int) {
+		go func(id int) {
 			defer wg.Done()
+			created[id] = make([]*VarState, numOpsPerGoroutine)
+			read[id] = make([]*VarState, numOpsPerGoroutine)
 
 			for op := 0; op < numOpsPerGoroutine; op++ {
-				// Access random address.
 				addr := addresses[op%len(addresses)]
-
-				// GetOrCreate and update.
-				vs := sm.GetOrCreate(addr)
-				vs.SetW(epoch.NewEpoch(uint16(goroutineID), uint64(op)))
-
-				// Sometimes just read.
+				created[id][op] = sm.GetOrCreate(addr)
 				if op%3 == 0 {
-					_ = sm.Get(addr)
+					read[id][op] = sm.Get(addr)
 				}
 			}
 		}(gid)
@@ -401,15 +403,26 @@ func TestShadowMemoryConcurrent_ReadWrite(t *testing.T) {
 
 	wg.Wait()
 
-	// Verify all addresses have cells.
-	for _, addr := range addresses {
-		vs := sm.Get(addr)
-		if vs == nil {
-			t.Errorf("Address 0x%x missing after concurrent workload", addr)
+	// Every lookup for an address must observe its one installed pointer.
+	for id := range created {
+		for op, vs := range created[id] {
+			addr := addresses[op%len(addresses)]
+			want := sm.Get(addr)
+			if want == nil {
+				t.Fatalf("Address 0x%x missing after concurrent workload", addr)
+			}
+			if vs != want {
+				t.Errorf("GetOrCreate result for 0x%x = %p, want %p", addr, vs, want)
+			}
+			if op%3 == 0 {
+				if got := read[id][op]; got != want {
+					t.Errorf("Get result for 0x%x = %p, want %p", addr, got, want)
+				}
+			}
 		}
 	}
 
-	t.Logf("Realistic concurrent workload: %d goroutines × %d ops = %d total operations",
+	t.Logf("Concurrent lookup workload: %d goroutines × %d ops = %d total operations",
 		numGoroutines, numOpsPerGoroutine, numGoroutines*numOpsPerGoroutine)
 }
 
