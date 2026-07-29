@@ -4,10 +4,95 @@ package shadowmem
 
 import (
 	"testing"
+	"unsafe"
 
 	"runtime/race/kolkov/epoch"
 	"runtime/race/kolkov/vectorclock"
 )
+
+func TestCompactGroupsStorageLayout(t *testing.T) {
+	var groups compactGroups
+	if got := unsafe.Sizeof(groups); got != 96 {
+		t.Fatalf("compactGroups size=%d, want 96", got)
+	}
+	if got := unsafe.Sizeof(compactTombstones{}); got != 512 {
+		t.Fatalf("compactTombstones size=%d, want 512", got)
+	}
+	if got := unsafe.Sizeof(compactGroupOverflow{}); got != 80 {
+		t.Fatalf("compactGroupOverflow size=%d, want 80", got)
+	}
+	if got := unsafe.Offsetof(groups.active); got != 0 {
+		t.Fatalf("compactGroups.active offset=%d, want 0", got)
+	}
+	if got := unsafe.Sizeof(groups.active); got != 4 {
+		t.Fatalf("compactGroups.active width=%d, want 4", got)
+	}
+}
+
+func TestCompactResetDetachesColdStorageIntact(t *testing.T) {
+	groups := newCompactGroups()
+	compactTestClearRange(groups, 4000, 1)
+	current := compactTestEpoch(51, 7)
+	clock := compactTestClock(current)
+	var blocker *compactGroup
+	for i := 0; i <= compactPaletteBitmapCrossover; i++ {
+		if _, ok := groups.tryWrite(uintptr(i), current, clock, uintptr(0x8100+i)); !ok {
+			t.Fatalf("bitmap class %d failed", i)
+		}
+		if i+1 == compactPaletteBitmapCrossover {
+			blocker = compactTestKeepBitmapThroughCapacity(t, groups, 0)
+		}
+	}
+	blocker.joinable = true
+	oldPlane := groups.tombstones.Load()
+	oldOverflow := groups.overflow.Load()
+	if oldPlane == nil || oldOverflow == nil {
+		t.Fatalf("setup cold storage plane=%p overflow=%p", oldPlane, oldOverflow)
+	}
+	oldTombstone := oldPlane[4000>>6].Load()
+	var oldDirectory [compactOverflowGroups]*compactGroup
+	for i := range oldDirectory {
+		oldDirectory[i] = oldOverflow[i].Load()
+	}
+	oldRevision := groups.revision.Load()
+	oldLifecycle := groups.lifecycle
+	groups.reset()
+	if groups.tombstones.Load() != nil || groups.overflow.Load() != nil || groups.palette.Load() != nil {
+		t.Fatalf("reset roots plane=%p overflow=%p palette=%p, want detached", groups.tombstones.Load(), groups.overflow.Load(), groups.palette.Load())
+	}
+	if groups.revision.Load() != oldRevision+2 || groups.lifecycle == oldLifecycle || groups.active.Load() != 1 {
+		t.Fatalf("reset revision/lifecycle/active=%d/%v/%d, want %d/fresh/1", groups.revision.Load(), groups.lifecycle, groups.active.Load(), oldRevision+2)
+	}
+	if oldPlane[4000>>6].Load() != oldTombstone {
+		t.Fatal("reset mutated detached tombstone plane")
+	}
+	for i, want := range oldDirectory {
+		if got := oldOverflow[i].Load(); got != want {
+			t.Fatalf("reset mutated detached overflow slot %d from %p to %p", i, want, got)
+		}
+	}
+	for i := 0; i <= compactPaletteBitmapCrossover; i++ {
+		if state, authoritative := groups.lookupExact(uintptr(i)); state != nil || authoritative {
+			t.Fatalf("reset mapping %d=(%p,%v), want empty", i, state, authoritative)
+		}
+	}
+}
+
+func compactTestDefaultBacked(groups *compactGroups) {
+	if groups.palette.Load() == nil {
+		groups.provisionTombstones()
+	}
+}
+
+func compactTestClearRange(groups *compactGroups, offset, size uintptr) {
+	compactTestDefaultBacked(groups)
+	groups.clearRange(offset, size)
+}
+
+func compactTestPublishTombstoneRange(groups *compactGroups, offset, size uintptr) {
+	compactTestDefaultBacked(groups)
+	groups.publishTombstoneRange(offset, size)
+}
 
 func compactTestEpoch(tid uint32, clock uint64) epoch.Epoch {
 	return epoch.NewEpoch(tid, clock)
@@ -24,8 +109,8 @@ func compactTestClock(entries ...epoch.Epoch) *vectorclock.VectorClock {
 
 func compactActiveGroups(groups *compactGroups) int {
 	count := 0
-	for i := range groups.groups {
-		group := groups.groups[i].Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		group := groups.groupLoad(i)
 		if group != nil && !group.empty() {
 			count++
 		}
@@ -66,28 +151,42 @@ func TestCompactClearLifecyclePolicyParity(t *testing.T) {
 			t.Run("empty known clear", func(t *testing.T) {
 				groups := newGroups()
 				before := groups.lifecycle
+				beforeRevision := groups.revision.Load()
 				groups.clearRangeKnownDefault(101, 1, false)
-				if groups.lifecycle != before {
-					t.Fatalf("virgin clear advanced lifecycle from %v to %v", before, groups.lifecycle)
+				if groups.lifecycle != before || groups.revision.Load() != beforeRevision {
+					t.Fatalf("virgin clear mutated lifecycle/revision from %v/%d to %v/%d", before, beforeRevision, groups.lifecycle, groups.revision.Load())
 				}
+				if state, authoritative := groups.lookupExact(101); state != nil || authoritative {
+					t.Fatalf("virgin defaultless clear lookup=(%p,%v), want exact absence", state, authoritative)
+				}
+				if !dense && groups.tombstones.Load() != nil {
+					t.Fatal("virgin defaultless clear allocated a tombstone plane")
+				}
+				compactTestDefaultBacked(groups)
 				groups.clearRangeKnownDefault(101, 1, true)
-				if groups.lifecycle != before {
-					t.Fatalf("repeated tombstone clear advanced lifecycle from %v to %v", before, groups.lifecycle)
+				if groups.lifecycle == before {
+					t.Fatal("inherited default clear did not advance lifecycle")
 				}
 				if state, authoritative := groups.lookupExact(101); state != nil || !authoritative {
 					t.Fatalf("known clear lookup=(%p,%v), want authoritative zero", state, authoritative)
+				}
+				before = groups.lifecycle
+				beforeRevision = groups.revision.Load()
+				groups.clearRangeKnownDefault(101, 1, true)
+				if groups.lifecycle != before || groups.revision.Load() != beforeRevision {
+					t.Fatalf("repeated tombstone clear mutated lifecycle/revision from %v/%d to %v/%d", before, beforeRevision, groups.lifecycle, groups.revision.Load())
 				}
 			})
 
 			t.Run("conservative direct clear", func(t *testing.T) {
 				groups := newGroups()
 				before := groups.lifecycle
-				groups.clearRange(102, 1)
+				compactTestClearRange(groups, 102, 1)
 				if groups.lifecycle == before {
 					t.Fatal("direct clear did not advance lifecycle")
 				}
 				before = groups.lifecycle
-				groups.clearRange(102, 1)
+				compactTestClearRange(groups, 102, 1)
 				if groups.lifecycle == before {
 					t.Fatal("repeated direct clear did not advance lifecycle")
 				}
@@ -95,6 +194,7 @@ func TestCompactClearLifecyclePolicyParity(t *testing.T) {
 
 			t.Run("inherited default", func(t *testing.T) {
 				groups := newGroups()
+				compactTestDefaultBacked(groups)
 				before := groups.lifecycle
 				groups.clearRangeKnownDefault(103, 1, true)
 				if groups.lifecycle == before {
@@ -271,11 +371,80 @@ func TestCompactTrueNoopAndWriteAfterReadPolicies(t *testing.T) {
 		t.Fatalf("compact read no-op allocated %.2f objects/op", allocs)
 	}
 
-	if got, ok := reads.tryWrite(10, current, clock, 300); ok || got != nil {
-		t.Fatalf("write-after-read remained compact: state=%p ok=%v", got, ok)
-	}
-	if got := reads.lookup(10); got != read {
-		t.Fatalf("write-after-read fallback mutated source: got=%p want=%p", got, read)
+	initialWriter := compactTestEpoch(7, 3)
+	reader := compactTestEpoch(4, 20)
+	for _, test := range []struct {
+		name        string
+		writer      epoch.Epoch
+		clock       *vectorclock.VectorClock
+		wantCompact bool
+	}{
+		{
+			name:        "same reader",
+			writer:      compactTestEpoch(4, 21),
+			clock:       compactTestClock(initialWriter, compactTestEpoch(4, 21)),
+			wantCompact: true,
+		},
+		{
+			name:   "ordered cross thread",
+			writer: compactTestEpoch(5, 8),
+			clock:  compactTestClock(initialWriter, reader, compactTestEpoch(5, 8)),
+		},
+		{
+			name:   "unordered cross thread",
+			writer: compactTestEpoch(5, 8),
+			clock:  compactTestClock(initialWriter, compactTestEpoch(5, 8)),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			groups := newCompactGroups()
+			if _, ok := groups.tryWrite(11, initialWriter, compactTestClock(initialWriter), 100); !ok {
+				t.Fatal("initial write failed")
+			}
+			source, ok := groups.tryRead(11, reader, compactTestClock(initialWriter, reader), 200)
+			if !ok {
+				t.Fatal("read setup failed")
+			}
+			beforeGroup, overlap := groups.lookupGroup(11)
+			if beforeGroup == nil || overlap {
+				t.Fatalf("source group=%p overlap=%v", beforeGroup, overlap)
+			}
+			beforeDescriptor := beforeGroup.descriptor
+			beforeRevision := groups.revision.Load()
+
+			state, compacted := groups.tryWrite(11, test.writer, test.clock, 300)
+			if compacted != test.wantCompact || compacted != (state != nil) {
+				t.Fatalf("write-after-read = (%p,%v), want compact=%v", state, compacted, test.wantCompact)
+			}
+			if !test.wantCompact {
+				afterGroup, afterOverlap := groups.lookupGroup(11)
+				if groups.lookup(11) != source || afterGroup != beforeGroup || afterOverlap ||
+					afterGroup.descriptor != beforeDescriptor || groups.revision.Load() != beforeRevision {
+					t.Fatalf("rejected write mutated mapping: state=%p/%p group=%p/%p overlap=%v descriptor=%+v/%+v revision=%d/%d",
+						groups.lookup(11), source, afterGroup, beforeGroup, afterOverlap,
+						afterGroup.descriptor, beforeDescriptor, groups.revision.Load(), beforeRevision)
+				}
+				return
+			}
+
+			want := compactHistoryDescriptor{
+				history: compactHistoryKey{
+					write:           test.writer,
+					exclusiveWriter: -1,
+					writePC:         300,
+					readPC:          200,
+					writeCount:      2,
+				},
+				lifecycle: beforeDescriptor.lifecycle,
+			}
+			afterGroup, afterOverlap := groups.lookupGroup(11)
+			got, descriptorOK := compactDescriptorFromState(state)
+			if groups.lookup(11) != state || afterGroup == nil || afterOverlap ||
+				!descriptorOK || got != want || afterGroup.descriptor != want {
+				t.Fatalf("accepted write history/mapping: lookup=%p state=%p group=%p overlap=%v descriptor=%+v ok=%v groupDescriptor=%+v want=%+v",
+					groups.lookup(11), state, afterGroup, afterOverlap, got, descriptorOK, afterGroup.descriptor, want)
+			}
+		})
 	}
 }
 
@@ -442,8 +611,8 @@ func TestCompactScalarVirginAdmissionRecyclesHistoricalCache(t *testing.T) {
 	if got := compactActiveGroups(groups); got != 1 {
 		t.Fatalf("active groups after convergence = %d, want 1", got)
 	}
-	for i := range groups.groups {
-		group := groups.groups[i].Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		group := groups.groupLoad(i)
 		if group == nil || group.retired {
 			t.Fatalf("slot %d = %p retired=%v, want non-retired historical cache", i, group, group != nil && group.retired)
 		}
@@ -481,8 +650,8 @@ func TestCompactEmptyGroupRecyclePreservesExposedState(t *testing.T) {
 			t.Fatalf("history %d fell back", pc)
 		}
 	}
-	if groups.groups[0].Load() != retainedGroup {
-		t.Fatalf("empty group object was replaced: got %p want %p", groups.groups[0].Load(), retainedGroup)
+	if groups.groupLoad(0) != retainedGroup {
+		t.Fatalf("empty group object was replaced: got %p want %p", groups.groupLoad(0), retainedGroup)
 	}
 	if replacement := retainedGroup.state.Load(); replacement == retained {
 		t.Fatalf("exposed state was reused in place: retained=%p replacement=%p", retained, replacement)
@@ -675,7 +844,7 @@ func TestCompactClearPublishesExactTombstonesAndFreshGeneration(t *testing.T) {
 	}
 	oldGeneration := groups.lifecycle
 
-	groups.clearRange(70, 1)
+	compactTestClearRange(groups, 70, 1)
 	if state, authoritative := groups.lookupExact(70); state != nil || !authoritative {
 		t.Fatalf("cleared anchor lookup = (%p,%v), want authoritative zero", state, authoritative)
 	}
@@ -708,7 +877,7 @@ func TestCompactClearPublishesExactTombstonesAndFreshGeneration(t *testing.T) {
 
 func TestCompactTombstoneRetiresOnlyAfterSlotPublicationHook(t *testing.T) {
 	groups := newCompactGroups()
-	groups.clearRange(80, 3)
+	compactTestClearRange(groups, 80, 3)
 	if got := groups.wordTombstoneMask(80); got != 0x07 {
 		t.Fatalf("setup tombstones = %#x, want 0x07", got)
 	}
@@ -732,7 +901,7 @@ func TestCompactTombstoneRetiresOnlyAfterSlotPublicationHook(t *testing.T) {
 func TestCompactLookupFailsClosedDuringTombstoneToMembershipPublication(t *testing.T) {
 	groups := newCompactGroups()
 	const anchor = uintptr(91)
-	groups.clearRange(anchor, 1)
+	compactTestClearRange(groups, anchor, 1)
 	descriptor := compactHistoryDescriptor{
 		history: compactHistoryKey{
 			write:           compactTestEpoch(3, 7),
@@ -756,7 +925,7 @@ func TestCompactLookupFailsClosedDuringTombstoneToMembershipPublication(t *testi
 	// Destination becomes visible before the tombstone is retired. The reader
 	// may conservatively miss during publication, but the next stable lookup
 	// must return the destination rather than a synthetic default.
-	groups.groups[0].Store(group)
+	groups.groupStore(0, group)
 	groups.clearTombstone(anchor)
 	groups.endMutation()
 	if got, authoritative := groups.lookupExact(anchor); got != state || !authoritative {
@@ -788,7 +957,7 @@ func TestCompactActiveGatePublicationAndResetPermanence(t *testing.T) {
 	if got := tombstone.active.Load(); got != 0 {
 		t.Fatalf("new tombstone header active = %d, want 0", got)
 	}
-	tombstone.publishTombstoneRange(222, 1)
+	compactTestPublishTombstoneRange(tombstone, 222, 1)
 	if got := tombstone.active.Load(); got != 1 {
 		t.Fatalf("tombstone header active = %d, want 1", got)
 	}
@@ -800,7 +969,7 @@ func TestCompactActiveGatePublicationAndResetPermanence(t *testing.T) {
 func TestCompactLookupNeverSynthesizesAbsenceAcrossMoves(t *testing.T) {
 	groups := newCompactGroups()
 	const anchor = uintptr(123)
-	groups.clearRange(anchor, 1)
+	compactTestClearRange(groups, anchor, 1)
 	current := compactTestEpoch(5, 6)
 	clock := compactTestClock(current)
 	stop := make(chan struct{})
@@ -829,7 +998,7 @@ func TestCompactLookupNeverSynthesizesAbsenceAcrossMoves(t *testing.T) {
 		if _, ok := groups.tryWrite(anchor, current, clock, uintptr(i+1)); !ok {
 			t.Fatalf("tombstone transition %d failed", i)
 		}
-		groups.clearRange(anchor, 1)
+		compactTestClearRange(groups, anchor, 1)
 	}
 	close(stop)
 	for reader := 0; reader < cap(done); reader++ {
@@ -852,7 +1021,7 @@ func TestCompactClearRangeAllocatesNothing(t *testing.T) {
 		}
 	}
 	allocs := testing.AllocsPerRun(100, func() {
-		groups.clearRange(0, 64)
+		compactTestClearRange(groups, 0, 64)
 	})
 	if allocs != 0 {
 		t.Fatalf("allocator clear allocated %.2f objects/op", allocs)
@@ -866,7 +1035,7 @@ func TestCompactClearRangeAllocatesNothing(t *testing.T) {
 
 func TestCompactResetAllocatesNothingAndClearsTombstones(t *testing.T) {
 	groups := newCompactGroups()
-	groups.clearRange(7, 2)
+	compactTestClearRange(groups, 7, 2)
 	allocs := testing.AllocsPerRun(100, func() {
 		groups.reset()
 	})

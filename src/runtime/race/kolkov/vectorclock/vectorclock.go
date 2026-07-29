@@ -24,7 +24,7 @@ const (
 	MaxThreads = DenseThreads
 
 	// maxPooledMetadataBytes bounds the aggregate backing storage retained by
-	// one pooled clock. With poolCap clocks, sparse peak traffic can therefore
+	// one pooled clock. With poolCapacity clocks, sparse peak traffic can therefore
 	// retain at most 16 MiB of metadata rather than process-lifetime peaks.
 	maxPooledMetadataBytes = 64 << 10
 
@@ -32,28 +32,38 @@ const (
 	// accumulated to amortize the allocation, and only when its four-byte
 	// coordinates use at most two thirds of the equivalent twelve-byte runs.
 	minDenseTailRuns = 64
+
+	poolShardCount    = 16
+	poolShardCapacity = 16
+	poolCapacity      = poolShardCount * poolShardCapacity
 )
 
-var (
-	poolSlice []*VectorClock
-	poolLock  iatomic.Uint32
-	poolCap   = 256
-)
+type clockPoolShard struct {
+	lock  iatomic.Uint32
+	count uint8
+	slots [poolShardCapacity]*VectorClock
+}
+
+var poolCursor iatomic.Uint32
+var poolShards [poolShardCount]clockPoolShard
 
 func poolGet() *VectorClock {
-	for !poolLock.CompareAndSwap(0, 1) {
-	}
+	shardIndex := (poolCursor.Add(1) - 1) & (poolShardCount - 1)
+	shard := &poolShards[shardIndex]
 	var vc *VectorClock
-	if n := len(poolSlice); n > 0 {
-		vc = poolSlice[n-1]
-		poolSlice[n-1] = nil
-		poolSlice = poolSlice[:n-1]
+	if shard.lock.CompareAndSwap(0, 1) {
+		if shard.count != 0 {
+			shard.count--
+			vc = shard.slots[shard.count]
+			shard.slots[shard.count] = nil
+		}
+		shard.lock.Store(0)
 	}
-	poolLock.Store(0)
-	if vc != nil {
-		return vc
+	if vc == nil {
+		vc = &VectorClock{}
 	}
-	return &VectorClock{}
+	vc.poolShard = uint8(shardIndex)
+	return vc
 }
 
 func poolPut(vc *VectorClock) {
@@ -69,12 +79,19 @@ func poolPut(vc *VectorClock) {
 		vc.sparseRuns = nil
 		vc.retired = nil
 	}
-	for !poolLock.CompareAndSwap(0, 1) {
+	shardIndex := int(vc.poolShard)
+	if shardIndex >= poolShardCount {
+		return
 	}
-	if len(poolSlice) < poolCap {
-		poolSlice = append(poolSlice, vc)
+	shard := &poolShards[shardIndex]
+	if !shard.lock.CompareAndSwap(0, 1) {
+		return
 	}
-	poolLock.Store(0)
+	if shard.count < poolShardCapacity {
+		shard.slots[shard.count] = vc
+		shard.count++
+	}
+	shard.lock.Store(0)
 }
 
 // VectorClock stores the first DenseThreads clock components inline and higher
@@ -84,6 +101,7 @@ func poolPut(vc *VectorClock) {
 type VectorClock struct {
 	clocks     [DenseThreads]uint32
 	maxDense   uint16
+	poolShard  uint8
 	denseTail  []uint32
 	sparseRuns []finiteRun
 	retired    []RetiredRange

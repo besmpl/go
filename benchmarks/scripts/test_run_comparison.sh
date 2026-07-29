@@ -4,19 +4,102 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 HARNESS="${SCRIPT_DIR}/../run_comparison.sh"
+ORDER_HELPER="${SCRIPT_DIR}/benchmark_order.sh"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/race-comparison-test.XXXXXX")"
 trap 'rm -rf "${TMP_ROOT}"' EXIT
 
 case_number=0
 FIXTURE=
 
+test_comparison_order() {
+    local sample output expected position backend count
+
+    output="$(bash -c 'source "$1"' _ "${ORDER_HELPER}")"
+    [[ -z "${output}" ]] || {
+        echo 'benchmark_order.sh is not source-safe' >&2
+        exit 1
+    }
+
+    output="$({
+        source "${ORDER_HELPER}"
+        for (( sample = 1; sample <= 12; sample++ )); do
+            comparison_order "${sample}"
+        done
+    })"
+    expected="$(cat <<'EOF'
+baseline tsan purego
+tsan purego baseline
+purego baseline tsan
+baseline purego tsan
+purego tsan baseline
+tsan baseline purego
+baseline tsan purego
+tsan purego baseline
+purego baseline tsan
+baseline purego tsan
+purego tsan baseline
+tsan baseline purego
+EOF
+)"
+    [[ "${output}" == "${expected}" ]] || {
+        echo 'comparison order did not produce the exact first 12 triplets' >&2
+        printf '%s\n' "${output}" >&2
+        exit 1
+    }
+
+    for position in 1 2 3; do
+        for backend in baseline tsan purego; do
+            count="$(head -n 6 <<<"${output}" | awk -v position="${position}" -v backend="${backend}" '$position == backend { count++ } END { print count + 0 }')"
+            [[ "${count}" == 2 ]] || {
+                echo "${backend} appeared ${count} times in position ${position}; want 2" >&2
+                exit 1
+            }
+        done
+    done
+
+    # Quick mode's three samples place each backend once in every position.
+    # The default ten-sample release prefix differs by at most one, so the
+    # incomplete second cycle cannot reintroduce a systematic order bias.
+    for prefix in 3 10; do
+        for position in 1 2 3; do
+            local minimum=100 maximum=0
+            for backend in baseline tsan purego; do
+                count="$(head -n "${prefix}" <<<"${output}" | awk -v position="${position}" -v backend="${backend}" '$position == backend { count++ } END { print count + 0 }')"
+                if (( count < minimum )); then
+                    minimum=${count}
+                fi
+                if (( count > maximum )); then
+                    maximum=${count}
+                fi
+            done
+            (( maximum - minimum <= 1 )) || {
+                echo "first ${prefix} samples are imbalanced in position ${position}: min=${minimum} max=${maximum}" >&2
+                exit 1
+            }
+        done
+    done
+
+    for invalid in 0 -1 1.0 text 01; do
+        if bash -c 'source "$1"; comparison_order "$2"' _ "${ORDER_HELPER}" "${invalid}" >/dev/null 2>&1; then
+            echo "comparison_order accepted invalid sample ${invalid}" >&2
+            exit 1
+        fi
+    done
+    if bash -c 'source "$1"; comparison_order' _ "${ORDER_HELPER}" >/dev/null 2>&1 ||
+        bash -c 'source "$1"; comparison_order 1 2' _ "${ORDER_HELPER}" >/dev/null 2>&1; then
+        echo 'comparison_order accepted an invalid argument count' >&2
+        exit 1
+    fi
+}
+
 make_fixture() {
     local seconds="$1" maximum="$2" fixture output config sample
 
     case_number=$(( case_number + 1 ))
     fixture="${TMP_ROOT}/case-${case_number}"
-    mkdir -p "${fixture}/benchmarks/results" "${fixture}/benchmarks/baselines"
+    mkdir -p "${fixture}/benchmarks/results" "${fixture}/benchmarks/baselines" "${fixture}/benchmarks/scripts"
     cp "${HARNESS}" "${fixture}/benchmarks/run_comparison.sh"
+    cp "${ORDER_HELPER}" "${fixture}/benchmarks/scripts/benchmark_order.sh"
 
     output="${fixture}/benchmarks/results/sample.txt"
     for (( sample = 1; sample <= 10; sample++ )); do
@@ -302,9 +385,10 @@ test_toolchain_attestation() {
     case_number=$(( case_number + 1 ))
     fixture="${TMP_ROOT}/case-${case_number}"
     bootstrap="${fixture}/bootstrap"
-    mkdir -p "${fixture}/benchmarks" "${fixture}/bin" "${fixture}/src" \
+    mkdir -p "${fixture}/benchmarks/scripts" "${fixture}/bin" "${fixture}/src" \
         "${fixture}/pkg/include" "${fixture}/pkg/tool/testos_testarch" "${bootstrap}"
     cp "${HARNESS}" "${fixture}/benchmarks/run_comparison.sh"
+    cp "${ORDER_HELPER}" "${fixture}/benchmarks/scripts/benchmark_order.sh"
     printf 'package benchmarks\n' > "${fixture}/benchmarks/race_bench_test.go"
     printf 'module benchmarks\n\ngo 1.24\n' > "${fixture}/benchmarks/go.mod"
     printf 'go1.26-devel_fixture\n' > "${fixture}/VERSION"
@@ -442,6 +526,167 @@ EOF
     }
 }
 
+test_counterbalanced_run() {
+    local fixture bootstrap fake_bin trace output expected_order label phase
+
+    case_number=$(( case_number + 1 ))
+    fixture="${TMP_ROOT}/case-${case_number}"
+    bootstrap="${fixture}/bootstrap"
+    fake_bin="${fixture}/fake-bin"
+    trace="${fixture}/execution-order.txt"
+    mkdir -p "${fixture}/benchmarks/scripts" "${fixture}/bin" "${fixture}/src" \
+        "${fixture}/pkg/include" "${fixture}/pkg/tool/testos_testarch" "${bootstrap}" "${fake_bin}"
+    cp "${HARNESS}" "${fixture}/benchmarks/run_comparison.sh"
+    cp "${ORDER_HELPER}" "${fixture}/benchmarks/scripts/benchmark_order.sh"
+    printf 'package benchmarks\n' > "${fixture}/benchmarks/race_bench_test.go"
+    printf 'module benchmarks\n\ngo 1.24\n' > "${fixture}/benchmarks/go.mod"
+    printf 'go1.26-devel_fixture\n' > "${fixture}/VERSION"
+    printf '# fixture go environment\n' > "${fixture}/go.env"
+    printf 'package runtime\n' > "${fixture}/src/runtime.go"
+    cat > "${fixture}/src/make.bash" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${CGO_ENABLED:-}" == 0 && -d "${GOROOT_BOOTSTRAP:-}" ]]
+printf 'compiler artifact\n' > ../pkg/tool/testos_testarch/compile
+printf 'header artifact\n' > ../pkg/include/textflag.h
+EOF
+    chmod +x "${fixture}/src/make.bash"
+    cat > "${fixture}/bin/go" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd -P)"
+case "${1:-}" in
+    env)
+        case "${2:-}" in
+            GOROOT) echo "${root}" ;;
+            GOOS) echo testos ;;
+            GOARCH) echo testarch ;;
+            CC) echo fakecc ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    list)
+        if [[ "${CGO_ENABLED:-}" == 0 ]]; then
+            echo 'GoFiles=race_kolkov_import.go CgoFiles= SysoFiles='
+        else
+            echo 'GoFiles=race.go CgoFiles= SysoFiles=race_testos_testarch.syso'
+        fi
+        ;;
+    version) echo 'go version go1.26-fixture testos/testarch' ;;
+    tool)
+        case "${2:-}" in
+            buildid) echo "buildid-$(basename "$3")" ;;
+            nm)
+                if [[ "$3" == *tsan* ]]; then echo '1 T __tsan_read'; else echo '1 T runtime.raceRead'; fi
+                ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    test)
+        output=
+        while (( $# )); do
+            if [[ "$1" == -o ]]; then output="$2"; shift 2; else shift; fi
+        done
+        [[ -n "${output}" ]]
+        cat > "${output}" <<'BINARY'
+#!/usr/bin/env bash
+set -euo pipefail
+label="$(basename "$0")"
+label="${label#benchmark-}"
+label="${label%.test}"
+phase=latency
+benchtime=
+for arg in "$@"; do
+    case "${arg}" in
+        -test.bench=\^BenchmarkMemoryConcurrent*) phase=rss ;;
+        -test.benchtime=*) benchtime="${arg#*=}" ;;
+    esac
+done
+printf '%s %s %s\n' "${phase}" "${benchtime}" "${label}" >> "${FAKE_TRACE}"
+echo 'goos: testos'
+echo 'goarch: testarch'
+echo 'pkg: benchmarks'
+if [[ "${phase}" == rss ]]; then
+    echo 'BenchmarkMemoryConcurrent/g16-8 1 10 ns/op 0 B/op 0 allocs/op'
+else
+    echo 'BenchmarkRaceRead-8 1 10 ns/op 0 B/op 0 allocs/op'
+fi
+echo PASS
+BINARY
+        chmod +x "${output}"
+        ;;
+    *) exit 1 ;;
+esac
+EOF
+    chmod +x "${fixture}/bin/go"
+    cat > "${fake_bin}/fakecc" <<'EOF'
+#!/usr/bin/env bash
+echo 'fakecc fixture 1.0'
+EOF
+    cat > "${fake_bin}/benchstat" <<'EOF'
+#!/usr/bin/env bash
+echo 'RaceRead-8 10ns'
+EOF
+    cat > "${fake_bin}/gtime" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == --version ]]; then echo 'GNU time fixture'; exit 0; fi
+[[ "${1:-}" == -v ]]
+shift
+status=0
+"$@" || status=$?
+echo 'Maximum resident set size (kbytes): 100' >&2
+exit "${status}"
+EOF
+    chmod +x "${fake_bin}/fakecc" "${fake_bin}/benchstat" "${fake_bin}/gtime"
+
+    git -C "${fixture}" init -q
+    git -C "${fixture}" -c user.name=fixture -c user.email=fixture@example.invalid add .
+    git -C "${fixture}" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm fixture
+    PATH="${fake_bin}:${PATH}" GOROOT_BOOTSTRAP="${bootstrap}" \
+        bash "${fixture}/benchmarks/run_comparison.sh" --build-toolchain "${fixture}/bin/go" >/dev/null
+    PATH="${fake_bin}:${PATH}" FAKE_TRACE="${trace}" GNU_TIME_BIN="${fake_bin}/gtime" BENCH_GOMAXPROCS=2 \
+        bash "${fixture}/benchmarks/run_comparison.sh" --quick --go "${fixture}/bin/go" >/dev/null
+
+    expected_order="$(cat <<'EOF'
+001 baseline
+001 tsan
+001 purego
+002 tsan
+002 purego
+002 baseline
+003 purego
+003 baseline
+003 tsan
+EOF
+)"
+    [[ "$(cat "${fixture}/benchmarks/results/sample-order.txt")" == "${expected_order}" ]]
+    cmp -s "${fixture}/benchmarks/results/sample-order.txt" "${fixture}/benchmarks/results/rss-sample-order.txt" || {
+        echo 'latency and RSS phases did not share the counterbalanced schedule' >&2
+        exit 1
+    }
+    [[ "$(grep -c ' 100ms ' "${trace}")" == 6 ]]
+    for label in baseline tsan purego; do
+        [[ "$(grep -c "^latency 100ms ${label}$" "${trace}")" == 1 ]]
+        [[ "$(grep -c "^rss 100ms ${label}$" "${trace}")" == 1 ]]
+        [[ -s "${fixture}/benchmarks/results/raw/${label}/warmup-latency.txt" ]]
+        [[ -s "${fixture}/benchmarks/results/raw/${label}/warmup-rss.stdout" ]]
+        [[ -s "${fixture}/benchmarks/results/raw/${label}/warmup-rss.time" ]]
+        [[ ! -e "${fixture}/benchmarks/results/raw/${label}/warmup-latency.txt.samples" ]]
+        [[ ! -e "${fixture}/benchmarks/results/raw/${label}/warmup-rss.stdout.samples" ]]
+        [[ "$(grep -c '^Benchmark' "${fixture}/benchmarks/results/${label}.txt")" == 3 ]]
+        [[ "$(grep -c '^Benchmark' "${fixture}/benchmarks/results/rss-${label}.stdout")" == 3 ]]
+        [[ "$(wc -l < "${fixture}/benchmarks/results/rss-${label}-kb.txt" | tr -d '[:space:]')" == 3 ]]
+    done
+    [[ "$(wc -l < "${fixture}/benchmarks/results/sample-order.txt" | tr -d '[:space:]')" == 9 ]]
+    [[ "$(wc -l < "${fixture}/benchmarks/results/rss-sample-order.txt" | tr -d '[:space:]')" == 9 ]]
+    grep -F 'warmup_benchtime=100ms' "${fixture}/benchmarks/results/environment.txt" >/dev/null
+    grep -F 'sample_order=all-six-permutations' "${fixture}/benchmarks/results/summary.md" >/dev/null
+    [[ "$(cat "${fixture}/benchmarks/results/status.txt")" == QUICK ]]
+}
+
+test_comparison_order
+
 for value in '' 1junk 1=junk NaN Inf + - +1 -1 . .5 1. 1e0 ' 1' '1 '; do
     expect_invalid_metadata benchtime_seconds "${value}"
     expect_invalid_metadata max_raceread_ratio "${value}"
@@ -469,6 +714,7 @@ expect_manifest_sort_failure
 expect_runtime_fatal 'fatal error: fixture crash'
 expect_runtime_fatal 'runtime: fatal fixture crash'
 test_toolchain_attestation
+test_counterbalanced_run
 
 make_fixture 1 1
 bash "${FIXTURE}/benchmarks/run_comparison.sh" \

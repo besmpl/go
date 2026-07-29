@@ -774,13 +774,24 @@ func TestVectorClockSparseCloneCopyResetAndPoolReuse(t *testing.T) {
 	}
 	ptr := pooled
 	pooled.Release()
-	reused := NewFromPool()
-	defer reused.Release()
-	if reused != ptr {
-		t.Fatal("most recently released VectorClock was not reused")
+	reused := make([]*VectorClock, 0, poolShardCount)
+	found := false
+	for i := 0; i < poolShardCount; i++ {
+		clock := NewFromPool()
+		reused = append(reused, clock)
+		if clock == ptr {
+			found = true
+		}
+		if clock.Get(1<<28) != 0 || clock.GetMaxTID() != 0 ||
+			len(clock.denseTail) != 0 || len(clock.sparseRuns) != 0 || len(clock.retired) != 0 {
+			t.Errorf("pooled sparse VectorClock checkout %d retained data across lifetimes", i)
+		}
 	}
-	if reused.Get(1<<28) != 0 || reused.GetMaxTID() != 0 {
-		t.Fatal("pooled sparse VectorClock retained data across lifetimes")
+	for _, clock := range reused {
+		clock.Release()
+	}
+	if !found {
+		t.Fatal("released VectorClock was not reused within one pool-shard cycle")
 	}
 }
 

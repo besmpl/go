@@ -7,6 +7,7 @@ import (
 	"unsafe"
 
 	"runtime/race/kolkov/epoch"
+	"runtime/race/kolkov/vectorclock"
 )
 
 func TestCompactPaletteStorageCrossover(t *testing.T) {
@@ -122,7 +123,7 @@ func TestCompactPaletteUniformMissingTargetAdoption(t *testing.T) {
 	}
 
 	beforeLifecycle := groups.lifecycle
-	groups.clearRange(start, size)
+	compactTestClearRange(groups, start, size)
 	if groups.lifecycle == beforeLifecycle {
 		t.Fatal("conservative clear did not advance the tombstone lifecycle")
 	}
@@ -305,49 +306,30 @@ func TestCompactPalettePlanGenerationWrap(t *testing.T) {
 	}
 }
 
-func TestCompactPaletteResetBuildsAcyclicFreeList(t *testing.T) {
+func TestCompactPaletteResetDetachesHeavyStorage(t *testing.T) {
 	groups := newCompactGroups()
 	palette := new(compactPalette)
 	groups.palette.Store(palette)
-	const records = 20
-	var owners [records]uint8
-	for i := 0; i < records; i++ {
-		owners[i] = palette.ensureShape(compactPaletteShape{
-			writeTID:  42,
-			writePC:   uintptr(0x7a00 + i),
-			lifecycle: allocateLifecycleID(),
-			flags:     compactPaletteHasWrite,
-		})
-		palette.shapeRecord(owners[i], false).members = 1
+	groups.activate()
+	descriptor := compactHistoryDescriptor{
+		history:   compactHistoryKey{write: epoch.NewEpoch(42, 7), exclusiveWriter: 42, writePC: 0x7a00, writeCount: 1},
+		lifecycle: groups.lifecycle,
 	}
-	for i, owner := range owners {
-		if i%2 == 0 {
-			palette.releaseShapeMembers(owner, 1)
-		}
-	}
+	owner := installPaletteShape(t, palette, 3000, descriptor)
+	palette.setLows(3000, 7, 0)
+	oldLifecycle := groups.lifecycle
+	oldRevision := groups.revision.Load()
 	palette.reset(groups)
-	var seen [256]bool
-	count := 0
-	for owner := palette.freeHead; owner != 0; {
-		if seen[owner] {
-			t.Fatalf("free-list cycle or duplicate at owner %d", owner)
-		}
-		seen[owner] = true
-		record := palette.shapeRecord(owner, false)
-		if record == nil || !record.free || record.members != 0 {
-			t.Fatalf("invalid reset free owner %d: %+v", owner, record)
-		}
-		owner = record.freeNext
-		count++
-		if count > compactPaletteMaxShapes {
-			t.Fatal("free list exceeded the bounded shape capacity")
-		}
+	if groups.palette.Load() != nil || groups.active.Load() != 1 {
+		t.Fatalf("reset header = palette %p active %d, want detached permanent active header", groups.palette.Load(), groups.active.Load())
 	}
-	// Shape storage is allocated in chunks; reset can also make the unused tail
-	// in the final allocated chunk immediately reusable.
-	want := (records + compactPaletteShapeChunkRecords - 1) / compactPaletteShapeChunkRecords * compactPaletteShapeChunkRecords
-	if count != want {
-		t.Fatalf("reset free records=%d, want %d allocated records", count, want)
+	if groups.lifecycle == oldLifecycle || groups.revision.Load() != oldRevision+2 {
+		t.Fatalf("reset lifecycle/revision = %v/%d, want fresh lifecycle and revision %d", groups.lifecycle, groups.revision.Load(), oldRevision+2)
+	}
+	// The detached object is deliberately not mutated: a reader that loaded it
+	// before reset remains GC-safe, but its old revision cannot validate.
+	if palette.owner(3000) != owner || palette.shapeRecord(owner, false).members != 1 {
+		t.Fatal("reset mutated the stale palette snapshot")
 	}
 }
 
@@ -498,6 +480,9 @@ func TestCompactPaletteBitmapCrossoverAndEmptyDonor(t *testing.T) {
 			if _, ok := groups.tryWrite(uintptr(i), current, clock, uintptr(0xd000+i)); !ok {
 				t.Fatalf("seed class %d failed", i)
 			}
+			if groups.overflow.Load() != nil {
+				t.Fatalf("common class %d allocated overflow %p", i, groups.overflow.Load())
+			}
 		}
 		if groups.palette.Load() != nil || groups.allocatedGroupCount() != compactPaletteBitmapCrossover {
 			t.Fatalf("premature crossover: palette=%p groups=%d", groups.palette.Load(), groups.allocatedGroupCount())
@@ -540,11 +525,97 @@ func TestCompactPaletteBitmapCrossoverAndEmptyDonor(t *testing.T) {
 		if _, ok := groups.tryWrite(100, current, clock, 0xf100); !ok {
 			t.Fatal("unsupported block did not continue to physical capacity")
 		}
-		if groups.palette.Load() != nil || groups.allocatedGroupCount() != compactPaletteBitmapCrossover+1 {
-			t.Fatalf("unsupported crossover: palette=%p groups=%d", groups.palette.Load(), groups.allocatedGroupCount())
+		if groups.palette.Load() != nil || groups.allocatedGroupCount() != compactPaletteBitmapCrossover+1 || groups.overflow.Load() == nil {
+			t.Fatalf("unsupported crossover: palette=%p groups=%d overflow=%p", groups.palette.Load(), groups.allocatedGroupCount(), groups.overflow.Load())
+		}
+		for i := compactPaletteBitmapCrossover + 1; i < compactGroupCapacity; i++ {
+			if _, ok := groups.tryWrite(uintptr(100+i), current, clock, uintptr(0xf100+i)); !ok {
+				t.Fatalf("unsupported bitmap class %d did not reach logical capacity", i)
+			}
+		}
+		if groups.allocatedGroupCount() != compactGroupCapacity {
+			t.Fatalf("unsupported bitmap groups=%d, want logical capacity %d", groups.allocatedGroupCount(), compactGroupCapacity)
+		}
+		for slot := 0; slot < compactGroupCapacity; slot++ {
+			if groups.groupLoad(slot) == nil {
+				t.Fatalf("logical group slot %d is unreachable", slot)
+			}
+		}
+		if _, ok := groups.tryWrite(3000, current, clock, 0xffff); ok {
+			t.Fatal("unsupported bitmap admitted a seventeenth live group")
 		}
 		blocker.joinable = true
 	})
+}
+
+func TestCompactPaletteMigrationDetachesBitmapStorageIntact(t *testing.T) {
+	groups := newCompactGroups()
+	compactTestClearRange(groups, 3900, 1)
+	current := epoch.NewEpoch(52, 9)
+	clock := compactTestClock(current)
+	var blocker *compactGroup
+	for i := 0; i <= compactPaletteBitmapCrossover; i++ {
+		if _, ok := groups.tryWrite(uintptr(i*13), current, clock, uintptr(0x12100+i)); !ok {
+			t.Fatalf("bitmap history %d failed", i)
+		}
+		if i+1 == compactPaletteBitmapCrossover {
+			blocker = compactTestKeepBitmapThroughCapacity(t, groups, 0)
+		}
+	}
+	oldPlane := groups.tombstones.Load()
+	oldOverflow := groups.overflow.Load()
+	if oldPlane == nil || oldOverflow == nil {
+		t.Fatalf("setup plane=%p overflow=%p", oldPlane, oldOverflow)
+	}
+	oldTombstone := oldPlane[3900>>6].Load()
+	var oldDirectory [compactOverflowGroups]*compactGroup
+	for i := range oldDirectory {
+		oldDirectory[i] = oldOverflow[i].Load()
+	}
+	blocker.joinable = true
+	oldRevision := groups.revision.Load()
+	palette := groups.upgradePalette()
+	if palette == nil || groups.palette.Load() != palette {
+		t.Fatalf("palette migration=%p published=%p", palette, groups.palette.Load())
+	}
+	if groups.tombstones.Load() != nil || groups.overflow.Load() != nil || groups.revision.Load() != oldRevision+2 {
+		t.Fatalf("migration roots/revision plane=%p overflow=%p revision=%d, want nil/nil/%d", groups.tombstones.Load(), groups.overflow.Load(), groups.revision.Load(), oldRevision+2)
+	}
+	if palette.owner(3900) != compactPaletteTombstone {
+		t.Fatal("migration did not copy bitmap tombstone")
+	}
+	for i := 0; i <= compactPaletteBitmapCrossover; i++ {
+		descriptor, ok := palette.descriptor(uintptr(i * 13))
+		if !ok || descriptor.history.writePC != uintptr(0x12100+i) {
+			t.Fatalf("migrated history %d=(%+v,%v)", i, descriptor, ok)
+		}
+	}
+	if oldPlane[3900>>6].Load() != oldTombstone {
+		t.Fatal("migration mutated detached tombstone plane")
+	}
+	for i, want := range oldDirectory {
+		if got := oldOverflow[i].Load(); got != want {
+			t.Fatalf("migration mutated detached overflow slot %d from %p to %p", i, want, got)
+		}
+	}
+}
+
+func TestCompactPaletteClearOwnerMatchesDefault(t *testing.T) {
+	groups := newCompactGroups()
+	palette := new(compactPalette)
+	groups.palette.Store(palette)
+	groups.activate()
+	descriptor := compactHistoryDescriptor{
+		history:   compactHistoryKey{write: epoch.NewEpoch(53, 4), exclusiveWriter: 53, writePC: 0x12200, writeCount: 1},
+		lifecycle: groups.lifecycle,
+	}
+	installPaletteShape(t, palette, 3000, descriptor)
+	installPaletteShape(t, palette, 3001, descriptor)
+	groups.clearRangeKnownDefault(3000, 1, false)
+	groups.clearRangeKnownDefault(3001, 1, true)
+	if palette.owner(3000) != compactPaletteDefault || palette.owner(3001) != compactPaletteTombstone {
+		t.Fatalf("clear owners defaultless/default-backed=%d/%d, want %d/%d", palette.owner(3000), palette.owner(3001), compactPaletteDefault, compactPaletteTombstone)
+	}
 }
 
 func TestCompactPaletteRangeCrossover(t *testing.T) {
@@ -647,7 +718,7 @@ func TestCompactPaletteMigrationRejectsUnsupportedGroups(t *testing.T) {
 			}); allocs != 0 {
 				t.Fatalf("unsupported migration allocated %.2f objects", allocs)
 			}
-			if groups.groups[0].Load() != group || groups.lookup(37) != state ||
+			if groups.groupLoad(0) != group || groups.lookup(37) != state ||
 				state.GetW() != current || state.GetWritePC() != 0xc000 {
 				t.Fatal("rejected migration changed the bitmap representation or exact history")
 			}
@@ -712,6 +783,133 @@ func TestCompactPaletteConflictLeavesExactBitsUnchanged(t *testing.T) {
 	if groups.revision.Load() != beforeRevision || palette.owner(3000) != beforeOwner ||
 		afterWrite != beforeWrite || afterRead != beforeRead {
 		t.Fatal("failed range mutated dense publication")
+	}
+}
+
+func TestCompactPaletteScalarSameReaderWriteEligibility(t *testing.T) {
+	initialWriter := epoch.NewEpoch(7, 3)
+	reader := epoch.NewEpoch(4, 20)
+	for _, test := range []struct {
+		name        string
+		writer      epoch.Epoch
+		clock       *vectorclock.VectorClock
+		wantCompact bool
+	}{
+		{
+			name:        "same reader",
+			writer:      epoch.NewEpoch(4, 21),
+			clock:       compactTestClock(initialWriter, epoch.NewEpoch(4, 21)),
+			wantCompact: true,
+		},
+		{
+			name:   "ordered cross thread",
+			writer: epoch.NewEpoch(5, 8),
+			clock:  compactTestClock(initialWriter, reader, epoch.NewEpoch(5, 8)),
+		},
+		{
+			name:   "unordered cross thread",
+			writer: epoch.NewEpoch(5, 8),
+			clock:  compactTestClock(initialWriter, epoch.NewEpoch(5, 8)),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			groups := newCompactGroups()
+			palette := new(compactPalette)
+			groups.palette.Store(palette)
+			groups.activate()
+			if _, ok := groups.tryWrite(3000, initialWriter, compactTestClock(initialWriter), 100); !ok {
+				t.Fatal("initial dense write failed")
+			}
+			if _, ok := groups.tryRead(3000, reader, compactTestClock(initialWriter, reader), 200); !ok {
+				t.Fatal("dense read setup failed")
+			}
+			before, ok := palette.descriptor(3000)
+			if !ok {
+				t.Fatal("dense source descriptor missing")
+			}
+			beforeOwner := palette.owner(3000)
+			beforeWriteLow, beforeReadLow := palette.lows(3000)
+			beforeRevision := groups.revision.Load()
+
+			state, compacted := groups.tryWrite(3000, test.writer, test.clock, 300)
+			if compacted != test.wantCompact || state != nil {
+				t.Fatalf("dense write-after-read = (%p,%v), want (nil,%v)", state, compacted, test.wantCompact)
+			}
+			after, descriptorOK := palette.descriptor(3000)
+			if !test.wantCompact {
+				afterWriteLow, afterReadLow := palette.lows(3000)
+				if !descriptorOK || after != before || palette.owner(3000) != beforeOwner ||
+					afterWriteLow != beforeWriteLow || afterReadLow != beforeReadLow ||
+					groups.revision.Load() != beforeRevision {
+					t.Fatalf("rejected dense write mutated publication: descriptor=%+v/%+v ok=%v owner=%d/%d lows=(%d,%d)/(%d,%d) revision=%d/%d",
+						after, before, descriptorOK, palette.owner(3000), beforeOwner,
+						afterWriteLow, afterReadLow, beforeWriteLow, beforeReadLow,
+						groups.revision.Load(), beforeRevision)
+				}
+				return
+			}
+
+			want := compactHistoryDescriptor{
+				history: compactHistoryKey{
+					write:           test.writer,
+					exclusiveWriter: -1,
+					writePC:         300,
+					readPC:          200,
+					writeCount:      2,
+				},
+				lifecycle: before.lifecycle,
+			}
+			afterOwner := palette.owner(3000)
+			afterRecord := palette.shapeRecord(afterOwner, false)
+			if !descriptorOK || after != want || afterOwner < compactPaletteFirstShape ||
+				afterRecord == nil || afterRecord.members != 1 || groups.revision.Load() != beforeRevision+2 {
+				t.Fatalf("accepted dense write history/mapping: descriptor=%+v ok=%v owner=%d/%d revision=%d/%d want=%+v",
+					after, descriptorOK, afterOwner, beforeOwner,
+					groups.revision.Load(), beforeRevision+2, want)
+			}
+		})
+	}
+}
+
+func TestCompactPaletteScalarWriteReadWriteAllocatesNothing(t *testing.T) {
+	groups := newCompactGroups()
+	palette := new(compactPalette)
+	groups.palette.Store(palette)
+	groups.activate()
+	current := epoch.NewEpoch(9, 2)
+	clock := compactTestClock(current)
+	const (
+		anchor  = uintptr(3100)
+		writePC = uintptr(0xa301)
+		readPC  = uintptr(0xa302)
+	)
+	if _, ok := groups.tryWrite(anchor, current, clock, writePC); !ok {
+		t.Fatal("dense write setup failed")
+	}
+	if _, ok := groups.tryRead(anchor, current, clock, readPC); !ok {
+		t.Fatal("dense read warmup failed")
+	}
+	if _, ok := groups.tryWrite(anchor, current, clock, writePC); !ok {
+		t.Fatal("dense same-reader write warmup fell back")
+	}
+	if allocs := testing.AllocsPerRun(1000, func() {
+		if _, ok := groups.tryRead(anchor, current, clock, readPC); !ok {
+			panic("warmed dense read fell back")
+		}
+		if _, ok := groups.tryWrite(anchor, current, clock, writePC); !ok {
+			panic("warmed dense same-reader write fell back")
+		}
+	}); allocs != 0 {
+		t.Fatalf("warmed dense W-R-W allocated %.2f objects/op", allocs)
+	}
+	descriptor, ok := palette.descriptor(anchor)
+	owner := palette.owner(anchor)
+	record := palette.shapeRecord(owner, false)
+	if !ok || owner < compactPaletteFirstShape || record == nil || record.members != 1 || descriptor.lifecycle != groups.lifecycle ||
+		descriptor.history.write != current || descriptor.history.read != 0 ||
+		descriptor.history.exclusiveWriter != 9 || descriptor.history.writePC != writePC ||
+		descriptor.history.readPC != readPC || descriptor.history.writeCount <= 2 {
+		t.Fatalf("warmed dense W-R-W history/mapping = descriptor=%+v ok=%v owner=%d record=%+v", descriptor, ok, owner, record)
 	}
 }
 
@@ -850,14 +1048,112 @@ func TestCompactPaletteFullBlockClearAndReset(t *testing.T) {
 	if !groups.tryRange(0, rangeBlockSize, nil, current, clock, 0xc001, false) {
 		t.Fatal("full-block dense transition failed")
 	}
-	groups.clearRange(7, 2)
+	compactTestClearRange(groups, 7, 2)
 	if groups.palette.Load().owner(7) != compactPaletteTombstone || groups.palette.Load().owner(8) != compactPaletteTombstone {
 		t.Fatal("partial clear did not publish dense tombstones")
 	}
 	groups.reset()
+	if groups.palette.Load() != nil || groups.active.Load() != 1 {
+		t.Fatalf("reset retained dense root %p or cleared active=%d", groups.palette.Load(), groups.active.Load())
+	}
 	for _, anchor := range []uintptr{0, 7, 8, rangeBlockSize - 1} {
-		if groups.palette.Load().owner(anchor) != compactPaletteDefault {
-			t.Fatalf("reset retained owner at %d", anchor)
+		if state, authoritative := groups.lookupExact(anchor); state != nil || authoritative {
+			t.Fatalf("reset lookup at %d = (%p,%v), want ordinary miss", anchor, state, authoritative)
+		}
+	}
+}
+
+func TestPageTableCompactPaletteFullBlockClearRebuild(t *testing.T) {
+	pt := NewPageTableShadow()
+	const base = uintptr(0x8900000)
+	first := epoch.NewEpoch(43, 7)
+	firstClock := compactTestClock(first)
+
+	// Distinct write PCs create seven simultaneous history classes, forcing the
+	// real page-table block across the six-group bitmap-to-palette threshold.
+	for i := uintptr(0); i <= compactPaletteBitmapCrossover; i++ {
+		if !pt.TryCompactWrite(base+i*17, first, firstClock, 0xc100+i) {
+			t.Fatalf("initial dense history %d failed", i)
+		}
+	}
+	view, ok := pt.blockFor(base, false)
+	if !ok {
+		t.Fatal("dense block was not published")
+	}
+	header := view.history.compact.Load()
+	if header == nil {
+		t.Fatal("dense block has no compact header")
+	}
+	oldPalette := header.palette.Load()
+	if oldPalette == nil {
+		t.Fatal("test setup did not install the dense palette")
+	}
+	oldLifecycle := header.lifecycle
+	var oldOwners [compactPaletteBitmapCrossover + 1]uint8
+	var oldDescriptors [compactPaletteBitmapCrossover + 1]compactHistoryDescriptor
+	for i := uintptr(0); i <= compactPaletteBitmapCrossover; i++ {
+		addr := base + i*17
+		oldOwners[i] = oldPalette.owner(addr)
+		var represented bool
+		oldDescriptors[i], represented = oldPalette.descriptor(addr)
+		if !represented {
+			t.Fatalf("initial dense history %d is not represented", i)
+		}
+	}
+
+	pt.ClearRange(base, rangeBlockSize)
+	clearedView, ok := pt.blockFor(base, false)
+	if !ok {
+		t.Fatal("full clear removed the permanent block")
+	}
+	if got := clearedView.history.compact.Load(); got != header {
+		t.Fatalf("full clear replaced compact header %p with %p", header, got)
+	}
+	if header.active.Load() != 1 || header.palette.Load() != nil {
+		t.Fatalf("cleared header active=%d palette=%p, want active=1 and detached palette", header.active.Load(), header.palette.Load())
+	}
+	if header.lifecycle == oldLifecycle {
+		t.Fatalf("full clear retained lifecycle %v", oldLifecycle)
+	}
+	clearedLifecycle := header.lifecycle
+	for i := uintptr(0); i <= compactPaletteBitmapCrossover; i++ {
+		addr := base + i*17
+		if state, authoritative := header.lookupExact(addr); state != nil || authoritative {
+			t.Fatalf("cleared exact history %d = (%p,%v), want ordinary miss", i, state, authoritative)
+		}
+		if owner := oldPalette.owner(addr); owner != oldOwners[i] {
+			t.Fatalf("clear mutated stale palette owner %d from %d to %d", i, oldOwners[i], owner)
+		}
+		if descriptor, represented := oldPalette.descriptor(addr); !represented || descriptor != oldDescriptors[i] {
+			t.Fatalf("clear mutated stale palette history %d: descriptor=%+v represented=%v, want %+v", i, descriptor, represented, oldDescriptors[i])
+		}
+	}
+
+	second := epoch.NewEpoch(44, 11)
+	secondClock := compactTestClock(second)
+	for i := uintptr(0); i <= compactPaletteBitmapCrossover; i++ {
+		if !pt.TryCompactWrite(base+i*17, second, secondClock, 0xc200+i) {
+			t.Fatalf("rebuilt dense history %d failed", i)
+		}
+	}
+	newPalette := header.palette.Load()
+	if newPalette == nil || newPalette == oldPalette {
+		t.Fatalf("rebuilt palette=%p, want a new object distinct from %p", newPalette, oldPalette)
+	}
+	if header.lifecycle != clearedLifecycle || header.lifecycle == oldLifecycle {
+		t.Fatalf("rebuilt lifecycle=%v, want cleared lifecycle %v distinct from %v", header.lifecycle, clearedLifecycle, oldLifecycle)
+	}
+	for i := uintptr(0); i <= compactPaletteBitmapCrossover; i++ {
+		addr := base + i*17
+		descriptor, represented := newPalette.descriptor(addr)
+		wantHistory := compactHistoryKey{
+			write:           second,
+			exclusiveWriter: 44,
+			writePC:         0xc200 + i,
+			writeCount:      1,
+		}
+		if !represented || descriptor.history != wantHistory || descriptor.lifecycle != clearedLifecycle {
+			t.Fatalf("rebuilt dense history %d = %+v represented=%v, want history %+v lifecycle %v", i, descriptor, represented, wantHistory, clearedLifecycle)
 		}
 	}
 }

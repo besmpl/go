@@ -20,7 +20,18 @@ const compactGroupCapacity = 16
 const (
 	compactMembershipBits  = int(rangeBlockSize)
 	compactMembershipWords = compactMembershipBits / 64
+	compactInlineGroups    = compactPaletteBitmapCrossover
+	compactOverflowGroups  = compactGroupCapacity - compactInlineGroups
 )
+
+// compactTombstones is the exact-zero plane needed only while a bitmap-mode
+// block also has a non-nil default. Keeping it behind a pointer makes nil the
+// exact empty representation for the overwhelmingly common defaultless block.
+type compactTombstones [compactMembershipWords]atomic.Uint64
+
+// compactGroupOverflow is the uncommon tail of the logical 16-entry group
+// directory. Once detached by reset or palette migration it is immutable.
+type compactGroupOverflow [compactOverflowGroups]atomic.Pointer[compactGroup]
 
 // compactHistoryKey is the complete supported ordinary FastTrack history.
 // Allocator lifetime is deliberately kept in compactHistoryDescriptor: it is
@@ -78,12 +89,15 @@ type compactGroups struct {
 	// including across reset, so runtime lookup is permanently conservative
 	// after the block has ever held exact compact metadata.
 	active atomic.Uint32
-	groups [compactGroupCapacity]atomic.Pointer[compactGroup]
+	groups [compactInlineGroups]atomic.Pointer[compactGroup]
+	// overflow extends groups to compactGroupCapacity only after a failed dense
+	// migration needs a seventh bitmap group. Allocator clear/reset never creates
+	// it, and detachment never mutates a directory retained by an old reader.
+	overflow atomic.Pointer[compactGroupOverflow]
 	// tombstones are exact authoritative zero histories installed by partial
-	// allocator clears. They are embedded so racefree/GC sweep never allocates.
-	// A normal detector access may later move a tombstone into a fresh compact
-	// history; a materialized slot retires both forms after publication.
-	tombstones [compactMembershipWords]atomic.Uint64
+	// allocator clears of a non-nil bitmap default. The plane is provisioned at
+	// default publication, never by allocator clear, and detached intact.
+	tombstones atomic.Pointer[compactTombstones]
 	// revision is an even/odd publication sequence. It prevents a lock-free
 	// lookup from combining observations from opposite sides of a move into an
 	// absence which never existed. Writers are serialized by rangeBlock.mu.
@@ -131,6 +145,71 @@ func (c *compactGroups) newGenerationState() *VarState {
 // than the minimum release ordering and pairs with the runtime's atomic load.
 func (c *compactGroups) activate() {
 	c.active.Store(1)
+}
+
+// groupLoad addresses the logical 16-entry group directory without making the
+// common six-entry header pay for the cold tail.
+//
+//go:nosplit
+func (c *compactGroups) groupLoad(slot int) *compactGroup {
+	if c == nil || slot < 0 || slot >= compactGroupCapacity {
+		return nil
+	}
+	if slot < compactInlineGroups {
+		return c.groups[slot].Load()
+	}
+	overflow := c.overflow.Load()
+	if overflow == nil {
+		return nil
+	}
+	return overflow[slot-compactInlineGroups].Load()
+}
+
+// groupStore publishes one logical slot. A non-nil cold-tail store is an
+// ordinary detector allocation boundary reached only after palette migration
+// was attempted and rejected. Nil stores never allocate.
+func (c *compactGroups) groupStore(slot int, group *compactGroup) {
+	if slot < 0 || slot >= compactGroupCapacity {
+		runtimeThrow("race detector compact group slot out of range")
+	}
+	if slot < compactInlineGroups {
+		c.groups[slot].Store(group)
+		return
+	}
+	overflow := c.overflow.Load()
+	if overflow == nil {
+		if group == nil {
+			return
+		}
+		if c.revision.Load()&1 == 0 || c.palette.Load() != nil || c.allocatedGroupCount() < compactInlineGroups {
+			runtimeThrow("race detector compact overflow allocated outside bitmap migration fallback")
+		}
+		overflow = new(compactGroupOverflow)
+		c.overflow.Store(overflow)
+	}
+	overflow[slot-compactInlineGroups].Store(group)
+}
+
+// provisionTombstones is called only by the allocation-permitted block-default
+// publication boundary while the owning rangeBlock lock is held.
+func (c *compactGroups) provisionTombstones() {
+	if c.tombstones.Load() == nil {
+		c.tombstones.Store(new(compactTombstones))
+	}
+}
+
+// tombstoneWord is the nil-safe load shared by bitmap readers and range plans.
+//
+//go:nosplit
+func (c *compactGroups) tombstoneWord(word int) uint64 {
+	if c == nil {
+		return 0
+	}
+	plane := c.tombstones.Load()
+	if plane == nil {
+		return 0
+	}
+	return plane[word].Load()
 }
 
 func compactAnchor(anchor uintptr) uintptr {
@@ -279,8 +358,8 @@ func (c *compactGroups) lookupExact(anchor uintptr) (*VarState, bool) {
 	}
 	var group *compactGroup
 	var state *VarState
-	for i := range c.groups {
-		candidateGroup := c.groups[i].Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		candidateGroup := c.groupLoad(i)
 		if !compactMember(candidateGroup, anchor) {
 			continue
 		}
@@ -317,7 +396,7 @@ func (c *compactGroups) isTombstone(anchor uintptr) bool {
 		return palette.owner(compactAnchor(anchor)) == compactPaletteTombstone
 	}
 	word, mask := compactBit(anchor)
-	return c.tombstones[word].Load()&mask != 0
+	return c.tombstoneWord(word)&mask != 0
 }
 
 // tombstoned is the page-table spelling of isTombstone.
@@ -329,19 +408,25 @@ func (c *compactGroups) tombstoned(anchor uintptr) bool {
 
 func (c *compactGroups) setTombstone(anchor uintptr) {
 	word, mask := compactBit(anchor)
-	compactAtomicSet(&c.tombstones[word], mask)
+	plane := c.tombstones.Load()
+	if plane == nil {
+		runtimeThrow("race detector bitmap default missing tombstone plane")
+	}
+	compactAtomicSet(&plane[word], mask)
 }
 
 func (c *compactGroups) clearTombstone(anchor uintptr) {
 	word, mask := compactBit(anchor)
-	compactAtomicClear(&c.tombstones[word], mask)
+	if plane := c.tombstones.Load(); plane != nil {
+		compactAtomicClear(&plane[word], mask)
+	}
 }
 
 // lookupGroup is the block-locked form used by transitions. overlap=false is
 // part of the representation invariant; a detected overlap fails closed.
 func (c *compactGroups) lookupGroup(anchor uintptr) (found *compactGroup, overlap bool) {
-	for i := range c.groups {
-		group := c.groups[i].Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		group := c.groupLoad(i)
 		if !compactMember(group, anchor) {
 			continue
 		}
@@ -464,6 +549,15 @@ func compactHappensBefore(e epoch.Epoch, clock *vectorclock.VectorClock) bool {
 	return e == 0 || clock != nil && e.HappensBefore(clock)
 }
 
+func (key compactHistoryKey) sameReader(current epoch.Epoch) bool {
+	if key.read == 0 || current == 0 {
+		return false
+	}
+	readTID, _ := key.read.Decode()
+	currentTID, _ := current.Decode()
+	return readTID == currentTID
+}
+
 func (key compactHistoryKey) afterRead(current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr) (compactHistoryKey, bool) {
 	if current == 0 || !compactHappensBefore(key.write, clock) {
 		return compactHistoryKey{}, false
@@ -512,8 +606,8 @@ func (key compactHistoryKey) afterWrite(current epoch.Epoch, clock *vectorclock.
 }
 
 func (c *compactGroups) findDescriptor(descriptor compactHistoryDescriptor, exclude *compactGroup) *compactGroup {
-	for i := range c.groups {
-		group := c.groups[i].Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		group := c.groupLoad(i)
 		if group == nil || group == exclude || group.retired || !group.joinable ||
 			group.descriptor != descriptor || group.state.Load() == nil {
 			continue
@@ -530,8 +624,8 @@ func (c *compactGroups) reusableSlot() int {
 	// reuse an existing empty object before consuming another physical slot.
 	// This keeps temporal descriptor churn cheap without forcing dense storage.
 	if c.allocatedGroupCount() >= compactPaletteBitmapCrossover {
-		for i := range c.groups {
-			group := c.groups[i].Load()
+		for i := 0; i < compactGroupCapacity; i++ {
+			group := c.groupLoad(i)
 			if group != nil && group.empty() && (group.retired || group.joinable) {
 				return i
 			}
@@ -539,8 +633,8 @@ func (c *compactGroups) reusableSlot() int {
 	}
 	// Prefer never-used and explicitly retired slots. This preserves any small
 	// exact-descriptor working set while the table still has disposable space.
-	for i := range c.groups {
-		group := c.groups[i].Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		group := c.groupLoad(i)
 		if group == nil || group.retired && group.empty() {
 			return i
 		}
@@ -548,8 +642,8 @@ func (c *compactGroups) reusableSlot() int {
 	// Capacity is a bound on live equivalence classes, not on every descriptor
 	// the block has ever visited. An empty joinable group has no authoritative
 	// members, so its cache slot may be recycled for a new live descriptor.
-	for i := range c.groups {
-		group := c.groups[i].Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		group := c.groupLoad(i)
 		if group != nil && !group.retired && group.joinable && group.empty() {
 			return i
 		}
@@ -607,7 +701,7 @@ func (c *compactGroups) moveDescriptor(anchor uintptr, source *compactGroup, des
 	}
 
 	slot := c.reusableSlot()
-	if slot >= 0 && c.groups[slot].Load() == nil && c.allocatedGroupCount() >= compactPaletteBitmapCrossover {
+	if slot >= 0 && c.groupLoad(slot) == nil && c.allocatedGroupCount() >= compactPaletteBitmapCrossover {
 		if source != nil && source.soleMember(anchor) {
 			// Reuse the sole source in place instead of allocating a seventh
 			// object merely to leave the source empty.
@@ -652,7 +746,7 @@ func (c *compactGroups) moveDescriptor(anchor uintptr, source *compactGroup, des
 		c.endMutation()
 		return state, true
 	}
-	group := c.groups[slot].Load()
+	group := c.groupLoad(slot)
 	if group == nil {
 		state := compactStateFromDescriptor(descriptor)
 		group = &compactGroup{descriptor: descriptor, joinable: true}
@@ -660,7 +754,7 @@ func (c *compactGroups) moveDescriptor(anchor uintptr, source *compactGroup, des
 		compactSetMember(group, anchor)
 		c.activate()
 		c.beginMutation()
-		c.groups[slot].Store(group)
+		c.groupStore(slot, group)
 		if source != nil {
 			compactClearMember(source, anchor)
 		}
@@ -737,9 +831,10 @@ func (c *compactGroups) tryWrite(anchor uintptr, current epoch.Epoch, clock *vec
 		descriptor = source.descriptor
 		// Alternating/mutable hot locations should become authoritative word
 		// slots instead of permanently paying the bounded compact scan. Gob's
-		// critical bulk flow is write-then-read; a later write after any read
-		// frontier is conservatively promoted without changing compact history.
-		if descriptor.history.read != 0 && source.soleMember(anchor) {
+		// critical bulk flow is write-then-read; a later write after a different
+		// reader is conservatively promoted without changing compact history.
+		// The same logical reader may stay compact when afterWrite proves order.
+		if descriptor.history.read != 0 && !descriptor.history.sameReader(current) && source.soleMember(anchor) {
 			return nil, false
 		}
 	}
@@ -782,8 +877,8 @@ func (c *compactGroups) coveredWord(wordOffset uintptr) uint8 {
 		return palette.coveredWord(wordOffset)
 	}
 	mask := uint8(0)
-	for i := range c.groups {
-		mask |= groupWordMask(c.groups[i].Load(), wordOffset)
+	for i := 0; i < compactGroupCapacity; i++ {
+		mask |= groupWordMask(c.groupLoad(i), wordOffset)
 	}
 	return mask
 }
@@ -819,8 +914,8 @@ func (c *compactGroups) materializeWord(wordOffset uintptr, slot *ShadowSlot) {
 		palette.materializeWord(wordOffset, slot)
 		return
 	}
-	for i := range c.groups {
-		group := c.groups[i].Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		group := c.groupLoad(i)
 		mask := groupWordMask(group, wordOffset)
 		if mask == 0 {
 			continue
@@ -891,23 +986,18 @@ func (c *compactGroups) clearRangeWithHistory(offset, size uintptr, defaultHasHi
 	if start == end {
 		return
 	}
-	advanceLifecycle := forceAdvance
-	if !advanceLifecycle && defaultHasHistory {
-		for anchor := start; anchor < end; anchor++ {
-			if !c.isTombstone(anchor) {
-				advanceLifecycle = true
-				break
-			}
-		}
+	if defaultHasHistory && c.tombstones.Load() == nil {
+		runtimeThrow("race detector bitmap default missing tombstone plane")
 	}
+	membershipRepresented := false
 	var locked [compactGroupCapacity]*VarState
 	lockedCount := 0
-	for i := range c.groups {
-		group := c.groups[i].Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		group := c.groupLoad(i)
 		if group == nil || !group.intersects(start, end) {
 			continue
 		}
-		advanceLifecycle = true
+		membershipRepresented = true
 		state := group.state.Load()
 		if state == nil {
 			continue
@@ -932,9 +1022,45 @@ func (c *compactGroups) clearRangeWithHistory(offset, size uintptr, defaultHasHi
 		locked[lockedCount] = state
 		lockedCount++
 	}
+	tombstoneRepresented := false
+	firstWord := int(start >> 6)
+	lastWord := int((end - 1) >> 6)
+	for word := firstWord; word <= lastWord; word++ {
+		if c.tombstoneWord(word)&compactRangeWordMask(start, end-start, word) != 0 {
+			tombstoneRepresented = true
+			break
+		}
+	}
+	advanceLifecycle := forceAdvance || membershipRepresented
+	if defaultHasHistory && !advanceLifecycle {
+		// A non-tombstoned selected lane inherits the history-bearing default.
+		for word := firstWord; word <= lastWord; word++ {
+			selected := compactRangeWordMask(start, end-start, word)
+			if selected&^c.tombstoneWord(word) != 0 {
+				advanceLifecycle = true
+				break
+			}
+		}
+	}
+	if !forceAdvance && !membershipRepresented {
+		if defaultHasHistory && !advanceLifecycle {
+			return
+		}
+		if !defaultHasHistory && !tombstoneRepresented {
+			return
+		}
+	}
 	c.activate()
 	c.beginMutation()
-	c.setTombstoneRange(start, end-start)
+	if defaultHasHistory {
+		// Destination first: a lock-free lookup cannot fall through to the old
+		// block default while source membership is being retired.
+		c.setTombstoneRange(start, end-start)
+	} else {
+		// With no block default, absence itself is exact zero. Do not manufacture
+		// a retained zero plane merely because allocator sweep touched the range.
+		c.clearTombstoneRangeRaw(start, end-start)
+	}
 	c.removeMembershipRange(start, end-start)
 	if advanceLifecycle {
 		c.lifecycle = allocateLifecycleID()
@@ -1074,6 +1200,13 @@ func (c *compactGroups) clearTombstoneMask(wordOffset uintptr, mask uint8) {
 }
 
 func (c *compactGroups) updateTombstoneRange(start, end uintptr, set bool) {
+	plane := c.tombstones.Load()
+	if plane == nil {
+		if set {
+			runtimeThrow("race detector bitmap default missing tombstone plane")
+		}
+		return
+	}
 	for current := start; current < end; {
 		word := int(current >> 6)
 		wordEnd := (current | 63) + 1
@@ -1088,9 +1221,9 @@ func (c *compactGroups) updateTombstoneRange(start, end uintptr, set bool) {
 			mask = ((uint64(1) << width) - 1) << (current & 63)
 		}
 		if set {
-			compactAtomicSet(&c.tombstones[word], mask)
+			compactAtomicSet(&plane[word], mask)
 		} else {
-			compactAtomicClear(&c.tombstones[word], mask)
+			compactAtomicClear(&plane[word], mask)
 		}
 		current = wordEnd
 	}
@@ -1106,8 +1239,8 @@ func (c *compactGroups) removeMembershipRange(offset, size uintptr) {
 		size = rangeBlockSize - start
 	}
 	end := start + size
-	for i := range c.groups {
-		group := c.groups[i].Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		group := c.groupLoad(i)
 		if group == nil {
 			continue
 		}
@@ -1142,8 +1275,8 @@ func (c *compactGroups) snapshotAccesses(blockBase uintptr, dst *[compactGroupCa
 		return 0
 	}
 	count := 0
-	for i := range c.groups {
-		group := c.groups[i].Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		group := c.groupLoad(i)
 		first, ok := group.firstAnchor()
 		if !ok {
 			continue
@@ -1224,13 +1357,13 @@ func (c *compactGroups) commitAccesses(src *[compactGroupCapacity]compactAccess,
 // mergeEquivalent coalesces convergent exact keys after all source groups were
 // visited. Destination bits are published before source retirement.
 func (c *compactGroups) mergeEquivalent() {
-	for i := 0; i < len(c.groups); i++ {
-		destination := c.groups[i].Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		destination := c.groupLoad(i)
 		if destination == nil || destination.retired || !destination.joinable || destination.empty() {
 			continue
 		}
-		for j := i + 1; j < len(c.groups); j++ {
-			source := c.groups[j].Load()
+		for j := i + 1; j < compactGroupCapacity; j++ {
+			source := c.groupLoad(j)
 			if source == nil || source.retired || !source.joinable || source.empty() || source.descriptor != destination.descriptor {
 				continue
 			}
@@ -1268,8 +1401,8 @@ func (c *compactGroups) accessAll(blockBase uintptr, visit func(word uintptr, ma
 }
 
 // reset is the full-block clear operation. It closes atomic capabilities,
-// drains every distinct access transaction, removes all memberships and group
-// pointers, then advances the block generation. The compactGroups allocation
+// drains every distinct access transaction, detaches all mappings and cold
+// storage, then advances the block generation. The compactGroups allocation
 // itself remains permanent so external lock-free readers never dereference a
 // reclaimed header.
 func (c *compactGroups) reset() {
@@ -1283,8 +1416,8 @@ func (c *compactGroups) reset() {
 	newLifecycle := allocateLifecycleID()
 	var locked [compactGroupCapacity]*VarState
 	lockedCount := 0
-	for i := range c.groups {
-		group := c.groups[i].Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		group := c.groupLoad(i)
 		if group == nil || group.empty() {
 			continue
 		}
@@ -1313,18 +1446,13 @@ func (c *compactGroups) reset() {
 		lockedCount++
 	}
 	c.beginMutation()
-	for i := range c.groups {
-		group := c.groups[i].Load()
-		if group != nil {
-			for word := range group.members {
-				group.members[word].Store(0)
-			}
-		}
+	for i := 0; i < compactInlineGroups; i++ {
 		c.groups[i].Store(nil)
 	}
-	for word := range c.tombstones {
-		c.tombstones[word].Store(0)
-	}
+	// Detach the cold objects intact. A lock-free reader that captured either
+	// pointer before the odd revision may finish safely, but cannot validate it.
+	c.overflow.Store(nil)
+	c.tombstones.Store(nil)
 	c.lifecycle = newLifecycle
 	c.endMutation()
 	for i := lockedCount - 1; i >= 0; i-- {

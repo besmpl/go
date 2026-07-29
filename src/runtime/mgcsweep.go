@@ -784,7 +784,13 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 			// an unswept set, then the mcentral will pop it off the
 			// set, check its sweepgen, and ignore it.
 			if nalloc == 0 {
-				// Free totally free span directly back to the heap.
+				// Free totally free span directly back to the heap. Individual
+				// object frees keep race shadow metadata reusable, but returning
+				// the whole span is a definitive retirement signal that lets the
+				// pure-Go race backend release full-block compact backing state.
+				if raceenabled {
+					raceheapspanfree(unsafe.Pointer(s.base()), s.npages*pageSize)
+				}
 				mheap_.freeSpan(s)
 				return true
 			}

@@ -18,7 +18,18 @@ func compactClearClock(current epoch.Epoch) *vectorclock.VectorClock {
 	return clock
 }
 
-func TestPageTableEmptyCompactClearRetainsLifecycleUntilReaccess(t *testing.T) {
+func TestPageTableVirginClearDoesNotAllocateOrPublish(t *testing.T) {
+	pt := NewPageTableShadow()
+	const addr = uintptr(1)<<40 + 0x123
+	if allocs := testing.AllocsPerRun(100, func() { pt.ClearRange(addr, 1) }); allocs != 0 {
+		t.Fatalf("virgin clear allocated %.2f objects/op", allocs)
+	}
+	if _, ok := pt.blockFor(addr, false); ok {
+		t.Fatal("virgin clear published a block/header")
+	}
+}
+
+func TestPageTableDefaultlessCompactClearUsesExactAbsence(t *testing.T) {
 	pt := NewPageTableShadow()
 	const (
 		base   = uintptr(1) << 40
@@ -38,16 +49,18 @@ func TestPageTableEmptyCompactClearRetainsLifecycleUntilReaccess(t *testing.T) {
 		t.Fatalf("setup compact=%p default=%p, want compact metadata without inherited default", groups, view.history.state.Load())
 	}
 	before := groups.lifecycle
+	beforeRevision := groups.revision.Load()
 	pt.ClearRange(target, 1)
 	pt.ClearRange(target, 1)
-	if groups.lifecycle != before {
-		t.Fatalf("empty repeated clear advanced lifecycle from %v to %v", before, groups.lifecycle)
+	if groups.lifecycle != before || groups.revision.Load() != beforeRevision || groups.tombstones.Load() != nil {
+		t.Fatalf("virgin repeated clear mutated lifecycle/revision/plane from %v/%d/nil to %v/%d/%p",
+			before, beforeRevision, groups.lifecycle, groups.revision.Load(), groups.tombstones.Load())
 	}
 	if slot := pt.GetSlot(target); slot != nil {
 		t.Fatalf("empty compact clear materialized slot %p", slot)
 	}
-	if state, authoritative := groups.lookupExact(target); state != nil || !authoritative {
-		t.Fatalf("empty compact clear lookup=(%p,%v), want authoritative zero", state, authoritative)
+	if state, authoritative := groups.lookupExact(target); state != nil || authoritative {
+		t.Fatalf("empty compact clear lookup=(%p,%v), want exact absence", state, authoritative)
 	}
 
 	accessEpoch := epoch.NewEpoch(38, 5)
@@ -61,6 +74,15 @@ func TestPageTableEmptyCompactClearRetainsLifecycleUntilReaccess(t *testing.T) {
 	pt.ClearRange(target, 1)
 	if groups.lifecycle == before {
 		t.Fatal("clear after represented reaccess did not advance lifecycle")
+	}
+	if groups.tombstones.Load() != nil {
+		t.Fatal("defaultless represented clear manufactured a tombstone plane")
+	}
+	if state, authoritative := groups.lookupExact(target); state != nil || authoritative {
+		t.Fatalf("represented defaultless clear lookup=(%p,%v), want exact absence", state, authoritative)
+	}
+	if adjacent := pt.Get(seed); adjacent == nil || adjacent.GetW() != seedEpoch {
+		t.Fatalf("represented defaultless clear changed adjacent history: %v", adjacent)
 	}
 	freshEpoch := epoch.NewEpoch(39, 7)
 	if !pt.TryCompactWrite(target, freshEpoch, compactClearClock(freshEpoch), 0x7803) {
@@ -94,6 +116,18 @@ func TestPageTablePartialCompactDefaultClearAllocatesNothing(t *testing.T) {
 		}
 	}
 	pt.AccessRange(base, rangeBlockSize, func(_ uintptr, _ uint8, _ *VarState) {})
+	view, ok := pt.blockFor(base, false)
+	if !ok {
+		t.Fatal("full access did not publish its block")
+	}
+	compact := view.history.compact.Load()
+	if compact == nil {
+		t.Fatal("full access did not publish compact metadata")
+	}
+	if compact.palette.Load() != nil || compact.tombstones.Load() == nil || view.history.state.Load() == nil {
+		t.Fatalf("full access publication compact=%p palette=%p plane=%p state=%p, want bitmap default with ready plane",
+			compact, compact.palette.Load(), compact.tombstones.Load(), view.history.state.Load())
+	}
 
 	oldCompact := pt.Get(addresses[0])
 	oldDefault := pt.Get(addresses[0] - 1)

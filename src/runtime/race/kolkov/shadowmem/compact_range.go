@@ -118,8 +118,8 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 
 	// Partition selected bytes by their exact published compact group. Validate
 	// each immutable descriptor instead of trusting stale classification fields.
-	for i := range c.groups {
-		group := c.groups[i].Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		group := c.groupLoad(i)
 		if group == nil {
 			continue
 		}
@@ -160,7 +160,7 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 	// form one exact zero class in the current allocator generation.
 	tombstoneSelected := false
 	for word := firstWord; word <= lastWord; word++ {
-		mask := c.tombstones[word].Load() & compactRangeWordMask(offset, size, word)
+		mask := c.tombstoneWord(word) & compactRangeWordMask(offset, size, word)
 		if mask == 0 {
 			continue
 		}
@@ -189,7 +189,7 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 	defaultSelected := false
 	for word := firstWord; word <= lastWord; word++ {
 		selected := compactRangeWordMask(offset, size, word)
-		covered := c.tombstones[word].Load() & selected
+		covered := c.tombstoneWord(word) & selected
 		for i := 0; i < sourceCount; i++ {
 			if group := sources[i].group; group != nil {
 				covered |= group.members[word].Load() & selected
@@ -264,8 +264,8 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 	// as a different destination in this transaction.
 	for i := 0; i < destinationCount; i++ {
 		destination := &destinations[i]
-		for slot := range c.groups {
-			group := c.groups[slot].Load()
+		for slot := 0; slot < compactGroupCapacity; slot++ {
+			group := c.groupLoad(slot)
 			if group == nil || group.retired || !group.joinable || group.state.Load() == nil || group.descriptor != destination.descriptor {
 				continue
 			}
@@ -289,8 +289,8 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 		if group == nil {
 			continue
 		}
-		for slot := range c.groups {
-			if c.groups[slot].Load() == group {
+		for slot := 0; slot < compactGroupCapacity; slot++ {
+			if c.groupLoad(slot) == group {
 				reserved[slot] = true
 				break
 			}
@@ -309,11 +309,11 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 			continue
 		}
 		if allocatedGroups >= compactPaletteBitmapCrossover {
-			for slot := range c.groups {
+			for slot := 0; slot < compactGroupCapacity; slot++ {
 				if reserved[slot] {
 					continue
 				}
-				group := c.groups[slot].Load()
+				group := c.groupLoad(slot)
 				if group != nil && group.empty() && (group.retired || group.joinable) {
 					destination.slot = slot
 					reserved[slot] = true
@@ -321,14 +321,14 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 				}
 			}
 		}
-		for slot := range c.groups {
+		for slot := 0; slot < compactGroupCapacity; slot++ {
 			if destination.slot >= 0 {
 				break
 			}
 			if reserved[slot] {
 				continue
 			}
-			group := c.groups[slot].Load()
+			group := c.groupLoad(slot)
 			if group == nil || group.retired && group.empty() {
 				destination.slot = slot
 				reserved[slot] = true
@@ -336,11 +336,11 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 			}
 		}
 		if destination.slot < 0 {
-			for slot := range c.groups {
+			for slot := 0; slot < compactGroupCapacity; slot++ {
 				if reserved[slot] {
 					continue
 				}
-				group := c.groups[slot].Load()
+				group := c.groupLoad(slot)
 				if group != nil && !group.retired && group.joinable && group.empty() {
 					destination.slot = slot
 					reserved[slot] = true
@@ -358,7 +358,7 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 	newGroups := 0
 	for i := 0; i < destinationCount; i++ {
 		destination := &destinations[i]
-		if destination.group == nil && destination.slot >= 0 && c.groups[destination.slot].Load() == nil {
+		if destination.group == nil && destination.slot >= 0 && c.groupLoad(destination.slot) == nil {
 			newGroups++
 		}
 	}
@@ -376,7 +376,7 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 		if destination.group != nil {
 			continue
 		}
-		if group := c.groups[destination.slot].Load(); group != nil {
+		if group := c.groupLoad(destination.slot); group != nil {
 			destination.group = group
 			destination.recycle = true
 			continue
@@ -404,7 +404,7 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 	for i := 0; i < destinationCount; i++ {
 		destination := &destinations[i]
 		if destination.newGroup != nil {
-			c.groups[destination.slot].Store(destination.newGroup)
+			c.groupStore(destination.slot, destination.newGroup)
 		}
 	}
 	var sourceMasks [compactRangeSourceCapacity]uint64
@@ -419,7 +419,7 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 			case compactRangeGroupSource:
 				mask = source.group.members[word].Load() & selected
 			case compactRangeTombstoneSource:
-				mask = c.tombstones[word].Load() & selected
+				mask = c.tombstoneWord(word) & selected
 			case compactRangeDefaultSource:
 				defaultSource = i
 			}
@@ -447,7 +447,11 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 					compactClearMembershipMask(source.group, word, mask)
 				}
 			case compactRangeTombstoneSource:
-				compactAtomicClear(&c.tombstones[word], mask)
+				plane := c.tombstones.Load()
+				if plane == nil {
+					runtimeThrow("race detector compact range lost tombstone plane")
+				}
+				compactAtomicClear(&plane[word], mask)
 			}
 		}
 	}

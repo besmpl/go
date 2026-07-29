@@ -686,6 +686,11 @@ func accessBlockDefaultLocked(history *rangeBlock, compact *compactGroups, word 
 	state.LockAccess()
 	visit(word, mask, state)
 	state.UnlockAccess()
+	if compact.palette.Load() == nil {
+		// Allocator clear cannot allocate. Publish the ready exact-zero plane at
+		// this ordinary detector boundary before the bitmap default becomes visible.
+		compact.provisionTombstones()
+	}
 	history.state.Store(state)
 }
 

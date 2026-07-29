@@ -635,7 +635,8 @@ func (p *compactPalette) tryScalar(c *compactGroups, anchor uintptr, current epo
 	var next compactHistoryKey
 	var ok bool
 	if write {
-		if descriptor.history.read != 0 && owner >= compactPaletteFirstShape && p.shapeRecord(owner, false).members == 1 {
+		if descriptor.history.read != 0 && !descriptor.history.sameReader(current) &&
+			owner >= compactPaletteFirstShape && p.shapeRecord(owner, false).members == 1 {
 			return nil, false
 		}
 		next, ok = descriptor.history.afterWrite(current, clock, pc)
@@ -1014,19 +1015,27 @@ func (p *compactPalette) clearRange(c *compactGroups, offset, size uintptr, defa
 	if start == end {
 		return
 	}
+	target := compactPaletteDefault
+	if defaultHasHistory {
+		target = compactPaletteTombstone
+	}
 	advanceLifecycle := forceAdvance
-	if !advanceLifecycle {
-		for anchor := start; anchor < end; anchor++ {
-			owner := p.owner(anchor)
-			if owner >= compactPaletteFirstShape || owner == compactPaletteDefault && defaultHasHistory {
-				advanceLifecycle = true
-				break
-			}
+	mutate := forceAdvance
+	for anchor := start; anchor < end; anchor++ {
+		owner := p.owner(anchor)
+		if owner != target {
+			mutate = true
 		}
+		if owner >= compactPaletteFirstShape || owner == compactPaletteDefault && defaultHasHistory {
+			advanceLifecycle = true
+		}
+	}
+	if !mutate && !advanceLifecycle {
+		return
 	}
 	c.activate()
 	c.beginMutation()
-	p.setRangeOwner(start, end-start, compactPaletteTombstone)
+	p.setRangeOwner(start, end-start, target)
 	if advanceLifecycle {
 		c.lifecycle = allocateLifecycleID()
 	}
@@ -1035,16 +1044,12 @@ func (p *compactPalette) clearRange(c *compactGroups, offset, size uintptr, defa
 
 func (p *compactPalette) reset(c *compactGroups) {
 	c.beginMutation()
-	for word := range p.owners {
-		p.owners[word].Store(0)
+	c.palette.Store(nil)
+	for i := 0; i < compactInlineGroups; i++ {
+		c.groups[i].Store(nil)
 	}
-	for index := 0; index < compactPaletteMaxShapes; index++ {
-		id := uint8(index) + compactPaletteFirstShape
-		if record := p.shapeRecord(id, false); record != nil {
-			record.members = 0
-			p.markShapeFree(id, record)
-		}
-	}
+	c.overflow.Store(nil)
+	c.tombstones.Store(nil)
 	c.lifecycle = allocateLifecycleID()
 	c.endMutation()
 }
@@ -1054,8 +1059,8 @@ func (p *compactPalette) reset(c *compactGroups) {
 // unsupported block; it leaves the established bitmap oracle untouched.
 func paletteMigrationValid(c *compactGroups) bool {
 	var occupied [compactMembershipWords]uint64
-	for i := range c.groups {
-		group := c.groups[i].Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		group := c.groupLoad(i)
 		if group == nil || group.empty() {
 			continue
 		}
@@ -1075,10 +1080,12 @@ func paletteMigrationValid(c *compactGroups) bool {
 			occupied[word] |= members
 		}
 	}
-	for word := range c.tombstones {
-		value := c.tombstones[word].Load()
-		if occupied[word]&value != 0 {
-			return false
+	if tombstones := c.tombstones.Load(); tombstones != nil {
+		for word := range tombstones {
+			value := tombstones[word].Load()
+			if occupied[word]&value != 0 {
+				return false
+			}
 		}
 	}
 	return true
@@ -1092,8 +1099,8 @@ func densePaletteFromBitmaps(c *compactGroups) *compactPalette {
 		return nil
 	}
 	p := new(compactPalette)
-	for i := range c.groups {
-		group := c.groups[i].Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		group := c.groupLoad(i)
 		if group == nil || group.empty() {
 			continue
 		}
@@ -1114,13 +1121,15 @@ func densePaletteFromBitmaps(c *compactGroups) *compactPalette {
 			}
 		}
 	}
-	for word := range c.tombstones {
-		value := c.tombstones[word].Load()
-		for value != 0 {
-			bit := uint(bitsTrailingZeros64(value))
-			anchor := uintptr(word*64) + uintptr(bit)
-			p.setOwner(anchor, compactPaletteTombstone)
-			value &^= uint64(1) << bit
+	if tombstones := c.tombstones.Load(); tombstones != nil {
+		for word := range tombstones {
+			value := tombstones[word].Load()
+			for value != 0 {
+				bit := uint(bitsTrailingZeros64(value))
+				anchor := uintptr(word*64) + uintptr(bit)
+				p.setOwner(anchor, compactPaletteTombstone)
+				value &^= uint64(1) << bit
+			}
 		}
 	}
 	return p
@@ -1141,8 +1150,8 @@ func bitsTrailingZeros64(value uint64) int {
 
 func (c *compactGroups) allocatedGroupCount() int {
 	count := 0
-	for i := range c.groups {
-		if c.groups[i].Load() != nil {
+	for i := 0; i < compactGroupCapacity; i++ {
+		if c.groupLoad(i) != nil {
 			count++
 		}
 	}
@@ -1160,12 +1169,11 @@ func (c *compactGroups) upgradePalette() *compactPalette {
 	c.activate()
 	c.beginMutation()
 	c.palette.Store(palette)
-	for i := range c.groups {
+	for i := 0; i < compactInlineGroups; i++ {
 		c.groups[i].Store(nil)
 	}
-	for i := range c.tombstones {
-		c.tombstones[i].Store(0)
-	}
+	c.overflow.Store(nil)
+	c.tombstones.Store(nil)
 	c.endMutation()
 	return palette
 }

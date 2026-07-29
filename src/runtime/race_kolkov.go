@@ -226,22 +226,6 @@ const (
 // allocated context is zero-initialized, so cached addresses never cross a
 // context lifetime.
 
-// raceReadCacheEpochValid reports whether no external one-way synchronization
-// has observed the current cache epoch. A marker from an older epoch is harmless:
-// IncrementClock cleared the old entries before publishing the newer epoch.
-// Keeping zero as the common value avoids loading Epoch in programs that have
-// not performed such an observation.
-//
-//go:nosplit
-func raceReadCacheEpochValid(racectx uintptr) bool {
-	invalidated := atomic.Load((*uint32)(unsafe.Pointer(racectx + ctxReadCacheInvalidatedClockOffset)))
-	if invalidated == 0 {
-		return true
-	}
-	currentEpoch := atomic.Load64((*uint64)(unsafe.Pointer(racectx + ctxEpochOffset)))
-	return uint32(currentEpoch) > invalidated
-}
-
 // raceExternalBlockCell returns the exact sparse directory cell used outside
 // the primary window. The bounded walk is inlineable into racereadSlowPath;
 // missing or unusually long chains take the sound detector slow path.
@@ -845,6 +829,16 @@ func racefree(p unsafe.Pointer, sz uintptr) {
 	gp.raceguard--
 }
 
+// raceheapspanfree notifies the detector that the allocator is returning a
+// whole span to the heap. Unlike individual object frees, this is a quiescent
+// lifetime boundary for every address in the span, so full shadow blocks may
+// discard their retained compact state.
+//
+//go:nosplit
+func raceheapspanfree(p unsafe.Pointer, size uintptr) {
+	racefree(p, size)
+}
+
 // racegostart notifies the race detector that a new goroutine is starting.
 // Called by proc.go's newproc1 (on systemstack) when creating a goroutine.
 //
@@ -1361,7 +1355,14 @@ func raceread(addr uintptr) {
 		index := (addr >> 3) & ctxReadCacheMask
 		slot := (*uintptr)(unsafe.Pointer(racectx + ctxReadCacheOffset + index*goarch.PtrSize))
 		cachedWidth := *(*uint8)(unsafe.Pointer(racectx + ctxReadWidthOffset + index))
-		if *slot == addr && cachedWidth == 1 && raceReadCacheEpochValid(racectx) {
+		if *slot == addr && cachedWidth == 1 {
+			invalidated := atomic.Load((*uint32)(unsafe.Pointer(racectx + ctxReadCacheInvalidatedClockOffset)))
+			if invalidated != 0 {
+				currentEpoch := atomic.Load64((*uint64)(unsafe.Pointer(racectx + ctxEpochOffset)))
+				if uint32(currentEpoch) <= invalidated {
+					goto cacheMiss
+				}
+			}
 			// Static storage in the first module cannot be freed or reused. The
 			// exact address match is therefore sufficient after the initial read
 			// published this entry; heap, stack, and plugin storage still require
@@ -1375,6 +1376,7 @@ func raceread(addr uintptr) {
 			}
 		}
 	}
+cacheMiss:
 	pc := sys.GetCallerPC()
 	racereadSlowPath(addr, pc)
 }
@@ -1394,7 +1396,14 @@ func racereadn(addr, size uintptr) {
 		index := (addr >> 3) & ctxReadCacheMask
 		cachedAddr := *(*uintptr)(unsafe.Pointer(racectx + ctxReadCacheOffset + index*goarch.PtrSize))
 		cachedWidth := *(*uint8)(unsafe.Pointer(racectx + ctxReadWidthOffset + index))
-		if cachedAddr == addr && cachedWidth == uint8(size) && raceReadCacheEpochValid(racectx) {
+		if cachedAddr == addr && cachedWidth == uint8(size) {
+			invalidated := atomic.Load((*uint32)(unsafe.Pointer(racectx + ctxReadCacheInvalidatedClockOffset)))
+			if invalidated != 0 {
+				currentEpoch := atomic.Load64((*uint64)(unsafe.Pointer(racectx + ctxEpochOffset)))
+				if uint32(currentEpoch) <= invalidated {
+					goto cacheMiss
+				}
+			}
 			if raceFirstModuleStaticDataRange(addr, size) {
 				return
 			}
@@ -1404,6 +1413,7 @@ func racereadn(addr, size uintptr) {
 			}
 		}
 	}
+cacheMiss:
 	// Compiler hooks normally run on the current user goroutine. Keep the
 	// system-stack rejection on cache misses, but off the steady-state hit path;
 	// runtime work on g0/gsignal remains suppressed exactly as in raceread.

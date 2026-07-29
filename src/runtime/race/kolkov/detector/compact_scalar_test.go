@@ -606,7 +606,7 @@ func TestCompactScalarRepeatedIdenticalAccessPolicy(t *testing.T) {
 		}
 	})
 
-	t.Run("write after read promotes mutable cycle", func(t *testing.T) {
+	t.Run("same-reader write after read stays compact", func(t *testing.T) {
 		d := NewDetector()
 		ctx := goroutine.Alloc(228)
 		defer ctx.C.Release()
@@ -627,27 +627,32 @@ func TestCompactScalarRepeatedIdenticalAccessPolicy(t *testing.T) {
 			t.Fatalf("write/read setup materialized slot %p", slot)
 		}
 
-		// Any represented reader makes the following write a mutable-cycle
-		// workload. Promote it rather than repeatedly moving compact membership.
+		// A read by this same logical thread can remain compact: afterWrite still
+		// proves the represented read and write happen before the current clock.
 		d.OnWrite(addr, ctx, 0xc3b3)
 		slot := d.rangeMemory.GetSlot(addr)
-		if slot == nil {
-			t.Fatal("write after compact read did not promote the exact word")
+		if slot != nil {
+			t.Fatalf("same-reader write after compact read materialized slot %p", slot)
 		}
 		after := d.ShadowGet(addr)
-		if after == nil || slot.State(uint8(addr&7)) != after {
-			t.Fatalf("promoted cycle state = %p, slot state = %p", after, slot.State(uint8(addr&7)))
+		if after == nil || after == before {
+			t.Fatalf("same-reader compact cycle state = %p, before %p", after, before)
 		}
 		if after.GetLifecycleID() != lifecycle {
-			t.Fatalf("mutable-cycle promotion changed lifecycle from %d to %d", lifecycle, after.GetLifecycleID())
+			t.Fatalf("same-reader compact cycle changed lifecycle from %d to %d", lifecycle, after.GetLifecycleID())
 		}
 		if after.GetW() != ctx.GetEpoch() || after.GetReaderCount() != 0 ||
 			after.GetWritePC() != 0xc3b3 || after.GetWriteCount() != 2 ||
 			after.GetExclusiveWriter() != int64(ctx.TID) {
-			t.Fatalf("mutable-cycle promotion changed write semantics: %s", after)
+			t.Fatalf("same-reader compact cycle changed write semantics: %s", after)
+		}
+		peerState := d.ShadowGet(peer)
+		if peerState == nil || peerState == after || peerState.GetWritePC() != 0xc3b1 ||
+			peerState.GetWriteCount() != 1 || peerState.GetReaderCount() != 0 {
+			t.Fatalf("same-reader compact cycle changed peer history: %v", peerState)
 		}
 		if got := d.RacesDetected(); got != 0 {
-			t.Fatalf("same-context mutable cycle reported %d races", got)
+			t.Fatalf("same-reader compact cycle reported %d races", got)
 		}
 	})
 }

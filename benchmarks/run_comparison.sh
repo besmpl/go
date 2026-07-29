@@ -9,6 +9,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SOURCE_ROOT="$(cd "${SOURCE_ROOT_OVERRIDE:-${SCRIPT_DIR}/..}" && pwd -P)"
 RESULTS_DIR="${SCRIPT_DIR}/results"
 BASELINES_DIR="${SCRIPT_DIR}/baselines"
+ORDER_HELPER="${SCRIPT_DIR}/scripts/benchmark_order.sh"
+[[ -r "${ORDER_HELPER}" ]] || { echo "ERROR: benchmark order helper is missing: ${ORDER_HELPER}" >&2; exit 1; }
+# shellcheck source=scripts/benchmark_order.sh
+source "${ORDER_HELPER}"
 
 FORK_GO="${FORK_GO:-${SOURCE_ROOT}/bin/go}"
 COUNT=10
@@ -841,6 +845,8 @@ verify_race_binary_symbols PureGo "${PUREGO_BIN}" purego "${RESULTS_DIR}/symbols
     echo "Source HEAD:   ${FORK_REVISION}"
     echo "Source status: ${SOURCE_STATE}"
     echo "Evidence mode: ${RUN_MODE}"
+    echo "Warm-up:      warmup_benchtime=100ms (one validated run per backend and phase; raw evidence only)"
+    echo "Sample order: sample_order=all-six-permutations"
     echo "C compiler:    $("${cc_command}" --version | awk 'NR == 1 { print; exit }')"
     echo "GOOS/GOARCH:   $("${FORK_GO}" env GOOS)/$("${FORK_GO}" env GOARCH)"
     echo "Baseline:      CGO_ENABLED=0 race=false buildid=${baseline_id} hash=${baseline_hash}"
@@ -857,8 +863,38 @@ cat "${RESULTS_DIR}/environment.txt"
 : > "${RESULTS_DIR}/raceread-purego-ns.txt"
 : > "${RESULTS_DIR}/sample-order.txt"
 
+benchmark_binary() {
+    case "$1" in
+        baseline) printf '%s\n' "${BASELINE_BIN}" ;;
+        tsan) printf '%s\n' "${TSAN_BIN}" ;;
+        purego) printf '%s\n' "${PUREGO_BIN}" ;;
+        *) fail "unknown benchmark configuration: $1" ;;
+    esac
+}
+
+run_latency_warmup() {
+    local label="$1" binary output manifest
+    binary="$(benchmark_binary "${label}")"
+    output="${RESULTS_DIR}/raw/${label}/warmup-latency.txt"
+    manifest="$(mktemp "${TMPDIR:-/tmp}/race-latency-warmup.XXXXXX")" || fail "could not validate ${label} latency warm-up"
+    echo "Warming ${label} latency workload for 100ms..."
+    if ! GOMAXPROCS="${BENCH_GOMAXPROCS}" "${binary}" -test.run='^$' -test.bench='.' -test.benchmem \
+        -test.benchtime=100ms -test.count=1 -test.timeout="${TIMEOUT}" \
+        > "${output}" 2>&1; then
+        cat "${output}" >&2
+        rm -f "${manifest}"
+        fail "${label} latency warm-up failed"
+    fi
+    if ! validate_benchmark_output "${label} latency warm-up" "${output}" 1 "${manifest}"; then
+        rm -f "${manifest}"
+        return 1
+    fi
+    rm -f "${manifest}" || fail "could not clean up ${label} latency warm-up manifest"
+}
+
 run_sample() {
-    local label="$1" binary="$2" sample="$3" output aggregate value_file
+    local label="$1" sample="$2" binary output aggregate value_file
+    binary="$(benchmark_binary "${label}")"
     output="${RESULTS_DIR}/raw/${label}/${sample}.txt"
     aggregate="${RESULTS_DIR}/${label}.txt"
     echo "Running ${label} sample ${sample}/${COUNT}..."
@@ -895,16 +931,15 @@ run_sample() {
     fi
 }
 
+for label in $(comparison_order 1); do
+    run_latency_warmup "${label}"
+done
+
 for (( sample = 1; sample <= COUNT; sample++ )); do
     sample_name="$(printf '%03d' "${sample}")"
-    run_sample baseline "${BASELINE_BIN}" "${sample_name}"
-    if (( sample % 2 == 1 )); then
-        run_sample tsan "${TSAN_BIN}" "${sample_name}"
-        run_sample purego "${PUREGO_BIN}" "${sample_name}"
-    else
-        run_sample purego "${PUREGO_BIN}" "${sample_name}"
-        run_sample tsan "${TSAN_BIN}" "${sample_name}"
-    fi
+    for label in $(comparison_order "${sample}"); do
+        run_sample "${label}" "${sample_name}"
+    done
 done
 
 for config in baseline tsan purego; do
@@ -963,8 +998,9 @@ grep -Eq '^[[:space:]]*(Benchmark)?RaceRead(-[0-9]+)?[[:space:]]' "${RESULTS_DIR
 grep -Eq '^[[:space:]]*(Benchmark)?RaceRead(-[0-9]+)?[[:space:]]' "${RESULTS_DIR}/benchstat_all.txt" || fail "all-configuration benchstat output is incomplete"
 
 measure_peak_rss() {
-    local label="$1" binary="$2" sample="$3" stdout_file time_file manifest peak_kb
+    local label="$1" sample="$2" binary stdout_file time_file manifest peak_kb
     local aggregate_stdout aggregate_time sample_file
+    binary="$(benchmark_binary "${label}")"
     stdout_file="${RESULTS_DIR}/raw/${label}/rss-${sample}.stdout"
     time_file="${RESULTS_DIR}/raw/${label}/rss-${sample}.time"
     manifest="${stdout_file}.samples"
@@ -1004,6 +1040,41 @@ measure_peak_rss() {
     printf '%s\n' "${peak_kb}" >> "${sample_file}" || fail "could not append ${label} RSS sample"
 }
 
+run_rss_warmup() {
+    local label="$1" binary stdout_file time_file manifest
+    binary="$(benchmark_binary "${label}")"
+    stdout_file="${RESULTS_DIR}/raw/${label}/warmup-rss.stdout"
+    time_file="${RESULTS_DIR}/raw/${label}/warmup-rss.time"
+    manifest="$(mktemp "${TMPDIR:-/tmp}/race-rss-warmup.XXXXXX")" || fail "could not validate ${label} RSS warm-up"
+    echo "Warming ${label} RSS workload for 100ms..."
+    if ! GOMAXPROCS="${BENCH_GOMAXPROCS}" "${GNU_TIME_BIN}" -v "${binary}" -test.run='^$' \
+        -test.bench='^BenchmarkMemoryConcurrent$/^g16$' -test.benchmem \
+        -test.benchtime=100ms -test.count=1 -test.timeout=2m \
+        > "${stdout_file}" 2> "${time_file}"; then
+        cat "${stdout_file}" >&2
+        cat "${time_file}" >&2
+        rm -f "${manifest}"
+        fail "${label} RSS warm-up workload failed"
+    fi
+    if grep -Eq '^FAIL([[:space:]]|$)|^--- FAIL:|WARNING: DATA RACE|fatal error:|runtime: fatal' "${stdout_file}" "${time_file}"; then
+        cat "${stdout_file}" >&2
+        cat "${time_file}" >&2
+        rm -f "${manifest}"
+        fail "${label} RSS warm-up workload reported a failure"
+    fi
+    if ! benchmark_manifest "${stdout_file}" 1 "${manifest}"; then
+        rm -f "${manifest}"
+        fail "${label} RSS warm-up benchmark row is invalid"
+    fi
+    awk 'NR != 1 || $1 !~ /^BenchmarkMemoryConcurrent\/g16(-[0-9]+)?$/ || $2 != 1 { bad = 1 } END { exit bad || NR != 1 }' \
+        "${manifest}" || { rm -f "${manifest}"; fail "${label} RSS warm-up did not produce the exact BenchmarkMemoryConcurrent/g16 row"; }
+    awk '$0 == "PASS" { found++ } END { exit found != 1 }' "${stdout_file}" || {
+        rm -f "${manifest}"
+        fail "${label} RSS warm-up did not produce exactly one PASS marker"
+    }
+    rm -f "${manifest}" || fail "could not clean up ${label} RSS warm-up manifest"
+}
+
 for file in \
     rss-sample-order.txt \
     rss-baseline.stdout rss-tsan.stdout rss-purego.stdout \
@@ -1014,16 +1085,15 @@ for file in \
     : > "${RESULTS_DIR}/${file}"
 done
 
+for label in $(comparison_order 1); do
+    run_rss_warmup "${label}"
+done
+
 for (( sample = 1; sample <= COUNT; sample++ )); do
     sample_name="$(printf '%03d' "${sample}")"
-    measure_peak_rss baseline "${BASELINE_BIN}" "${sample_name}"
-    if (( sample % 2 == 1 )); then
-        measure_peak_rss tsan "${TSAN_BIN}" "${sample_name}"
-        measure_peak_rss purego "${PUREGO_BIN}" "${sample_name}"
-    else
-        measure_peak_rss purego "${PUREGO_BIN}" "${sample_name}"
-        measure_peak_rss tsan "${TSAN_BIN}" "${sample_name}"
-    fi
+    for label in $(comparison_order "${sample}"); do
+        measure_peak_rss "${label}" "${sample_name}"
+    done
 done
 summarize_rss "${RESULTS_DIR}" "${COUNT}" > "${RESULTS_DIR}/memory_rss.txt"
 
@@ -1047,7 +1117,8 @@ verify_race_binary_symbols PureGo "${PUREGO_BIN}" purego "${RESULTS_DIR}/symbols
     cat "${RESULTS_DIR}/environment.txt"
     echo '```'
     echo
-    echo "**Method:** exact prebuilt binaries, ${COUNT} paired alternating samples at ${BENCHTIME}."
+    echo "**Method:** exact prebuilt binaries, ${COUNT} paired samples at ${BENCHTIME}; sample_order=all-six-permutations."
+    echo "**Warm-up:** warmup_benchtime=100ms, one validated run per backend before each phase; retained only as raw evidence."
     echo "**Evidence mode:** ${RUN_MODE}. Quick-mode success is recorded as \`QUICK\`, not \`PASS\`."
     echo
     echo '### BenchmarkRaceRead release gate'

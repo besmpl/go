@@ -548,6 +548,12 @@ func racefree(p unsafe.Pointer, sz uintptr) {
 	racecall(&__tsan_free, uintptr(p), sz, 0, 0)
 }
 
+// raceheapspanfree is PureGo-specific. TSAN already observes object frees and
+// must not receive an additional __tsan_free for the containing span.
+//
+//go:nosplit
+func raceheapspanfree(p unsafe.Pointer, size uintptr) {}
+
 //go:nosplit
 func racegostart(pc uintptr) uintptr {
 	gp := getg()
