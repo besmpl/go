@@ -29,6 +29,7 @@ var (
 // address. Implementations may apply redundant-read elimination after the
 // first iteration.
 func BenchmarkRaceRead(b *testing.B) {
+	b.ReportAllocs()
 	n := b.N
 	var sum uint64
 
@@ -44,6 +45,7 @@ func BenchmarkRaceRead(b *testing.B) {
 // BenchmarkRaceReadAlternating alternates between two global addresses that
 // occupy distinct entries in the four-slot cache, measuring two-address hits.
 func BenchmarkRaceReadAlternating(b *testing.B) {
+	b.ReportAllocs()
 	n := b.N
 	var sum uint64
 
@@ -60,6 +62,7 @@ func BenchmarkRaceReadAlternating(b *testing.B) {
 // deterministically map to the same four-slot cache entry, forcing its miss
 // path without relying on linker placement of independent globals.
 func BenchmarkRaceReadCollision(b *testing.B) {
+	b.ReportAllocs()
 	n := b.N
 	var sum uint64
 
@@ -74,6 +77,7 @@ func BenchmarkRaceReadCollision(b *testing.B) {
 
 // BenchmarkRaceWrite measures one retained compiler-instrumented global write.
 func BenchmarkRaceWrite(b *testing.B) {
+	b.ReportAllocs()
 	n := b.N
 	b.ResetTimer()
 	for i := 0; i < n; i++ {
@@ -86,6 +90,7 @@ func BenchmarkRaceWrite(b *testing.B) {
 // BenchmarkRaceReadWrite measures one retained global read followed by one
 // global write to the same address. The write invalidates redundant-read state.
 func BenchmarkRaceReadWrite(b *testing.B) {
+	b.ReportAllocs()
 	n := b.N
 	var sum uint64
 	b.ResetTimer()
@@ -100,8 +105,11 @@ func BenchmarkRaceReadWrite(b *testing.B) {
 // BenchmarkMutexLockUnlock measures mutex acquire/release overhead under
 // race instrumentation.
 func BenchmarkMutexLockUnlock(b *testing.B) {
+	b.ReportAllocs()
 	var mu sync.Mutex
-	for b.Loop() {
+	n := b.N
+	b.ResetTimer()
+	for i := 0; i < n; i++ {
 		mu.Lock()
 		mu.Unlock()
 	}
@@ -109,8 +117,11 @@ func BenchmarkMutexLockUnlock(b *testing.B) {
 
 // BenchmarkRWMutexReadLock measures RWMutex reader lock overhead.
 func BenchmarkRWMutexReadLock(b *testing.B) {
+	b.ReportAllocs()
 	var mu sync.RWMutex
-	for b.Loop() {
+	n := b.N
+	b.ResetTimer()
+	for i := 0; i < n; i++ {
 		mu.RLock()
 		mu.RUnlock()
 	}
@@ -118,7 +129,10 @@ func BenchmarkRWMutexReadLock(b *testing.B) {
 
 // BenchmarkGoroutineStartStop measures goroutine creation + channel sync.
 func BenchmarkGoroutineStartStop(b *testing.B) {
-	for b.Loop() {
+	b.ReportAllocs()
+	n := b.N
+	b.ResetTimer()
+	for i := 0; i < n; i++ {
 		ch := make(chan struct{})
 		go func() { close(ch) }()
 		<-ch
@@ -129,13 +143,18 @@ func BenchmarkGoroutineStartStop(b *testing.B) {
 // Sync-heavy workloads
 // ---------------------------------------------------------------------------
 
-// BenchmarkMutexContention measures N goroutines contending on a single mutex.
+// BenchmarkMutexContention measures N RunParallel multipliers contending on a
+// single mutex. The gN sub-benchmark names are manifest-stable; they identify
+// SetParallelism(N), so the reported workers metric is N*GOMAXPROCS.
 func BenchmarkMutexContention(b *testing.B) {
+	b.ReportAllocs()
 	for _, n := range []int{1, 4, 16, 64} {
 		b.Run(goroutineLabel(n), func(b *testing.B) {
+			b.ReportAllocs()
 			var mu sync.Mutex
 			var counter int
 			b.SetParallelism(n)
+			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
 					mu.Lock()
@@ -143,6 +162,8 @@ func BenchmarkMutexContention(b *testing.B) {
 					mu.Unlock()
 				}
 			})
+			b.StopTimer()
+			b.ReportMetric(float64(n*runtime.GOMAXPROCS(0)), "workers")
 			mu.Lock()
 			_ = counter
 			mu.Unlock()
@@ -152,6 +173,7 @@ func BenchmarkMutexContention(b *testing.B) {
 
 // BenchmarkChannelPingPong measures channel send/recv pair latency.
 func BenchmarkChannelPingPong(b *testing.B) {
+	b.ReportAllocs()
 	ch1 := make(chan struct{})
 	ch2 := make(chan struct{})
 	go func() {
@@ -159,18 +181,25 @@ func BenchmarkChannelPingPong(b *testing.B) {
 			ch2 <- struct{}{}
 		}
 	}()
-	for b.Loop() {
+	n := b.N
+	b.ResetTimer()
+	for i := 0; i < n; i++ {
 		ch1 <- struct{}{}
 		<-ch2
 	}
+	b.StopTimer()
 	close(ch1)
 }
 
 // BenchmarkWaitGroupFanOut fans out N goroutines with WaitGroup synchronization.
 func BenchmarkWaitGroupFanOut(b *testing.B) {
+	b.ReportAllocs()
 	for _, n := range []int{1, 4, 16, 64} {
 		b.Run(goroutineLabel(n), func(b *testing.B) {
-			for b.Loop() {
+			b.ReportAllocs()
+			iterations := b.N
+			b.ResetTimer()
+			for i := 0; i < iterations; i++ {
 				var wg sync.WaitGroup
 				wg.Add(n)
 				for range n {
@@ -190,9 +219,13 @@ func BenchmarkWaitGroupFanOut(b *testing.B) {
 // ---------------------------------------------------------------------------
 
 // BenchmarkMapReadWrite simulates concurrent map access protected by RWMutex.
+// Its gN sub-benchmark names identify SetParallelism(N), so RunParallel starts
+// N*GOMAXPROCS workers; the exact count is reported as a workers metric.
 func BenchmarkMapReadWrite(b *testing.B) {
+	b.ReportAllocs()
 	for _, n := range []int{1, 4, 16, 64} {
 		b.Run(goroutineLabel(n), func(b *testing.B) {
+			b.ReportAllocs()
 			var mu sync.RWMutex
 			m := make(map[int]int)
 			// Pre-fill map.
@@ -218,14 +251,18 @@ func BenchmarkMapReadWrite(b *testing.B) {
 					i++
 				}
 			})
+			b.StopTimer()
+			b.ReportMetric(float64(n*runtime.GOMAXPROCS(0)), "workers")
 		})
 	}
 }
 
 // BenchmarkProducerConsumer simulates a buffered channel pipeline.
 func BenchmarkProducerConsumer(b *testing.B) {
+	b.ReportAllocs()
 	for _, bufSize := range []int{1, 16, 64} {
 		b.Run(bufLabel(bufSize), func(b *testing.B) {
+			b.ReportAllocs()
 			ch := make(chan int, bufSize)
 			var wg sync.WaitGroup
 			// Consumer.
@@ -235,9 +272,12 @@ func BenchmarkProducerConsumer(b *testing.B) {
 				for range ch {
 				}
 			}()
-			for b.Loop() {
+			iterations := b.N
+			b.ResetTimer()
+			for i := 0; i < iterations; i++ {
 				ch <- 1
 			}
+			b.StopTimer()
 			close(ch)
 			wg.Wait()
 		})
@@ -246,8 +286,10 @@ func BenchmarkProducerConsumer(b *testing.B) {
 
 // BenchmarkWorkerPool simulates a pool of N workers processing tasks.
 func BenchmarkWorkerPool(b *testing.B) {
+	b.ReportAllocs()
 	for _, n := range []int{1, 4, 16, 64} {
 		b.Run(goroutineLabel(n), func(b *testing.B) {
+			b.ReportAllocs()
 			tasks := make(chan int, n)
 			var wg sync.WaitGroup
 			// Start workers.
@@ -263,9 +305,12 @@ func BenchmarkWorkerPool(b *testing.B) {
 					_ = sum
 				}()
 			}
-			for b.Loop() {
+			iterations := b.N
+			b.ResetTimer()
+			for i := 0; i < iterations; i++ {
 				tasks <- 1
 			}
+			b.StopTimer()
 			close(tasks)
 			wg.Wait()
 		})
@@ -284,13 +329,17 @@ var (
 // BenchmarkMemoryAllocation measures small allocations under race
 // instrumentation. Only the final allocation is retained.
 func BenchmarkMemoryAllocation(b *testing.B) {
+	b.ReportAllocs()
 	var last []byte
-	for b.Loop() {
+	n := b.N
+	b.ResetTimer()
+	for i := 0; i < n; i++ {
 		s := make([]byte, 256)
 		s[0] = 1
 		s[255] = 2
 		last = s
 	}
+	b.StopTimer()
 	memoryAllocationSink = last
 	runtime.KeepAlive(memoryAllocationSink)
 }
@@ -299,8 +348,10 @@ func BenchmarkMemoryAllocation(b *testing.B) {
 // retains only its final allocation; process RSS is measured externally by
 // running a prebuilt benchmark binary.
 func BenchmarkMemoryConcurrent(b *testing.B) {
+	b.ReportAllocs()
 	for _, n := range []int{4, 16} {
 		b.Run(goroutineLabel(n), func(b *testing.B) {
+			b.ReportAllocs()
 			var wg sync.WaitGroup
 			last := make([][]byte, n)
 			wg.Add(n)

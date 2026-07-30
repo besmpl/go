@@ -103,7 +103,42 @@ make_fixture() {
 
     output="${fixture}/benchmarks/results/sample.txt"
     for (( sample = 1; sample <= 10; sample++ )); do
-        printf 'BenchmarkRaceRead-8 %d 10 ns/op\n' "${sample}" >> "${output}"
+        while IFS= read -r workload; do
+            [[ -n "${workload}" ]] || continue
+            printf 'Benchmark%s-8 %d 10 ns/op 0 B/op 0 allocs/op\n' "${workload}" "${sample}" >> "${output}"
+        done <<'EOF'
+RaceRead
+RaceReadAlternating
+RaceReadCollision
+RaceWrite
+RaceReadWrite
+MutexLockUnlock
+RWMutexReadLock
+GoroutineStartStop
+MutexContention/g1
+MutexContention/g4
+MutexContention/g16
+MutexContention/g64
+ChannelPingPong
+WaitGroupFanOut/g1
+WaitGroupFanOut/g4
+WaitGroupFanOut/g16
+WaitGroupFanOut/g64
+MapReadWrite/g1
+MapReadWrite/g4
+MapReadWrite/g16
+MapReadWrite/g64
+ProducerConsumer/buf1
+ProducerConsumer/buf16
+ProducerConsumer/buf64
+WorkerPool/g1
+WorkerPool/g4
+WorkerPool/g16
+WorkerPool/g64
+MemoryAllocation
+MemoryConcurrent/g4
+MemoryConcurrent/g16
+EOF
     done
     printf 'PASS\nok  \tbenchmarks\t0.1s\n' >> "${output}"
     for config in baseline tsan purego; do
@@ -119,7 +154,19 @@ benchtime_seconds=${seconds}
 max_raceread_ratio=${maximum}
 rss_count=10
 rss_benchtime=3s
+max_matrix_geomean=1
+max_matrix_class_ratio=1.10
+min_contention_throughput=0.90
+max_p99_ratio=1.25
 EOF
+    cat > "${fixture}/.gitignore" <<'EOF'
+/benchmarks/results/
+/benchmarks/baselines/
+/fake-bin/
+EOF
+    git -C "${fixture}" init -q
+    git -C "${fixture}" -c user.name=fixture -c user.email=fixture@example.invalid add .
+    git -C "${fixture}" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm fixture
     FIXTURE="${fixture}"
 }
 
@@ -328,7 +375,7 @@ expect_wrong_sample_count() {
         echo "accepted mismatched benchmark sample counts" >&2
         exit 1
     fi
-    grep -F 'benchmark configurations must contain identical sample sets' <<<"${output}" >/dev/null || {
+    grep -Eq 'benchmark configurations must contain identical sample sets|benchmark sample set is invalid' <<<"${output}" >/dev/null || {
         echo "wrong mismatched sample diagnostic:" >&2
         echo "${output}" >&2
         exit 1
@@ -379,6 +426,90 @@ expect_runtime_fatal() {
     }
 }
 
+expect_incomplete_matrix() {
+    local fixture output
+    make_fixture 1 1
+    fixture="${FIXTURE}"
+    awk '!/^BenchmarkRaceWrite-8 /' "${fixture}/benchmarks/results/purego.txt" > "${fixture}/short.txt"
+    mv "${fixture}/short.txt" "${fixture}/benchmarks/results/purego.txt"
+    if output="$(bash "${fixture}/benchmarks/run_comparison.sh" --save invalid 2>&1)"; then
+        echo 'accepted an incomplete named workload matrix' >&2
+        exit 1
+    fi
+    grep -F 'benchmark matrix is incomplete' <<<"${output}" >/dev/null
+}
+
+expect_invalid_allocation_metric() {
+    local fixture output
+    make_fixture 1 1
+    fixture="${FIXTURE}"
+    sed '1s/0 B\/op/NaN B\/op/' "${fixture}/benchmarks/results/purego.txt" > "${fixture}/bad.txt"
+    mv "${fixture}/bad.txt" "${fixture}/benchmarks/results/purego.txt"
+    if output="$(bash "${fixture}/benchmarks/run_comparison.sh" --save invalid 2>&1)"; then
+        echo 'accepted a non-finite allocation metric' >&2
+        exit 1
+    fi
+    grep -F 'benchmark sample set is invalid' <<<"${output}" >/dev/null
+}
+
+
+expect_dirty_save_rejected() {
+    local fixture output
+    make_fixture 1 1
+    fixture="${FIXTURE}"
+    printf 'dirty source\n' > "${fixture}/untracked-source.txt"
+    if output="$(bash "${fixture}/benchmarks/run_comparison.sh" --save invalid 2>&1)"; then
+        echo 'saved evidence from a dirty source tree' >&2
+        exit 1
+    fi
+    grep -F 'source tree must be clean (including untracked files)' <<<"${output}" >/dev/null
+    if output="$(BENCHMARK_ALLOW_DIRTY_SOURCE_DEVELOPMENT=true bash "${fixture}/benchmarks/run_comparison.sh" --save invalid 2>&1)"; then
+        echo 'development override permitted saving dirty evidence' >&2
+        exit 1
+    fi
+    grep -F 'source tree must be clean (including untracked files)' <<<"${output}" >/dev/null
+}
+
+test_p99_maximum_outlier() {
+    local fixture output
+    make_fixture 1 1
+    fixture="${FIXTURE}"
+    awk 'BEGIN { seen = 0 } /^BenchmarkRaceRead-8 / { if (++seen == 10) $3 = 13 } { print }' \
+        "${fixture}/benchmarks/results/purego.txt" > "${fixture}/outlier.txt"
+    mv "${fixture}/outlier.txt" "${fixture}/benchmarks/results/purego.txt"
+    if output="$(bash "${fixture}/benchmarks/run_comparison.sh" --save p99-outlier 2>&1)"; then
+        echo 'accepted a maximum p99 outlier in saved evidence' >&2
+        exit 1
+    fi
+    grep -F 'p99 ratio' <<<"${output}" >/dev/null
+
+    make_fixture 1 1
+    fixture="${FIXTURE}"
+    cp "${fixture}/benchmarks/results/purego.txt" "${fixture}/base.txt"
+    awk 'BEGIN { seen = 0 } /^BenchmarkRaceRead-8 / { if (++seen == 10) $3 = 13 } { print }' \
+        "${fixture}/base.txt" > "${fixture}/pr-outlier.txt"
+    if output="$(cd "${fixture}" && bash benchmarks/run_comparison.sh --validate-pr-comparison base.txt pr-outlier.txt 2>&1)"; then
+        echo 'accepted a maximum p99 outlier in PR comparison evidence' >&2
+        exit 1
+    fi
+    grep -F 'PR/base complete-matrix regression gate failed' <<<"${output}" >/dev/null
+}
+
+test_pr_matrix_thresholds() {
+    local fixture output
+    make_fixture 1 1
+    fixture="${FIXTURE}"
+    cp "${fixture}/benchmarks/results/purego.txt" "${fixture}/base.txt"
+    awk '{ if ($1 ~ /^BenchmarkRaceRead-8$/) $3 = 10.5; print }' "${fixture}/base.txt" > "${fixture}/equal.txt"
+    (cd "${fixture}" && bash benchmarks/run_comparison.sh --validate-pr-comparison base.txt equal.txt >/dev/null)
+    awk '{ if ($1 ~ /^BenchmarkRaceRead-8$/) $3 = 10.51; print }' "${fixture}/base.txt" > "${fixture}/over.txt"
+    if output="$(cd "${fixture}" && bash benchmarks/run_comparison.sh --validate-pr-comparison base.txt over.txt 2>&1)"; then
+        echo 'accepted a PR/base ratio above the equality boundary' >&2
+        exit 1
+    fi
+    grep -F 'PR/base complete-matrix regression gate failed' <<<"${output}" >/dev/null
+}
+
 test_toolchain_attestation() {
     local fixture output bootstrap
 
@@ -423,8 +554,15 @@ printf 'make.bash completed\n' > ../make-ran
 EOF
     chmod +x "${fixture}/src/make.bash"
     printf 'stale compiler artifact\n' > "${fixture}/pkg/tool/testos_testarch/compile tool"
+    cat > "${fixture}/.gitignore" <<'EOF'
+/bin/
+/pkg/
+/make-ran
+/benchmarks/results/
+EOF
     git -C "${fixture}" init -q
-    git -C "${fixture}" add VERSION go.env benchmarks/go.mod benchmarks/race_bench_test.go src/runtime.go
+    git -C "${fixture}" -c user.name=fixture -c user.email=fixture@example.invalid add .
+    git -C "${fixture}" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm fixture
 
     GOROOT_BOOTSTRAP="${bootstrap}" bash "${fixture}/benchmarks/run_comparison.sh" --build-toolchain "${fixture}/bin/go" >/dev/null
     [[ -s "${fixture}/make-ran" ]]
@@ -436,7 +574,7 @@ EOF
         echo "accepted a toolchain receipt for changed source" >&2
         exit 1
     fi
-    grep -F 'receipt does not match current source and toolchain artifacts' <<<"${output}" >/dev/null
+    grep -F 'source tree must be clean (including untracked files)' <<<"${output}" >/dev/null
 
     git -C "${fixture}" checkout -- src/runtime.go
     printf '// module changed after build\n' >> "${fixture}/benchmarks/go.mod"
@@ -444,7 +582,7 @@ EOF
         echo "accepted a toolchain receipt for changed benchmarks/go.mod" >&2
         exit 1
     fi
-    grep -F 'receipt does not match current source and toolchain artifacts' <<<"${output}" >/dev/null
+    grep -F 'source tree must be clean (including untracked files)' <<<"${output}" >/dev/null
 
     git -C "${fixture}" checkout -- benchmarks/go.mod
     rm -f "${fixture}/benchmarks/go.mod"
@@ -452,23 +590,18 @@ EOF
         echo "accepted a toolchain receipt with a missing benchmarks/go.mod" >&2
         exit 1
     fi
-    grep -F 'could not compute current toolchain source identity' <<<"${output}" >/dev/null
+    grep -F 'source tree must be clean (including untracked files)' <<<"${output}" >/dev/null
 
     git -C "${fixture}" checkout -- benchmarks/go.mod
     GOROOT_BOOTSTRAP="${bootstrap}" bash "${fixture}/benchmarks/run_comparison.sh" --build-toolchain "${fixture}/bin/go" >/dev/null
 
-	printf 'package runtime\n' > "${fixture}/src/deleted.go"
-	git -C "${fixture}" add src/deleted.go
-	rm -f "${fixture}/src/deleted.go"
-	GOROOT_BOOTSTRAP="${bootstrap}" bash "${fixture}/benchmarks/run_comparison.sh" --build-toolchain "${fixture}/bin/go" >/dev/null
-	bash "${fixture}/benchmarks/run_comparison.sh" --validate-toolchain-build "${fixture}/bin/go" >/dev/null
-	git -C "${fixture}" checkout -- src/deleted.go
-	if output="$(bash "${fixture}/benchmarks/run_comparison.sh" --validate-toolchain-build "${fixture}/bin/go" 2>&1)"; then
-		echo "accepted a toolchain receipt after restoring a tracked source deletion" >&2
-		exit 1
-	fi
-	grep -F 'receipt does not match current source and toolchain artifacts' <<<"${output}" >/dev/null
-	rm -f "${fixture}/src/deleted.go"
+    printf 'package runtime\n' > "${fixture}/src/deleted.go"
+    if output="$(GOROOT_BOOTSTRAP="${bootstrap}" bash "${fixture}/benchmarks/run_comparison.sh" --build-toolchain "${fixture}/bin/go" 2>&1)"; then
+        echo "rebuilt a toolchain from an untracked source" >&2
+        exit 1
+    fi
+    grep -F 'source tree must be clean (including untracked files)' <<<"${output}" >/dev/null
+    rm -f "${fixture}/src/deleted.go"
 
     printf 'changed compiler artifact\n' > "${fixture}/pkg/tool/testos_testarch/compile tool"
     if output="$(bash "${fixture}/benchmarks/run_comparison.sh" --validate-toolchain-build "${fixture}/bin/go" 2>&1)"; then
@@ -495,7 +628,7 @@ EOF
     grep -F 'could not compute current toolchain source identity' <<<"${output}" >/dev/null
 
     GOROOT_BOOTSTRAP="${bootstrap}" bash "${fixture}/benchmarks/run_comparison.sh" --build-toolchain "${fixture}/bin/go" >/dev/null
-    printf 'src/ignored.go\n' > "${fixture}/.gitignore"
+    printf 'src/ignored.go\n' >> "${fixture}/.git/info/exclude"
     printf 'package runtime\n' > "${fixture}/src/ignored.go"
     GOROOT_BOOTSTRAP="${bootstrap}" bash "${fixture}/benchmarks/run_comparison.sh" --build-toolchain "${fixture}/bin/go" >/dev/null
     printf '// changed ignored build input\n' >> "${fixture}/src/ignored.go"
@@ -609,7 +742,42 @@ echo 'pkg: benchmarks'
 if [[ "${phase}" == rss ]]; then
     echo 'BenchmarkMemoryConcurrent/g16-8 1 10 ns/op 0 B/op 0 allocs/op'
 else
-    echo 'BenchmarkRaceRead-8 1 10 ns/op 0 B/op 0 allocs/op'
+    while IFS= read -r workload; do
+        [[ -n "${workload}" ]] || continue
+        echo "Benchmark${workload}-8 1 10 ns/op 0 B/op 0 allocs/op"
+    done <<'MATRIX'
+RaceRead
+RaceReadAlternating
+RaceReadCollision
+RaceWrite
+RaceReadWrite
+MutexLockUnlock
+RWMutexReadLock
+GoroutineStartStop
+MutexContention/g1
+MutexContention/g4
+MutexContention/g16
+MutexContention/g64
+ChannelPingPong
+WaitGroupFanOut/g1
+WaitGroupFanOut/g4
+WaitGroupFanOut/g16
+WaitGroupFanOut/g64
+MapReadWrite/g1
+MapReadWrite/g4
+MapReadWrite/g16
+MapReadWrite/g64
+ProducerConsumer/buf1
+ProducerConsumer/buf16
+ProducerConsumer/buf64
+WorkerPool/g1
+WorkerPool/g4
+WorkerPool/g16
+WorkerPool/g64
+MemoryAllocation
+MemoryConcurrent/g4
+MemoryConcurrent/g16
+MATRIX
 fi
 echo PASS
 BINARY
@@ -639,12 +807,38 @@ echo 'Maximum resident set size (kbytes): 100' >&2
 exit "${status}"
 EOF
     chmod +x "${fake_bin}/fakecc" "${fake_bin}/benchstat" "${fake_bin}/gtime"
+    cat > "${fixture}/.gitignore" <<'EOF'
+/bin/
+/pkg/
+/benchmarks/results/
+/fake-bin/
+/execution-order.txt
+EOF
 
     git -C "${fixture}" init -q
     git -C "${fixture}" -c user.name=fixture -c user.email=fixture@example.invalid add .
     git -C "${fixture}" -c user.name=fixture -c user.email=fixture@example.invalid commit -qm fixture
+    printf 'dirty source\n' > "${fixture}/untracked-source.txt"
+    if output="$(PATH="${fake_bin}:${PATH}" GOROOT_BOOTSTRAP="${bootstrap}" bash "${fixture}/benchmarks/run_comparison.sh" --build-toolchain "${fixture}/bin/go" 2>&1)"; then
+        echo 'built a toolchain from a dirty source tree' >&2
+        exit 1
+    fi
+    grep -F 'source tree must be clean (including untracked files)' <<<"${output}" >/dev/null
+    rm -f "${fixture}/untracked-source.txt"
     PATH="${fake_bin}:${PATH}" GOROOT_BOOTSTRAP="${bootstrap}" \
         bash "${fixture}/benchmarks/run_comparison.sh" --build-toolchain "${fixture}/bin/go" >/dev/null
+    printf 'dirty source\n' > "${fixture}/untracked-source.txt"
+    if output="$(PATH="${fake_bin}:${PATH}" bash "${fixture}/benchmarks/run_comparison.sh" --validate-toolchain-build "${fixture}/bin/go" 2>&1)"; then
+        echo 'validated a toolchain receipt from a dirty source tree' >&2
+        exit 1
+    fi
+    grep -F 'source tree must be clean (including untracked files)' <<<"${output}" >/dev/null
+    if output="$(PATH="${fake_bin}:${PATH}" FAKE_TRACE="${trace}" GNU_TIME_BIN="${fake_bin}/gtime" BENCH_GOMAXPROCS=2 bash "${fixture}/benchmarks/run_comparison.sh" --quick --go "${fixture}/bin/go" 2>&1)"; then
+        echo 'accepted a normal benchmark run from a dirty source tree' >&2
+        exit 1
+    fi
+    grep -F 'source tree must be clean (including untracked files)' <<<"${output}" >/dev/null
+    rm -f "${fixture}/untracked-source.txt"
     PATH="${fake_bin}:${PATH}" FAKE_TRACE="${trace}" GNU_TIME_BIN="${fake_bin}/gtime" BENCH_GOMAXPROCS=2 \
         bash "${fixture}/benchmarks/run_comparison.sh" --quick --go "${fixture}/bin/go" >/dev/null
 
@@ -674,7 +868,7 @@ EOF
         [[ -s "${fixture}/benchmarks/results/raw/${label}/warmup-rss.time" ]]
         [[ ! -e "${fixture}/benchmarks/results/raw/${label}/warmup-latency.txt.samples" ]]
         [[ ! -e "${fixture}/benchmarks/results/raw/${label}/warmup-rss.stdout.samples" ]]
-        [[ "$(grep -c '^Benchmark' "${fixture}/benchmarks/results/${label}.txt")" == 3 ]]
+        [[ "$(grep -c '^Benchmark' "${fixture}/benchmarks/results/${label}.txt")" == 93 ]]
         [[ "$(grep -c '^Benchmark' "${fixture}/benchmarks/results/rss-${label}.stdout")" == 3 ]]
         [[ "$(wc -l < "${fixture}/benchmarks/results/rss-${label}-kb.txt" | tr -d '[:space:]')" == 3 ]]
     done
@@ -713,6 +907,11 @@ expect_wrong_sample_count
 expect_manifest_sort_failure
 expect_runtime_fatal 'fatal error: fixture crash'
 expect_runtime_fatal 'runtime: fatal fixture crash'
+expect_incomplete_matrix
+expect_invalid_allocation_metric
+expect_dirty_save_rejected
+test_p99_maximum_outlier
+test_pr_matrix_thresholds
 test_toolchain_attestation
 test_counterbalanced_run
 

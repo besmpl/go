@@ -19,15 +19,102 @@ COUNT=10
 BENCHTIME=1s
 TIMEOUT=10m
 MAX_RACEREAD_RATIO=1.00
+# Matrix gates are intentionally explicit and fail closed.  Keep these values
+# in one place so release metadata, local runs, and CI all use the same
+# contract.  A ratio is always PureGo latency divided by TSAN latency; the
+# contention throughput ratio is the inverse (TSAN latency / PureGo latency).
+MAX_MATRIX_GEOMEAN=1.00
+MAX_MATRIX_CLASS_RATIO=1.10
+MIN_CONTENTION_THROUGHPUT=0.90
+MAX_MATRIX_P99_RATIO=1.25
 QUICK_MODE=false
 ACTION=run
 ACTION_ARG1=
 ACTION_ARG2=
+ACTION_ARG3=
 RUN_OPTIONS=false
+
+# Keep the workload list in the harness rather than inferring it from one
+# output.  An output which silently omits a named class is invalid evidence.
+# The suffix containing GOMAXPROCS is stripped by the parser before matching.
+workload_matrix() {
+    cat <<'EOF'
+RaceRead
+RaceReadAlternating
+RaceReadCollision
+RaceWrite
+RaceReadWrite
+MutexLockUnlock
+RWMutexReadLock
+GoroutineStartStop
+MutexContention/g1
+MutexContention/g4
+MutexContention/g16
+MutexContention/g64
+ChannelPingPong
+WaitGroupFanOut/g1
+WaitGroupFanOut/g4
+WaitGroupFanOut/g16
+WaitGroupFanOut/g64
+MapReadWrite/g1
+MapReadWrite/g4
+MapReadWrite/g16
+MapReadWrite/g64
+ProducerConsumer/buf1
+ProducerConsumer/buf16
+ProducerConsumer/buf64
+WorkerPool/g1
+WorkerPool/g4
+WorkerPool/g16
+WorkerPool/g64
+MemoryAllocation
+MemoryConcurrent/g4
+MemoryConcurrent/g16
+EOF
+}
+
+WORKLOAD_MATRIX_CSV="$(workload_matrix | paste -sd, -)"
+
+contention_workload() {
+    case "$1" in
+        MutexContention/*|ChannelPingPong|WaitGroupFanOut/*|MapReadWrite/*|ProducerConsumer/*|WorkerPool/*)
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+steady_zero_alloc_workload() {
+    case "$1" in
+        RaceRead|RaceReadAlternating|RaceReadCollision|RaceWrite|RaceReadWrite|MutexLockUnlock|RWMutexReadLock)
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+}
 
 fail() {
     echo "ERROR: $*" >&2
     exit 1
+}
+
+# Release evidence must come from an exact Git tree. Ignored benchmark output
+# and build artifacts are intentionally excluded by Git's porcelain status.
+# BENCHMARK_ALLOW_DIRTY_SOURCE_DEVELOPMENT is deliberately limited to quick
+# local measurement; it never permits building, standalone receipt validation,
+# or saving.
+require_clean_source_tree() {
+    local status
+    command -v git >/dev/null 2>&1 || fail "git is required to verify source-tree cleanliness"
+    status="$(git -C "${SOURCE_ROOT}" status --porcelain=v1 --untracked-files=all)" || fail "could not inspect source-tree cleanliness"
+    if [[ -z "${status}" ]]; then
+        return 0
+    fi
+    if [[ "${ACTION}" == run && "${QUICK_MODE}" == true && "${BENCHMARK_ALLOW_DIRTY_SOURCE_DEVELOPMENT:-false}" == true ]]; then
+        echo "WARNING: measuring a dirty source tree under BENCHMARK_ALLOW_DIRTY_SOURCE_DEVELOPMENT" >&2
+        return 0
+    fi
+    fail "source tree must be clean (including untracked files) before accepting benchmark evidence"
 }
 
 require_args() {
@@ -60,6 +147,30 @@ while [[ $# -gt 0 ]]; do
             RUN_OPTIONS=true
             shift 2
             ;;
+        --max-matrix-geomean)
+            require_args "$1" 1 "$(( $# - 1 ))"
+            MAX_MATRIX_GEOMEAN="$2"
+            RUN_OPTIONS=true
+            shift 2
+            ;;
+        --max-matrix-class-ratio)
+            require_args "$1" 1 "$(( $# - 1 ))"
+            MAX_MATRIX_CLASS_RATIO="$2"
+            RUN_OPTIONS=true
+            shift 2
+            ;;
+        --min-contention-throughput)
+            require_args "$1" 1 "$(( $# - 1 ))"
+            MIN_CONTENTION_THROUGHPUT="$2"
+            RUN_OPTIONS=true
+            shift 2
+            ;;
+        --max-p99-ratio)
+            require_args "$1" 1 "$(( $# - 1 ))"
+            MAX_MATRIX_P99_RATIO="$2"
+            RUN_OPTIONS=true
+            shift 2
+            ;;
         --quick)
             COUNT=3
             BENCHTIME=500ms
@@ -86,6 +197,13 @@ while [[ $# -gt 0 ]]; do
             ACTION_ARG2="$3"
             shift 3
             ;;
+		--validate-pr-comparison)
+			require_args "$1" 2 "$(( $# - 1 ))"
+			select_action validate-pr-comparison
+			ACTION_ARG1="$2"
+			ACTION_ARG2="$3"
+			shift 3
+			;;
 		--list)
 			select_action list
 			shift
@@ -125,6 +243,15 @@ Run options:
   --benchtime T               Time per sample (default and release minimum: 1s)
   --max-raceread-ratio R      Maximum PureGo/TSAN BenchmarkRaceRead median
                               ratio (default and release gate: 1.00)
+  --max-matrix-geomean R      Maximum complete-matrix PureGo/TSAN geomean
+                              (default and release gate: 1.00)
+  --max-matrix-class-ratio R  Maximum named-class PureGo/TSAN ratio
+                              (default and release gate: 1.10)
+  --min-contention-throughput R
+                              Minimum PureGo/TSAN contention throughput ratio
+                              (default and release gate: 0.90)
+  --max-p99-ratio R           Maximum complete-matrix p99 latency ratio
+                              (default and release gate: 1.25)
   --quick                     Development run: count=3, benchtime=500ms;
                               writes QUICK status and cannot be saved
   --go PATH                   This fork's bin/go
@@ -139,6 +266,9 @@ Evidence validation (cannot be combined with run options):
                               Validate release-contract metadata and exit
   --summarize-rss DIR COUNT   Validate COUNT matched RSS samples in DIR, write
                               paired-delta files, and print key=value medians
+  --validate-pr-comparison BASE PR
+                              Validate two PureGo aggregate files and write
+                              matrix gate evidence in the current directory
   --build-toolchain PATH      Run a fresh CGO_ENABLED=0 src/make.bash and, only
                               after it succeeds, attest this fork's PATH.
                               GOROOT_BOOTSTRAP or BOOTSTRAP_GO may select the
@@ -170,17 +300,33 @@ benchmark_manifest() {
     local input="$1" expected="$2" output="$3" tmp
     tmp="$(mktemp "${output}.tmp.XXXXXX")" || return 1
     if ! awk -v expected="${expected}" '
-        function positive_decimal(value) {
-            return value ~ /^[0-9]+([.][0-9]+)?$/ && (value + 0) > 0
+        function finite_decimal(value, allow_zero) {
+            if (value !~ /^[0-9]+([.][0-9]+)?$/) return 0
+            if ((value + 0) != (value + 0) || (value + 0) >= 1e308) return 0
+            return allow_zero ? (value + 0) >= 0 : (value + 0) > 0
         }
         /^Benchmark/ {
-            timed = 0
+            timed = bytes = allocs = 0
             for (i = 2; i <= NF; i++) {
                 if ($i == "ns/op" || $i == "us/op" || $i == "µs/op" ||
                     $i == "ms/op" || $i == "s/op") {
                     timed++
-                    if (i == 2 || !positive_decimal($(i-1))) {
+                    if (i == 2 || !finite_decimal($(i-1), 0)) {
                         printf "invalid benchmark metric before %s: %s\n", $i, $0 > "/dev/stderr"
+                        bad = 1
+                    }
+                }
+                if ($i == "B/op") {
+                    bytes++
+                    if (i == 2 || !finite_decimal($(i-1), 1)) {
+                        printf "invalid allocation metric before %s: %s\n", $i, $0 > "/dev/stderr"
+                        bad = 1
+                    }
+                }
+                if ($i == "allocs/op") {
+                    allocs++
+                    if (i == 2 || !finite_decimal($(i-1), 1)) {
+                        printf "invalid allocation metric before %s: %s\n", $i, $0 > "/dev/stderr"
                         bad = 1
                     }
                 }
@@ -189,6 +335,10 @@ benchmark_manifest() {
                 printf "invalid benchmark result line: %s\n", $0 > "/dev/stderr"
                 bad = 1
                 next
+            }
+            if (bytes != 1 || allocs != 1) {
+                printf "benchmark result has no unique B/op and allocs/op metrics: %s\n", $0 > "/dev/stderr"
+                bad = 1
             }
             samples[$1]++
             total++
@@ -347,6 +497,7 @@ toolchain_attestation_content() {
 
 build_and_attest_toolchain() {
     local go_binary="$1" go_dir receipt tmp bootstrap_go bootstrap_goroot
+    require_clean_source_tree
     mkdir -p "${SOURCE_ROOT}/bin" || fail "could not create toolchain output directory"
     go_dir="$(cd "$(dirname "${go_binary}")" && pwd -P)" || fail "toolchain output directory does not exist: ${go_binary}"
     go_binary="${go_dir}/$(basename "${go_binary}")"
@@ -367,6 +518,7 @@ build_and_attest_toolchain() {
         fail "fresh PureGo make.bash failed; no toolchain receipt was written"
     fi
     [[ -x "${go_binary}" ]] || fail "fresh PureGo make.bash did not create ${go_binary}"
+    require_clean_source_tree
 
     tmp="$(mktemp "${receipt}.tmp.XXXXXX")" || fail "could not create toolchain build receipt"
     if ! toolchain_attestation_content "${go_binary}" > "${tmp}"; then
@@ -379,6 +531,7 @@ build_and_attest_toolchain() {
 
 validate_toolchain_build() {
     local go_binary="$1" receipt expected
+    require_clean_source_tree
     go_binary="$(resolve_executable "${go_binary}")" || fail "fork go binary not found or not executable: ${go_binary}"
     [[ "${go_binary}" == "${SOURCE_ROOT}/bin/go" ]] || fail "tool must be this source tree's bin/go: ${go_binary}"
     receipt="${go_binary}.benchmark-attestation"
@@ -416,6 +569,261 @@ compare_manifests() {
         cat "${right}" >&2
         fail "benchmark configurations must contain identical sample sets"
     fi
+}
+
+# A manifest only proves that rows were repeated consistently.  This second
+# check proves that every named workload in the contract is present.  Keeping
+# these checks separate makes the error for a truncated or accidentally
+# filtered benchmark actionable instead of allowing a smaller geomean to pass.
+validate_complete_matrix() {
+    local manifest="$1" expected_count="$2" label="$3"
+    [[ -r "${manifest}" ]] || fail "${label} benchmark manifest is missing: ${manifest}"
+    [[ "${expected_count}" =~ ^[1-9][0-9]*$ ]] || fail "${label} matrix sample count is invalid: ${expected_count}"
+    awk -v expected="${WORKLOAD_MATRIX_CSV}" -v want="${expected_count}" '
+        function canonical(name) {
+            sub(/^Benchmark/, "", name)
+            sub(/-[0-9]+$/, "", name)
+            return name
+        }
+        BEGIN {
+            n = split(expected, names, ",")
+            for (i = 1; i <= n; i++) wanted[names[i]] = 1
+        }
+        NF != 2 || $1 !~ /^Benchmark/ || $2 !~ /^[1-9][0-9]*$/ {
+            bad = 1
+            next
+        }
+        {
+            name = canonical($1)
+            if (!(name in wanted)) {
+                printf "unexpected workload row: %s\n", $0 > "/dev/stderr"
+                bad = 1
+                next
+            }
+            if (++rows[name] != 1) {
+                printf "duplicate workload row: %s\n", $0 > "/dev/stderr"
+                bad = 1
+            }
+            if (($2 + 0) != (want + 0)) {
+                printf "%s has %s samples; want %s\n", name, $2, want > "/dev/stderr"
+                bad = 1
+            }
+        }
+        END {
+            if (NR == 0) bad = 1
+            for (i = 1; i <= n; i++) {
+                if (!(names[i] in rows)) {
+                    printf "missing workload row: %s\n", names[i] > "/dev/stderr"
+                    bad = 1
+                }
+            }
+            if (length(rows) != n) bad = 1
+            exit bad
+        }
+    ' "${manifest}" || fail "${label} benchmark matrix is incomplete or malformed"
+}
+
+# Parse raw Go benchmark output into one canonical row per sample.  In
+# addition to ns/op this deliberately requires B/op and allocs/op: a run made
+# without -benchmem is not valid release evidence even when its timings look
+# plausible.  The parser accepts only ordinary finite decimal numbers so
+# NaN, Inf, exponents, and unit-swapped fixtures are rejected deterministically.
+extract_matrix() {
+    local input="$1" output="$2" expected_count="$3" label="$4" tmp
+    [[ -r "${input}" ]] || fail "${label} benchmark output is missing: ${input}"
+    tmp="$(mktemp "${output}.tmp.XXXXXX")" || fail "could not create ${label} matrix parser output"
+    if ! awk -v expected="${WORKLOAD_MATRIX_CSV}" -v want="${expected_count}" '
+        function decimal(value, allow_zero) {
+            if (value !~ /^[0-9]+([.][0-9]+)?$/) return 0
+            number = value + 0
+            if (number != number || number >= 1e308) return 0
+            return allow_zero ? number >= 0 : number > 0
+        }
+        function canonical(name) {
+            sub(/^Benchmark/, "", name)
+            sub(/-[0-9]+$/, "", name)
+            return name
+        }
+        BEGIN {
+            n = split(expected, names, ",")
+            for (i = 1; i <= n; i++) wanted[names[i]] = 1
+            scale["ns/op"] = 1
+            scale["us/op"] = 1000
+            scale["µs/op"] = 1000
+            scale["ms/op"] = 1000000
+            scale["s/op"] = 1000000000
+        }
+        /^Benchmark/ {
+            name = canonical($1)
+            if (!(name in wanted)) {
+                printf "unexpected workload row: %s\n", $0 > "/dev/stderr"
+                bad = 1
+                next
+            }
+            timed = bytes = allocs = 0
+            for (i = 2; i <= NF; i++) {
+                if ($i in scale) {
+                    timed++
+                    if (i == 2 || !decimal($(i - 1), 0)) {
+                        printf "invalid timed metric in %s\n", $0 > "/dev/stderr"
+                        bad = 1
+                    } else {
+                        ns = ($(i - 1) + 0) * scale[$i]
+                    }
+                }
+                if ($i == "B/op") {
+                    bytes++
+                    if (i == 2 || !decimal($(i - 1), 1)) {
+                        printf "invalid B/op metric in %s\n", $0 > "/dev/stderr"
+                        bad = 1
+                    } else {
+                        byte_value = $(i - 1) + 0
+                    }
+                }
+                if ($i == "allocs/op") {
+                    allocs++
+                    if (i == 2 || !decimal($(i - 1), 1)) {
+                        printf "invalid allocs/op metric in %s\n", $0 > "/dev/stderr"
+                        bad = 1
+                    } else {
+                        alloc_value = $(i - 1) + 0
+                    }
+                }
+            }
+            if (timed != 1 || bytes != 1 || allocs != 1 || ns != ns || ns <= 0 || ns >= 1e308) {
+                printf "benchmark row lacks one unique finite timing/allocation triplet: %s\n", $0 > "/dev/stderr"
+                bad = 1
+                next
+            }
+            if (++rows[name] > want) {
+                printf "%s has more than %s samples\n", name, want > "/dev/stderr"
+                bad = 1
+            }
+            printf "%s\t%d\t%.17g\t%.17g\t%.17g\n", name, rows[name], ns, byte_value, alloc_value
+            total++
+        }
+        END {
+            if (total == 0) bad = 1
+            for (i = 1; i <= n; i++) {
+                if ((names[i] in rows) == 0 || rows[names[i]] != want) {
+                    printf "%s has %d samples; want %s\n", names[i], rows[names[i]] + 0, want > "/dev/stderr"
+                    bad = 1
+                }
+            }
+            if (length(rows) != n) bad = 1
+            exit bad
+        }
+    ' "${input}" > "${tmp}"; then
+        rm -f "${tmp}"
+        fail "${label} benchmark matrix metrics are invalid"
+    fi
+    [[ -s "${tmp}" ]] || { rm -f "${tmp}"; fail "${label} benchmark matrix metrics are empty"; }
+    mv "${tmp}" "${output}" || { rm -f "${tmp}"; fail "could not install ${label} matrix metrics"; }
+}
+
+matrix_report() {
+    local tsan_matrix="$1" purego_matrix="$2" output="$3" summary="$4" expected_count="$5" label="$6" tmp_report tmp_summary
+    tmp_report="$(mktemp "${output}.tmp.XXXXXX")" || fail "could not create ${label} matrix report"
+    tmp_summary="$(mktemp "${summary}.tmp.XXXXXX")" || { rm -f "${tmp_report}"; fail "could not create ${label} matrix summary"; }
+    if ! awk -v expected="${WORKLOAD_MATRIX_CSV}" -v want="${expected_count}" \
+        -v max_geo="${MAX_MATRIX_GEOMEAN}" -v max_class="${MAX_MATRIX_CLASS_RATIO}" \
+        -v min_contention="${MIN_CONTENTION_THROUGHPUT}" -v max_p99="${MAX_MATRIX_P99_RATIO}" \
+        -v report="${tmp_report}" -v summary="${tmp_summary}" -v label="${label}" '
+        function finite(x) { return x == x && x < 1e308 && x > -1e308 }
+        function median(a, key, n,    i,j,t) {
+            for (i = 1; i <= n; i++) b[i] = a[key, i]
+            for (i = 2; i <= n; i++) {
+                t = b[i]; j = i - 1
+                while (j >= 1 && b[j] > t) { b[j + 1] = b[j]; j-- }
+                b[j + 1] = t
+            }
+            if (n % 2) return b[(n + 1) / 2]
+            return (b[n / 2] + b[n / 2 + 1]) / 2
+        }
+        function p99(a, key, n,    i,j,t,rank) {
+            for (i = 1; i <= n; i++) b[i] = a[key, i]
+            for (i = 2; i <= n; i++) {
+                t = b[i]; j = i - 1
+                while (j >= 1 && b[j] > t) { b[j + 1] = b[j]; j-- }
+                b[j + 1] = t
+            }
+            rank = int((99 * n + 99) / 100)
+            if (rank < 1) rank = 1
+            if (rank > n) rank = n
+            return b[rank]
+        }
+        function expected_name(name,    i) {
+            for (i = 1; i <= n; i++) if (names[i] == name) return 1
+            return 0
+        }
+        function contention(name) {
+            return name ~ /^MutexContention\// || name == "ChannelPingPong" ||
+                name ~ /^WaitGroupFanOut\// || name ~ /^MapReadWrite\// ||
+                name ~ /^ProducerConsumer\// || name ~ /^WorkerPool\//
+        }
+        function steady(name) {
+            return name == "RaceRead" || name == "RaceReadAlternating" ||
+                name == "RaceReadCollision" || name == "RaceWrite" ||
+                name == "RaceReadWrite" || name == "MutexLockUnlock" ||
+                name == "RWMutexReadLock"
+        }
+        BEGIN {
+            n = split(expected, names, ",")
+            for (i = 1; i <= n; i++) wanted[names[i]] = 1
+            print "class\ttsan_median_ns\tpurego_median_ns\tlatency_ratio\ttsan_p99_ns\tpurego_p99_ns\tp99_ratio\ttsan_bytes_per_op\tpurego_bytes_per_op\ttsan_allocs_per_op\tpurego_allocs_per_op\tthroughput_ratio" > report
+        }
+        FNR == NR {
+            if (NF != 5 || !expected_name($1) || $2 !~ /^[1-9][0-9]*$/ || $2 > want) bad = 1
+            tcount[$1]++
+            tn[$1, tcount[$1]] = $3
+            tb[$1, tcount[$1]] = $4
+            ta[$1, tcount[$1]] = $5
+            next
+        }
+        {
+            if (NF != 5 || !expected_name($1) || $2 !~ /^[1-9][0-9]*$/ || $2 > want) bad = 1
+            pcount[$1]++
+            pn[$1, pcount[$1]] = $3
+            pb[$1, pcount[$1]] = $4
+            pa[$1, pcount[$1]] = $5
+        }
+        END {
+            if (bad) exit 1
+            geo_sum = 0
+            for (i = 1; i <= n; i++) {
+                name = names[i]
+                if (tcount[name] != want || pcount[name] != want) {
+                    printf "%s has incomplete TSAN/PureGo rows\n", name > "/dev/stderr"
+                    bad = 1
+                    continue
+                }
+                tm = median(tn, name, tcount[name]); pm = median(pn, name, pcount[name])
+                ttail = p99(tn, name, tcount[name]); ptail = p99(pn, name, pcount[name])
+                tbytes = median(tb, name, tcount[name]); pbytes = median(pb, name, pcount[name])
+                talloc = median(ta, name, tcount[name]); palloc = median(pa, name, pcount[name])
+                if (!finite(tm) || !finite(pm) || tm <= 0 || pm <= 0 || !finite(ttail) || !finite(ptail)) { bad = 1; continue }
+                ratio = pm / tm
+                tail_ratio = ptail / ttail
+                throughput = tm / pm
+                if (!finite(ratio) || !finite(tail_ratio) || !finite(throughput) || ratio <= 0 || tail_ratio <= 0 || throughput <= 0) { bad = 1; continue }
+                if (ratio > max_class) { printf "%s latency ratio %.17g exceeds %.17g\n", name, ratio, max_class > "/dev/stderr"; bad = 1 }
+                if (tail_ratio > max_p99) { printf "%s p99 ratio %.17g exceeds %.17g\n", name, tail_ratio, max_p99 > "/dev/stderr"; bad = 1 }
+                if (contention(name) && throughput < min_contention) { printf "%s contention throughput %.17g is below %.17g\n", name, throughput, min_contention > "/dev/stderr"; bad = 1 }
+                if (steady(name) && (pbytes != 0 || palloc != 0 || tbytes != 0 || talloc != 0)) { printf "%s steady path is not allocation-free\n", name > "/dev/stderr"; bad = 1 }
+                geo_sum += log(ratio)
+                printf "%s\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\n", name, tm, pm, ratio, ttail, ptail, tail_ratio, tbytes, pbytes, talloc, palloc, throughput >> report
+            }
+            geomean = exp(geo_sum / n)
+            if (!finite(geomean) || geomean > max_geo) { printf "complete-matrix geomean %.17g exceeds %.17g\n", geomean, max_geo > "/dev/stderr"; bad = 1 }
+            printf "format=matrix-v1\nlabel=%s\nclasses=%d\ncomplete_matrix_geomean=%.17g\ncomplete_matrix_geomean_limit=%.17g\nclass_ratio_limit=%.17g\ncontention_throughput_floor=%.17g\np99_ratio_limit=%.17g\n" , label, n, geomean, max_geo, max_class, min_contention, max_p99 > summary
+            if (bad) exit 1
+        }
+    ' "${tsan_matrix}" "${purego_matrix}"; then
+        rm -f "${tmp_report}" "${tmp_summary}"
+        fail "${label} complete-matrix metrics failed a release gate"
+    fi
+    mv "${tmp_report}" "${output}" || { rm -f "${tmp_report}" "${tmp_summary}"; fail "could not install ${label} matrix report"; }
+    mv "${tmp_summary}" "${summary}" || { rm -f "${tmp_summary}"; fail "could not install ${label} matrix summary"; }
 }
 
 validate_rss_values() {
@@ -525,12 +933,16 @@ validate_name() {
 }
 
 validate_release_metadata() {
-    local file="$1" mode count seconds maximum rss_count rss_benchtime
+    local file="$1" mode count seconds maximum rss_count rss_benchtime matrix_geo matrix_class contention_floor p99_ratio
     [[ -s "${file}" ]] || fail "release evidence metadata is missing: ${file}"
     mode="$(awk -F= '$1 == "mode" { print substr($0, length($1) + 2) }' "${file}")"
     count="$(awk -F= '$1 == "count" { print substr($0, length($1) + 2) }' "${file}")"
     seconds="$(awk -F= '$1 == "benchtime_seconds" { print substr($0, length($1) + 2) }' "${file}")"
     maximum="$(awk -F= '$1 == "max_raceread_ratio" { print substr($0, length($1) + 2) }' "${file}")"
+    matrix_geo="$(awk -F= '$1 == "max_matrix_geomean" { print substr($0, length($1) + 2) }' "${file}")"
+    matrix_class="$(awk -F= '$1 == "max_matrix_class_ratio" { print substr($0, length($1) + 2) }' "${file}")"
+    contention_floor="$(awk -F= '$1 == "min_contention_throughput" { print substr($0, length($1) + 2) }' "${file}")"
+    p99_ratio="$(awk -F= '$1 == "max_p99_ratio" { print substr($0, length($1) + 2) }' "${file}")"
     rss_count="$(awk -F= '$1 == "rss_count" { print substr($0, length($1) + 2) }' "${file}")"
     rss_benchtime="$(awk -F= '$1 == "rss_benchtime" { print substr($0, length($1) + 2) }' "${file}")"
     [[ "${mode}" == release ]] || fail "evidence mode is ${mode:-missing}, not release"
@@ -541,11 +953,63 @@ validate_release_metadata() {
     awk -v value="${seconds}" 'BEGIN { exit !(value >= 1) }' || fail "release evidence has benchtime_seconds=${seconds:-missing}; want at least 1"
     [[ "${maximum}" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "release evidence has invalid max_raceread_ratio=${maximum:-missing}; want a finite decimal"
     awk -v value="${maximum}" 'BEGIN { exit !(value > 0 && value <= 1) }' || fail "release evidence has max_raceread_ratio=${maximum:-missing}; want (0,1]"
+    [[ "${matrix_geo}" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "release evidence has invalid max_matrix_geomean=${matrix_geo:-missing}; want a finite decimal"
+    awk -v value="${matrix_geo}" 'BEGIN { exit !(value > 0 && value <= 1) }' || fail "release evidence has max_matrix_geomean=${matrix_geo:-missing}; want (0,1]"
+    [[ "${matrix_class}" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "release evidence has invalid max_matrix_class_ratio=${matrix_class:-missing}; want a finite decimal"
+    awk -v value="${matrix_class}" 'BEGIN { exit !(value > 0 && value <= 1.10) }' || fail "release evidence has max_matrix_class_ratio=${matrix_class:-missing}; want (0,1.10]"
+    [[ "${contention_floor}" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "release evidence has invalid min_contention_throughput=${contention_floor:-missing}; want a finite decimal"
+    awk -v value="${contention_floor}" 'BEGIN { exit !(value > 0 && value <= 0.90) }' || fail "release evidence has min_contention_throughput=${contention_floor:-missing}; want (0,0.90]"
+    [[ "${p99_ratio}" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "release evidence has invalid max_p99_ratio=${p99_ratio:-missing}; want a finite decimal"
+    awk -v value="${p99_ratio}" 'BEGIN { exit !(value > 0 && value <= 1.25) }' || fail "release evidence has max_p99_ratio=${p99_ratio:-missing}; want (0,1.25]"
     if [[ ! "${rss_count}" =~ ^[1-9][0-9]*$ ]] || (( rss_count < 10 )); then
         fail "release evidence has rss_count=${rss_count:-missing}; want at least 10"
     fi
     [[ "${rss_count}" == "${count}" ]] || fail "release evidence has rss_count=${rss_count}; want count=${count}"
     [[ "${rss_benchtime}" == 3s ]] || fail "release evidence has rss_benchtime=${rss_benchtime:-missing}; want exactly 3s"
+}
+
+validate_pr_comparison() {
+    local base="$1" pr="$2" work count base_matrix pr_matrix report summary
+    [[ -r "${base}" && -r "${pr}" ]] || fail "PR comparison inputs are missing or unreadable"
+    work="$(mktemp -d "${TMPDIR:-/tmp}/race-pr-matrix.XXXXXX")" || fail "could not create PR matrix workspace"
+    validate_benchmark_output base "${base}" 0 "${work}/base.samples"
+    validate_benchmark_output PR "${pr}" 0 "${work}/pr.samples"
+    compare_manifests base "${work}/base.samples" PR "${work}/pr.samples"
+    count="$(awk 'NR == 1 { print $2; exit }' "${work}/base.samples")"
+    [[ "${count}" =~ ^[1-9][0-9]*$ ]] || fail "PR comparison has no benchmark rows"
+    (( count >= 10 )) || fail "PR comparison requires at least 10 samples per workload"
+    validate_complete_matrix "${work}/base.samples" "${count}" base
+    validate_complete_matrix "${work}/pr.samples" "${count}" PR
+    extract_matrix "${base}" "${work}/base.tsv" "${count}" base
+    extract_matrix "${pr}" "${work}/pr.tsv" "${count}" PR
+    report="$(pwd -P)/pr-matrix-ratios.tsv"
+    summary="$(pwd -P)/pr-matrix-summary.txt"
+    if ! awk -v expected="${WORKLOAD_MATRIX_CSV}" -v want="${count}" -v report="${report}.tmp" -v summary="${summary}.tmp" '
+        function median(a,key,n,    i,j,t) {
+            for (i=1;i<=n;i++) b[i]=a[key,i]
+            for (i=2;i<=n;i++) { t=b[i]; j=i-1; while(j>=1&&b[j]>t){b[j+1]=b[j];j--}; b[j+1]=t }
+            return n%2 ? b[(n+1)/2] : (b[n/2]+b[n/2+1])/2
+        }
+        function p99(a,key,n,    i,j,t,r) {
+            for (i=1;i<=n;i++) b[i]=a[key,i]
+            for (i=2;i<=n;i++) { t=b[i]; j=i-1; while(j>=1&&b[j]>t){b[j+1]=b[j];j--}; b[j+1]=t }
+            r=int((99*n+99)/100); if(r<1)r=1; if(r>n)r=n; return b[r]
+        }
+        function expected_name(name,    i) { for(i=1;i<=n;i++)if(names[i]==name)return 1; return 0 }
+        BEGIN { n=split(expected,names,","); print "class\tbase_median_ns\tpr_median_ns\tpr_base_ratio\tbase_p99_ns\tpr_p99_ns\tp99_ratio" > report }
+        FNR==NR { bc[$1]++; bn[$1,bc[$1]]=$3; next }
+        { pc[$1]++; pn[$1,pc[$1]]=$3 }
+        END {
+            for(i=1;i<=n;i++){ name=names[i]; if(bc[name]!=want||pc[name]!=want){bad=1;continue}; bm=median(bn,name,want);pm=median(pn,name,want);bt=p99(bn,name,want);pt=p99(pn,name,want);r=pm/bm;tr=pt/bt;if(!(r>0&&r<1e308&&tr>0&&tr<1e308)){bad=1;continue};if(r>1.05){printf "%s PR/base ratio %.17g exceeds 1.05\n",name,r > "/dev/stderr";bad=1};if(tr>1.25){printf "%s PR/base p99 ratio %.17g exceeds 1.25\n",name,tr > "/dev/stderr";bad=1};printf "%s\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\t%.17g\n",name,bm,pm,r,bt,pt,tr >> report;geo+=log(r)}
+            g=exp(geo/n); if(g>1.05){printf "PR/base complete-matrix geomean %.17g exceeds 1.05\n",g > "/dev/stderr";bad=1};printf "format=pr-matrix-v1\nclasses=%d\ncomplete_matrix_geomean=%.17g\ncomplete_matrix_geomean_limit=1.05\nclass_ratio_limit=1.05\np99_ratio_limit=1.25\n",n,g > summary; if(bad)exit 1
+        }
+    ' "${work}/base.tsv" "${work}/pr.tsv"; then
+        rm -f "${report}.tmp" "${summary}.tmp"
+        fail "PR/base complete-matrix regression gate failed"
+    fi
+    mv "${report}.tmp" "${report}" || fail "could not install PR matrix report"
+    mv "${summary}.tmp" "${summary}" || fail "could not install PR matrix summary"
+    rm -rf "${work}"
 }
 
 if [[ "${ACTION}" != run && "${RUN_OPTIONS}" == true ]]; then
@@ -568,6 +1032,11 @@ case "${ACTION}" in
 		validate_release_metadata "${ACTION_ARG1}"
 		exit 0
 		;;
+	validate-pr-comparison)
+		validate_pr_comparison "${ACTION_ARG1}" "${ACTION_ARG2}"
+		echo "Validated PR/base complete-matrix comparison"
+		exit 0
+		;;
 	summarize-rss)
 		summarize_rss "${ACTION_ARG1}" "${ACTION_ARG2}"
 		exit 0
@@ -585,18 +1054,23 @@ case "${ACTION}" in
         exit 0
         ;;
     save)
+        require_clean_source_tree
         validate_name "${ACTION_ARG1}"
         [[ -f "${RESULTS_DIR}/status.txt" ]] || fail "no completed comparison status found"
         [[ "$(cat "${RESULTS_DIR}/status.txt")" == PASS ]] || fail "current comparison is not complete"
         validate_release_metadata "${RESULTS_DIR}/release-contract.txt"
         tmp="$(mktemp -d "${TMPDIR:-/tmp}/race-comparison-save.XXXXXX")"
         trap 'rm -rf "${tmp}"' EXIT
+        saved_count="$(awk -F= '$1 == "count" { print $2; exit }' "${RESULTS_DIR}/release-contract.txt")"
         for config in baseline tsan purego; do
             validate_benchmark_output "${config}" "${RESULTS_DIR}/${config}.txt" 0 "${tmp}/${config}.samples"
+            validate_complete_matrix "${tmp}/${config}.samples" "${saved_count}" "${config}"
+            extract_matrix "${RESULTS_DIR}/${config}.txt" "${tmp}/${config}.tsv" "${saved_count}" "${config}"
         done
+        matrix_report "${tmp}/tsan.tsv" "${tmp}/purego.tsv" "${tmp}/matrix-ratios.tsv" "${tmp}/matrix-summary.txt" "${saved_count}" saved-evidence
         compare_manifests baseline "${tmp}/baseline.samples" tsan "${tmp}/tsan.samples"
         compare_manifests baseline "${tmp}/baseline.samples" purego "${tmp}/purego.samples"
-        awk '$2 < 10 { exit 1 }' "${tmp}/baseline.samples" || fail "saved evidence contains fewer than 10 samples"
+        awk -v want="${saved_count}" '$2 != want { exit 1 }' "${tmp}/baseline.samples" || fail "saved evidence contains inconsistent sample counts"
         mkdir -p "${BASELINES_DIR}"
         for config in baseline tsan purego; do
             cp "${RESULTS_DIR}/${config}.txt" "${BASELINES_DIR}/${ACTION_ARG1}-${config}.txt"
@@ -637,6 +1111,14 @@ BENCHTIME_SECONDS="$(awk -v value="${BENCHTIME}" '
 [[ "${MAX_RACEREAD_RATIO}" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "--max-raceread-ratio must be a positive number: ${MAX_RACEREAD_RATIO}"
 awk -v value="${MAX_RACEREAD_RATIO}" 'BEGIN { exit !(value > 0) }' || fail "--max-raceread-ratio must be positive: ${MAX_RACEREAD_RATIO}"
 awk -v value="${MAX_RACEREAD_RATIO}" 'BEGIN { exit !(value <= 1) }' || fail "--max-raceread-ratio cannot exceed the release ceiling 1.00: ${MAX_RACEREAD_RATIO}"
+[[ "${MAX_MATRIX_GEOMEAN}" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "--max-matrix-geomean must be a finite decimal: ${MAX_MATRIX_GEOMEAN}"
+awk -v value="${MAX_MATRIX_GEOMEAN}" 'BEGIN { exit !(value > 0 && value <= 1) }' || fail "--max-matrix-geomean must be in (0,1]: ${MAX_MATRIX_GEOMEAN}"
+[[ "${MAX_MATRIX_CLASS_RATIO}" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "--max-matrix-class-ratio must be a finite decimal: ${MAX_MATRIX_CLASS_RATIO}"
+awk -v value="${MAX_MATRIX_CLASS_RATIO}" 'BEGIN { exit !(value > 0 && value <= 1.10) }' || fail "--max-matrix-class-ratio must be in (0,1.10]: ${MAX_MATRIX_CLASS_RATIO}"
+[[ "${MIN_CONTENTION_THROUGHPUT}" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "--min-contention-throughput must be a finite decimal: ${MIN_CONTENTION_THROUGHPUT}"
+awk -v value="${MIN_CONTENTION_THROUGHPUT}" 'BEGIN { exit !(value > 0 && value <= 0.90) }' || fail "--min-contention-throughput must be in (0,0.90]: ${MIN_CONTENTION_THROUGHPUT}"
+[[ "${MAX_MATRIX_P99_RATIO}" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "--max-p99-ratio must be a finite decimal: ${MAX_MATRIX_P99_RATIO}"
+awk -v value="${MAX_MATRIX_P99_RATIO}" 'BEGIN { exit !(value > 0 && value <= 1.25) }' || fail "--max-p99-ratio must be in (0,1.25]: ${MAX_MATRIX_P99_RATIO}"
 if [[ "${QUICK_MODE}" == false ]]; then
     (( COUNT >= 10 )) || fail "release comparisons require --count at least 10 (use --quick for development)"
     awk -v value="${BENCHTIME_SECONDS}" 'BEGIN { exit !(value >= 1) }' || fail "release comparisons require --benchtime at least 1s (use --quick for development)"
@@ -652,6 +1134,7 @@ fi
 FORK_GO="$(resolve_executable "${FORK_GO}")" || fail "fork go binary not found or not executable: ${FORK_GO}"
 require_benchstat
 command -v git >/dev/null 2>&1 || fail "git is required to identify the tested revision"
+require_clean_source_tree
 
 FORK_GOROOT="$("${FORK_GO}" env GOROOT)"
 [[ -d "${FORK_GOROOT}" ]] || fail "fork GOROOT does not exist: ${FORK_GOROOT}"
@@ -719,6 +1202,16 @@ FORK_STATUS="$(git -C "${FORK_GOROOT}" status --porcelain --untracked-files=norm
 mkdir -p "${RESULTS_DIR}/raw/baseline" "${RESULTS_DIR}/raw/tsan" "${RESULTS_DIR}/raw/purego"
 echo RUNNING > "${RESULTS_DIR}/status.txt"
 printf '%s\n' "${FORK_STATUS}" > "${RESULTS_DIR}/source-status.txt"
+cat > "${RESULTS_DIR}/backend-identity.txt" <<EOF
+format=backend-identity-v1
+source_revision=${FORK_REVISION}
+purego_cgo_enabled=0
+purego_race=true
+purego_manifest=${purego_backend}
+tsan_cgo_enabled=1
+tsan_race=true
+tsan_manifest=${tsan_backend}
+EOF
 if [[ -z "${FORK_STATUS}" ]]; then
     SOURCE_STATE=clean
 else
@@ -735,6 +1228,10 @@ fi
     echo "benchtime=${BENCHTIME}"
     echo "benchtime_seconds=${BENCHTIME_SECONDS}"
     echo "max_raceread_ratio=${MAX_RACEREAD_RATIO}"
+    echo "max_matrix_geomean=${MAX_MATRIX_GEOMEAN}"
+    echo "max_matrix_class_ratio=${MAX_MATRIX_CLASS_RATIO}"
+    echo "min_contention_throughput=${MIN_CONTENTION_THROUGHPUT}"
+    echo "max_p99_ratio=${MAX_MATRIX_P99_RATIO}"
     echo "rss_count=${COUNT}"
     echo "rss_benchtime=3s"
 } > "${RESULTS_DIR}/release-contract.txt"
@@ -831,6 +1328,7 @@ verify_race_binary_symbols() {
 
 verify_race_binary_symbols TSAN "${TSAN_BIN}" tsan "${RESULTS_DIR}/symbols-tsan.txt"
 verify_race_binary_symbols PureGo "${PUREGO_BIN}" purego "${RESULTS_DIR}/symbols-purego.txt"
+require_clean_source_tree
 
 {
     echo "=== Environment ==="
@@ -944,9 +1442,17 @@ done
 
 for config in baseline tsan purego; do
     validate_benchmark_output "${config}" "${RESULTS_DIR}/${config}.txt" "${COUNT}" "${RESULTS_DIR}/${config}.samples"
+    validate_complete_matrix "${RESULTS_DIR}/${config}.samples" "${COUNT}" "${config}"
 done
 compare_manifests baseline "${RESULTS_DIR}/baseline.samples" tsan "${RESULTS_DIR}/tsan.samples"
 compare_manifests baseline "${RESULTS_DIR}/baseline.samples" purego "${RESULTS_DIR}/purego.samples"
+
+extract_matrix "${RESULTS_DIR}/tsan.txt" "${RESULTS_DIR}/matrix-tsan.tsv" "${COUNT}" TSAN
+extract_matrix "${RESULTS_DIR}/purego.txt" "${RESULTS_DIR}/matrix-purego.tsv" "${COUNT}" PureGo
+extract_matrix "${RESULTS_DIR}/baseline.txt" "${RESULTS_DIR}/matrix-baseline.tsv" "${COUNT}" baseline
+matrix_report "${RESULTS_DIR}/matrix-tsan.tsv" "${RESULTS_DIR}/matrix-purego.tsv" \
+    "${RESULTS_DIR}/matrix-ratios.tsv" "${RESULTS_DIR}/matrix-summary.txt" "${COUNT}" TSAN-PureGo
+cp "${RESULTS_DIR}/matrix-ratios.tsv" "${RESULTS_DIR}/matrix-tsan-purego.tsv" || fail "could not retain TSAN/PureGo matrix report"
 
 median() {
     local input="$1" count sorted
@@ -1109,6 +1615,7 @@ verify_benchmark_binary PureGo "${PUREGO_BIN}" "${purego_hash}"
 validate_toolchain_build "${FORK_GO}"
 verify_race_binary_symbols TSAN "${TSAN_BIN}" tsan "${RESULTS_DIR}/symbols-tsan.txt"
 verify_race_binary_symbols PureGo "${PUREGO_BIN}" purego "${RESULTS_DIR}/symbols-purego.txt"
+require_clean_source_tree
 
 {
     echo "## Benchmark Results: Pure-Go Race Detector vs TSAN"
@@ -1129,6 +1636,12 @@ verify_race_binary_symbols PureGo "${PUREGO_BIN}" purego "${RESULTS_DIR}/symbols
     echo '### TSAN vs PureGo'
     echo '```'
     cat "${RESULTS_DIR}/benchstat_tsan_vs_purego.txt"
+    echo '```'
+    echo
+    echo '### Complete workload matrix gates'
+    echo '```'
+    cat "${RESULTS_DIR}/matrix-summary.txt"
+    cat "${RESULTS_DIR}/matrix-ratios.tsv"
     echo '```'
     echo
     echo '### All configurations'

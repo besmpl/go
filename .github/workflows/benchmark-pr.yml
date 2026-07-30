@@ -79,7 +79,9 @@ jobs:
           cache: false
 
       - name: Test benchmark evidence validation
-        run: bash pr/benchmarks/scripts/test_run_comparison.sh
+        run: |
+          bash pr/benchmarks/scripts/test_run_comparison.sh
+          bash pr/benchmarks/scripts/test_run_soak.sh
 
       - name: Install pinned benchstat
         run: |
@@ -292,6 +294,11 @@ jobs:
           bash pr/benchmarks/run_comparison.sh --validate-toolchain-build pr/bin/go
           [[ "$(git hash-object base-purego.test)" == "$base_binary_hash" ]]
           [[ "$(git hash-object pr-purego.test)" == "$pr_binary_hash" ]]
+          # The shared harness rejects missing/malformed allocation rows and
+          # computes the complete named workload PR/base matrix gates before
+          # the human-readable RaceRead summary below is produced.
+          bash pr/benchmarks/run_comparison.sh \
+            --validate-pr-comparison base-purego.txt pr-purego.txt
           manifest() {
             local input="$1" output="$2" unsorted
             unsorted="${output}.unsorted"
@@ -436,6 +443,8 @@ jobs:
             base-raceread.sorted.txt
             pr-raceread.sorted.txt
             pr-raceread-ratio.txt
+            pr-matrix-ratios.tsv
+            pr-matrix-summary.txt
             sample-order.txt
             comparison.txt
             comment.md

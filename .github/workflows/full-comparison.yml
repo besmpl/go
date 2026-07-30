@@ -49,7 +49,10 @@ jobs:
   compare:
     name: Baseline vs TSAN vs PureGo
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # Each 60-minute soak runs PureGo and TSAN sequentially to avoid
+    # cross-backend resource interference. Stable + churn therefore require
+    # at least four hours before build and comparison overhead.
+    timeout-minutes: 360
 
     steps:
       - name: Checkout exact revision
@@ -69,7 +72,9 @@ jobs:
           cache: false
 
       - name: Test benchmark evidence validation
-        run: bash benchmarks/scripts/test_run_comparison.sh
+        run: |
+          bash benchmarks/scripts/test_run_comparison.sh
+          bash benchmarks/scripts/test_run_soak.sh
 
       - name: Install pinned benchmark tools
         run: |
@@ -102,6 +107,23 @@ jobs:
             --validate-release-contract benchmarks/results/release-contract.txt
           cat benchmarks/results/summary.md >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Run stable 60-minute soak
+        run: |
+          bash benchmarks/scripts/run_soak.sh \
+            --go ./bin/go --mode stable --duration 60m \
+            --out benchmarks/results/soak-stable
+
+      - name: Run churn 60-minute soak
+        run: |
+          bash benchmarks/scripts/run_soak.sh \
+            --go ./bin/go --mode churn --duration 60m \
+            --out benchmarks/results/soak-churn
+
+      - name: Publish soak summaries
+        run: |
+          cat benchmarks/results/soak-stable/summary.txt >> "$GITHUB_STEP_SUMMARY"
+          cat benchmarks/results/soak-churn/summary.txt >> "$GITHUB_STEP_SUMMARY"
+
       - name: Mark incomplete evidence failed
         if: failure()
         run: |
@@ -118,12 +140,14 @@ jobs:
             benchmarks/results/release-contract.txt
             benchmarks/results/environment.txt
             benchmarks/results/source-status.txt
+            benchmarks/results/backend-identity.txt
             benchmarks/results/raw/**
             benchmarks/results/baseline.txt
             benchmarks/results/tsan.txt
             benchmarks/results/purego.txt
             benchmarks/results/*.samples
             benchmarks/results/raceread-*.txt
+            benchmarks/results/matrix-*
             benchmarks/results/raceread_ratio.txt
             benchmarks/results/sample-order.txt
             benchmarks/results/benchstat_tsan_vs_purego.txt
@@ -133,6 +157,8 @@ jobs:
             benchmarks/results/rss-*.time
             benchmarks/results/symbols-*.txt
             benchmarks/results/summary.md
+            benchmarks/results/soak-stable/**
+            benchmarks/results/soak-churn/**
             bin/go.benchmark-attestation
           if-no-files-found: warn
           retention-days: 90
