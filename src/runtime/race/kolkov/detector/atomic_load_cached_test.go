@@ -9,17 +9,25 @@ import (
 )
 
 func completeCachedLoadSlowForTest(d *Detector, addr uintptr, ctx *goroutine.RaceContext, pc uintptr) {
+	completeCachedLoadSlowSizedForTest(d, addr, 8, ctx, pc)
+}
+
+func completeCachedLoadSlowSizedForTest(d *Detector, addr, size uintptr, ctx *goroutine.RaceContext, pc uintptr) {
 	var token AtomicToken
-	d.AtomicBeginLoad(addr, 8, ctx, &token)
-	d.AtomicEndLoad(addr, 8, ctx, &token, pc)
+	d.AtomicBeginLoad(addr, size, ctx, &token)
+	d.AtomicEndLoad(addr, size, ctx, &token, pc)
 }
 
 func warmCachedLoadForTest(t *testing.T, d *Detector, addr uintptr, ctx *goroutine.RaceContext, pc uintptr) {
+	warmCachedLoadSizedForTest(t, d, addr, 8, ctx, pc)
+}
+
+func warmCachedLoadSizedForTest(t *testing.T, d *Detector, addr, size uintptr, ctx *goroutine.RaceContext, pc uintptr) {
 	t.Helper()
 	for i := 0; i < 3; i++ {
-		completeCachedLoadSlowForTest(d, addr, ctx, pc)
+		completeCachedLoadSlowSizedForTest(d, addr, size, ctx, pc)
 		var token AtomicToken
-		if revision, generation, ok := d.AtomicBeginLoadFast(addr, 8, ctx, pc, &token); ok {
+		if revision, generation, ok := d.AtomicBeginLoadFast(addr, size, ctx, pc, &token); ok {
 			if !d.AtomicEndLoadFast(ctx, &token, revision, generation) {
 				t.Fatal("stable warmed cached load failed validation")
 			}
@@ -297,8 +305,8 @@ func TestAtomicCachedLoadEvictionFoldsLatestFrontier(t *testing.T) {
 	d := NewDetector()
 	reader := goroutine.Alloc(70_041)
 	const pc = uintptr(0x8140)
-	addrs := [3]uintptr{0x51400, 0x51500, 0x51600}
-	for _, addr := range addrs[:2] {
+	addrs := [4]uintptr{0x51400, 0x51500, 0x51600, 0x51700}
+	for _, addr := range addrs[:goroutine.AtomicLoadCacheSlots] {
 		warmCachedLoadForTest(t, d, addr, reader, pc)
 	}
 	writer := goroutine.AllocWithParentClock(70_042, reader.C, 1)
@@ -315,10 +323,10 @@ func TestAtomicCachedLoadEvictionFoldsLatestFrontier(t *testing.T) {
 	if canonicalBefore != 0 {
 		t.Fatalf("cached load recorded %d canonical reads before eviction, want frontier only", canonicalBefore)
 	}
-	// The third key misses before it has shadow state; miss preparation evicts
+	// The fourth key misses before it has shadow state; miss preparation evicts
 	// slot zero and must fold addr[0]'s new epoch before unlinking its node.
-	if _, _, ok := d.AtomicBeginLoadFast(addrs[2], 8, reader, pc, &token); ok {
-		t.Fatal("unmaterialized third address unexpectedly hit")
+	if _, _, ok := d.AtomicBeginLoadFast(addrs[3], 8, reader, pc, &token); ok {
+		t.Fatal("unmaterialized fourth address unexpectedly hit")
 	}
 	state.mu.lock()
 	folded, foldedOK := atomicHistoryAccess(state.reads, reader.TID)
@@ -330,6 +338,48 @@ func TestAtomicCachedLoadEvictionFoldsLatestFrontier(t *testing.T) {
 	d.OnWrite(addrs[0], writer, pc+1)
 	if got := d.RacesDetected(); got != 1 {
 		t.Fatalf("post-eviction writer saw %d races, want folded cached read", got)
+	}
+}
+
+func TestAtomicCachedLoadRetainsThreeIdentityWorkingSet(t *testing.T) {
+	d := NewDetector()
+	reader := goroutine.Alloc(70_045)
+	const addr = uintptr(0x51440)
+	wordSize := unsafe.Sizeof(uintptr(0))
+	identities := [...]struct {
+		addr uintptr
+		pc   uintptr
+	}{
+		// atomic.Value.Store and atomic.Value.Load read the same type word at
+		// distinct call sites; Load then reads the adjacent data word.
+		{addr: addr, pc: 0x8145},
+		{addr: addr, pc: 0x8146},
+		{addr: addr + wordSize, pc: 0x8147},
+	}
+
+	// atomic.Value-style loops repeatedly load a small, fixed set of exact
+	// identities. Keep all three enrolled so the steady state stays on the
+	// cache-only path instead of folding and rebuilding a frontier each cycle.
+	var frontiers [len(identities)]unsafe.Pointer
+	for i, identity := range identities {
+		warmCachedLoadSizedForTest(t, d, identity.addr, wordSize, reader, identity.pc)
+		frontiers[i] = ctxCacheEntryForTest(t, d, reader, identity.addr, identity.pc).Frontier
+	}
+
+	for cycle := 0; cycle < 32; cycle++ {
+		for i, identity := range identities {
+			var token AtomicToken
+			revision, generation, ok := d.AtomicBeginLoadFast(identity.addr, wordSize, reader, identity.pc, &token)
+			if !ok {
+				t.Fatalf("cycle %d identity %d missed the resident three-entry working set", cycle, i)
+			}
+			if !d.AtomicEndLoadFast(reader, &token, revision, generation) {
+				t.Fatalf("cycle %d identity %d failed cached-load validation", cycle, i)
+			}
+			if got := ctxCacheEntryForTest(t, d, reader, identity.addr, identity.pc).Frontier; got != frontiers[i] {
+				t.Fatalf("cycle %d identity %d frontier = %p, want resident %p", cycle, i, got, frontiers[i])
+			}
+		}
 	}
 }
 
@@ -400,14 +450,14 @@ func TestAtomicCachedLoadWithoutFrontierKeepsCanonicalHistory(t *testing.T) {
 	d := NewDetector()
 	ctx := goroutine.Alloc(70_057)
 	const pc = uintptr(0x815a)
-	for _, addr := range []uintptr{0x51800, 0x51840} {
+	for _, addr := range []uintptr{0x51800, 0x51840, 0x51880} {
 		warmCachedLoadForTest(t, d, addr, ctx, pc)
 	}
 
-	// Direct detector callers need not run FastBegin miss preparation. With both
+	// Direct detector callers need not run FastBegin miss preparation. With all
 	// cache slots occupied, a locked cached load therefore has no frontier slot
 	// and must retain its witness in the canonical history instead.
-	const addr = uintptr(0x51880)
+	const addr = uintptr(0x518c0)
 	completeCachedLoadSlowForTest(d, addr, ctx, pc)
 	state := atomicHistoryForTest(t, d, addr)
 	state.mu.lock()
@@ -430,7 +480,7 @@ func TestAtomicCachedLoadReusesContextOwnedNode(t *testing.T) {
 	}
 	var token AtomicToken
 	if _, _, ok := d.AtomicBeginLoadFast(addr, 8, ctx, 0x8170, &token); ok {
-		t.Fatal("third PC unexpectedly hit two-entry cache")
+		t.Fatal("new PC unexpectedly hit a full cache")
 	}
 	completeCachedLoadSlowForTest(d, addr, ctx, 0x8170)
 	state := atomicHistoryForTest(t, d, addr)
@@ -492,10 +542,11 @@ func TestAtomicCachedLoadDescriptorRegenerationDoesNotAliasFrontier(t *testing.T
 		t.Fatal("compatible loads did not publish a fresh capability generation")
 	}
 
-	// With both cache slots occupied, the unrelated miss evicts F1's slot and
+	// Fill the third cache slot so the unrelated miss evicts F1's slot and
 	// reuses its detached node in another state. An old implementation let F2
 	// alias that node; its ensuing generation miss then repurposed the still-live
 	// other-state node and linked one mutable object into both lists.
+	warmCachedLoadForTest(t, d, other-0x40, reader, otherPC-1)
 	if _, _, ok := d.AtomicBeginLoadFast(other, 8, reader, otherPC, &token); ok {
 		t.Fatal("unmaterialized other address unexpectedly hit")
 	}
@@ -605,11 +656,13 @@ func TestAtomicCachedLoadPartialPruneEvictionFoldsSurvivingLanes(t *testing.T) {
 	const (
 		addr     = uintptr(0x51900)
 		other    = uintptr(0x51a00)
+		padding  = uintptr(0x51b00)
 		eviction = uintptr(0x51c00)
 		pc       = uintptr(0x8180)
 	)
 	warmCachedLoadForTest(t, d, addr, reader, pc)
 	warmCachedLoadForTest(t, d, other, reader, pc)
+	warmCachedLoadForTest(t, d, padding, reader, pc)
 	for i, entry := range reader.AtomicLoadCache {
 		if entry.Fast == nil || entry.State == nil || entry.Frontier == nil {
 			t.Fatalf("cache slot %d is not filled before eviction: %+v", i, entry)
@@ -635,7 +688,7 @@ func TestAtomicCachedLoadPartialPruneEvictionFoldsSurvivingLanes(t *testing.T) {
 		t.Fatalf("low-half HB write left frontier mask %#x, want high-half mask %#x", got, uint8(0xf0))
 	}
 
-	// The low-half HB write deactivates only those lanes. With both slots full,
+	// The low-half HB write deactivates only those lanes. With all slots full,
 	// an unrelated miss selects this partial node as the round-robin victim and
 	// must fold its surviving high half before unlinking it.
 	if _, _, ok := d.AtomicBeginLoadFast(eviction, 8, reader, pc, &token); ok {

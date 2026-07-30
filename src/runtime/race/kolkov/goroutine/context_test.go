@@ -43,13 +43,13 @@ func TestRaceContextLayoutOffsets(t *testing.T) {
 	if ptrSize == 8 {
 		const (
 			atomicCacheOffset = uintptr(96)
-			wantSize          = uintptr(304)
+			wantSize          = uintptr(360)
 		)
 		if got := unsafe.Offsetof(ctx.AtomicReleaseCache); got != atomicCacheOffset {
 			t.Fatalf("AtomicReleaseCache offset = %d, want %d", got, atomicCacheOffset)
 		}
-		if got := unsafe.Offsetof(ctx.ForeignGeneration); got != 288 {
-			t.Fatalf("ForeignGeneration offset = %d, want 288", got)
+		if got := unsafe.Offsetof(ctx.ForeignGeneration); got != 344 {
+			t.Fatalf("ForeignGeneration offset = %d, want 344", got)
 		}
 		if got := unsafe.Sizeof(ctx); got != wantSize {
 			t.Fatalf("RaceContext size = %d, want %d", got, wantSize)

@@ -133,3 +133,85 @@ func TestAtomicRMWCooperativeBridgeContentionReturnsCleanRetry(t *testing.T) {
 	}
 	raceAtomicEnd(addr+8, 8, 0x6303, ctx, &miss, true, true)
 }
+
+func TestAtomicLoadStoreCooperativeBridgesReturnCleanRetry(t *testing.T) {
+	Reset()
+	defer Reset()
+	Enable()
+	const addr = uintptr(0x7f4000)
+
+	var token [8]unsafe.Pointer
+	ctx := raceAtomicBeginPlain(addr, 8, 0, false, &token)
+	raceAtomicEnd(addr, 8, 0x6400, ctx, &token, true, true)
+	ctx = raceAtomicBeginRMW(addr, 8, ctx, true, &token)
+	if token[0] == nil || token[1] != nil {
+		t.Fatalf("blocking owner token = [%p %p], want exact capability", token[0], token[1])
+	}
+
+	tests := []struct {
+		name  string
+		begin func(*[8]unsafe.Pointer) (uintptr, bool)
+		end   func(uintptr, *[8]unsafe.Pointer)
+	}{
+		{
+			name: "load",
+			begin: func(candidate *[8]unsafe.Pointer) (uintptr, bool) {
+				return raceAtomicBeginLoadCooperative(addr, 8, ctx, candidate)
+			},
+			end: func(context uintptr, candidate *[8]unsafe.Pointer) {
+				raceAtomicLoadEnd(addr, 8, 0x6402, context, candidate)
+			},
+		},
+		{
+			name: "store",
+			begin: func(candidate *[8]unsafe.Pointer) (uintptr, bool) {
+				return raceAtomicBeginStoreCooperative(addr, 8, ctx, candidate)
+			},
+			end: func(context uintptr, candidate *[8]unsafe.Pointer) {
+				raceAtomicEnd(addr, 8, 0x6403, context, candidate, true, true)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name+" contention", func(t *testing.T) {
+			var candidate [8]unsafe.Pointer
+			candidate[0] = unsafe.Pointer(new(byte))
+			gotContext, retry := test.begin(&candidate)
+			if gotContext != ctx || !retry {
+				t.Fatalf("cooperative contention = (%#x, %v), want (%#x, true)", gotContext, retry, ctx)
+			}
+			for lane, retained := range candidate {
+				if retained != nil {
+					t.Fatalf("contention retained token[%d] = %p", lane, retained)
+				}
+			}
+		})
+	}
+	raceAtomicEnd(addr, 8, 0x6401, ctx, &token, true, true)
+
+	for _, test := range tests {
+		t.Run(test.name+" success", func(t *testing.T) {
+			var candidate [8]unsafe.Pointer
+			gotContext, retry := test.begin(&candidate)
+			if gotContext != ctx || retry {
+				t.Fatalf("uncontended cooperative begin = (%#x, %v), want (%#x, false)", gotContext, retry, ctx)
+			}
+			if candidate[0] == nil || candidate[1] != nil {
+				t.Fatalf("uncontended token = [%p %p], want exact capability", candidate[0], candidate[1])
+			}
+			test.end(gotContext, &candidate)
+		})
+	}
+
+	var miss [8]unsafe.Pointer
+	gotContext, retry := raceAtomicBeginLoadCooperative(addr+8, 8, ctx, &miss)
+	if gotContext != ctx || retry || miss[0] == nil {
+		t.Fatalf("load enrollment miss = (%#x, %v, %p), want blocking token", gotContext, retry, miss[0])
+	}
+	raceAtomicLoadEnd(addr+8, 8, 0x6404, gotContext, &miss)
+	gotContext, retry = raceAtomicBeginStoreCooperative(addr+16, 8, ctx, &miss)
+	if gotContext != ctx || retry || miss[0] == nil {
+		t.Fatalf("store enrollment miss = (%#x, %v, %p), want blocking token", gotContext, retry, miss[0])
+	}
+	raceAtomicEnd(addr+16, 8, 0x6405, gotContext, &miss, true, true)
+}

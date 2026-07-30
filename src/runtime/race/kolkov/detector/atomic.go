@@ -1068,6 +1068,21 @@ func (d *Detector) AtomicBeginLoad(addr, size uintptr, ctx *goroutine.RaceContex
 	d.atomicBegin(addr, size, ctx, true, true, true, false, false, 1, false, token)
 }
 
+// AtomicBeginLoadCooperative is the enabled public-Load fallback. It asks the
+// user-goroutine wrapper to retry only when an already-retained exact
+// capability's state lock is contended. Capability misses, enrollment, and
+// general transactions remain on the authoritative blocking path.
+func (d *Detector) AtomicBeginLoadCooperative(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken) (retry bool) {
+	return d.atomicBegin(addr, size, ctx, true, true, true, false, false, 1, true, token)
+}
+
+// AtomicBeginStoreCooperative is the enabled public-Store transaction. Like
+// AtomicBeginLoadCooperative, only retained exact-capability lock contention is
+// returned to the user goroutine; misses and enrollment continue to block.
+func (d *Detector) AtomicBeginStoreCooperative(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken) (retry bool) {
+	return d.atomicBegin(addr, size, ctx, false, true, true, true, true, 1, true, token)
+}
+
 func deactivateAtomicLoadEntry(entry goroutine.AtomicLoadCacheEntry) *atomicReadFrontier {
 	if entry.State == nil || entry.Frontier == nil {
 		return nil

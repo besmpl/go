@@ -21,9 +21,10 @@ const ReadCacheSlots = 4
 // happens-before relation.
 const AtomicReleaseCacheSlots = 2
 
-// AtomicLoadCacheSlots bounds the exact atomic-load working set. A miss is a
-// performance-only event and takes the detector's locked transaction path.
-const AtomicLoadCacheSlots = 2
+// AtomicLoadCacheSlots bounds the exact atomic-load working set. Three entries
+// cover atomic.Value's Store type load plus Load's type and data loads. A miss
+// is a performance-only event and takes the detector's locked transaction path.
+const AtomicLoadCacheSlots = 3
 
 // AtomicReleaseCacheEntry is context-owned metadata for one exact atomic
 // release binding. Release is a GC root rather than a uintptr so explicit

@@ -276,6 +276,90 @@ func TestAtomicRMWCooperativeContentionIsClean(t *testing.T) {
 	d.AtomicEnd(addr, 8, contender, &token, 0x5122, true)
 }
 
+func TestAtomicLoadStoreCooperativeContentionIsClean(t *testing.T) {
+	tests := []struct {
+		name  string
+		begin func(*Detector, uintptr, *goroutine.RaceContext, *AtomicToken) bool
+		end   func(*Detector, uintptr, *goroutine.RaceContext, *AtomicToken)
+	}{
+		{
+			name: "load",
+			begin: func(d *Detector, addr uintptr, ctx *goroutine.RaceContext, token *AtomicToken) bool {
+				return d.AtomicBeginLoadCooperative(addr, 8, ctx, token)
+			},
+			end: func(d *Detector, addr uintptr, ctx *goroutine.RaceContext, token *AtomicToken) {
+				d.AtomicEndLoad(addr, 8, ctx, token, 0x5132)
+			},
+		},
+		{
+			name: "store",
+			begin: func(d *Detector, addr uintptr, ctx *goroutine.RaceContext, token *AtomicToken) bool {
+				return d.AtomicBeginStoreCooperative(addr, 8, ctx, token)
+			},
+			end: func(d *Detector, addr uintptr, ctx *goroutine.RaceContext, token *AtomicToken) {
+				d.AtomicEnd(addr, 8, ctx, token, 0x5133, true)
+			},
+		},
+	}
+	for i, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			d := NewDetector()
+			seed := goroutine.Alloc(uint32(208 + i*2))
+			contender := goroutine.Alloc(uint32(209 + i*2))
+			defer seed.C.Release()
+			defer contender.C.Release()
+			addr := uintptr(0x31260 + i*0x10)
+			enrollPlainAtomicForTest(t, d, addr, 8, seed)
+			capability := plainAtomicCapabilityForTest(t, d, addr, 8)
+			state := atomicHistoryForTest(t, d, addr)
+
+			state.mu.lock()
+			beforeRevision := state.writerRevision.Load()
+			beforePinned := state.arena.pinned.Load()
+			beforeReads := atomicHistoryCardinality(state.reads)
+			beforeWrites := atomicHistoryCardinality(state.writes)
+			beforeEpoch := contender.GetEpoch()
+			beforeSeedClock := contender.C.Get(seed.TID)
+			var token AtomicToken
+			token[0] = unsafe.Pointer(new(byte))
+			retry := test.begin(d, addr, contender, &token)
+			if !retry {
+				state.mu.unlock()
+				t.Fatal("cooperative contention did not request a retry")
+			}
+			for lane, retained := range token {
+				if retained != nil {
+					state.mu.unlock()
+					t.Fatalf("contention retained token[%d] = %p", lane, retained)
+				}
+			}
+			if state.transactionActive || state.writerRevision.Load() != beforeRevision || state.arena.pinned.Load() != beforePinned ||
+				atomicHistoryCardinality(state.reads) != beforeReads || atomicHistoryCardinality(state.writes) != beforeWrites {
+				state.mu.unlock()
+				t.Fatal("contention mutated transaction, revision, pins, or atomic history")
+			}
+			state.mu.unlock()
+			if got := contender.GetEpoch(); got != beforeEpoch {
+				t.Fatalf("contention changed epoch from %v to %v", beforeEpoch, got)
+			}
+			if got := contender.C.Get(seed.TID); got != beforeSeedClock {
+				t.Fatalf("contention imported release clock %d, want %d", got, beforeSeedClock)
+			}
+			if fresh := plainAtomicCapabilityForTest(t, d, addr, 8); fresh != capability {
+				t.Fatalf("contention replaced capability %p with %p", capability, fresh)
+			}
+
+			if retry := test.begin(d, addr, contender, &token); retry {
+				t.Fatal("uncontended cooperative begin requested a retry")
+			}
+			if fast := atomicFastToken(&token); fast != capability {
+				t.Fatalf("uncontended token capability = %p, want %p", fast, capability)
+			}
+			test.end(d, addr, contender, &token)
+		})
+	}
+}
+
 func TestAtomicAcquireOnlyFastCompletionKeepsClockAndWeakensReadCache(t *testing.T) {
 	d := NewDetector()
 	seed := goroutine.Alloc(209)

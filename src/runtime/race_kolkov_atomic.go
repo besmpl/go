@@ -34,6 +34,14 @@ func kolkovApiAtomicBeginPlain(addr, size, racectx uintptr, acquire bool, token 
 //go:noescape
 func kolkovApiAtomicBeginLoad(addr, size, racectx uintptr, token *[8]unsafe.Pointer) (context uintptr)
 
+//go:linkname kolkovApiAtomicBeginLoadCooperative runtime/race/kolkov/api.raceAtomicBeginLoadCooperative
+//go:noescape
+func kolkovApiAtomicBeginLoadCooperative(addr, size, racectx uintptr, token *[8]unsafe.Pointer) (context uintptr, retry bool)
+
+//go:linkname kolkovApiAtomicBeginStoreCooperative runtime/race/kolkov/api.raceAtomicBeginStoreCooperative
+//go:noescape
+func kolkovApiAtomicBeginStoreCooperative(addr, size, racectx uintptr, token *[8]unsafe.Pointer) (context uintptr, retry bool)
+
 //go:linkname kolkovApiAtomicBeginRMW runtime/race/kolkov/api.raceAtomicBeginRMW
 //go:noescape
 func kolkovApiAtomicBeginRMW(addr, size, racectx uintptr, acquire bool, token *[8]unsafe.Pointer) (context uintptr)
@@ -408,11 +416,19 @@ func kolkovAtomicPlainBegin(addr, size, racectx uintptr, acquire, synchronize bo
 }
 
 //go:nosplit
-func kolkovAtomicLoadBegin(addr, size, racectx uintptr, synchronize bool, token *[8]unsafe.Pointer) uintptr {
+func kolkovAtomicLoadBegin(addr, size, racectx uintptr, synchronize bool, token *[8]unsafe.Pointer) (context uintptr, retry bool) {
 	if synchronize {
-		return kolkovApiAtomicBeginLoad(addr, size, racectx, token)
+		return kolkovApiAtomicBeginLoadCooperative(addr, size, racectx, token)
 	}
-	return kolkovApiAtomicBegin(addr, size, racectx, false, token)
+	return kolkovApiAtomicBegin(addr, size, racectx, false, token), false
+}
+
+//go:nosplit
+func kolkovAtomicStoreBegin(addr, size, racectx uintptr, synchronize bool, token *[8]unsafe.Pointer) (context uintptr, retry bool) {
+	if synchronize {
+		return kolkovApiAtomicBeginStoreCooperative(addr, size, racectx, token)
+	}
+	return kolkovApiAtomicBegin(addr, size, racectx, false, token), false
 }
 
 // kolkovAtomicRMWBegin lets an enabled aligned RMW reuse an existing exact
@@ -431,20 +447,20 @@ func kolkovAtomicRMWBegin(addr, size, racectx uintptr, synchronize bool, token *
 // procyield is a pause-count on most targets, but an approximate nanosecond
 // delay on arm64. Keep the portable count deliberately small while giving
 // arm64 enough elapsed time for the short detector critical section to finish.
-const kolkovAtomicRMWRetryMaxDelay = uint32(32 + goarch.IsArm64*(1<<20-32))
+const kolkovAtomicRetryMaxDelay = uint32(32 + goarch.IsArm64*(1<<20-32))
 
-// kolkovAtomicRMWRetry backs off on the user goroutine after a clean exact-lock
+// kolkovAtomicRetry backs off on the user goroutine after a clean exact-lock
 // miss. Short ownership intervals normally resolve during bounded processor
 // pauses; after saturation, scheduling another goroutine prevents a descheduled
 // owner from being starved. Detector capabilities and tokens have already been
 // released before this function is called.
 //
 //go:nosplit
-func kolkovAtomicRMWRetry(delay *uint32) {
+func kolkovAtomicRetry(delay *uint32) {
 	if *delay == 0 {
 		*delay = 1
 	}
-	if *delay <= kolkovAtomicRMWRetryMaxDelay {
+	if *delay <= kolkovAtomicRetryMaxDelay {
 		procyield(*delay)
 		*delay <<= 1
 		return
@@ -463,26 +479,43 @@ func kolkovAtomicLoad32(addr *uint32, pc uintptr) (value uint32) {
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
-	systemstack(func() {
-		var revision, generation uint64
-		if synchronize && racectx > 1 && kolkovApiAtomicLoadFastBegin(uintptr(unsafe.Pointer(addr)), 4, pc, racectx, &token, &revision, &generation) {
-			value = atomic.Load(addr)
-			if kolkovApiAtomicLoadFastEnd(racectx, &token, revision, generation) {
-				context = racectx
+	fastAttempt := synchronize && racectx > 1
+	retryDelay := uint32(1)
+	for {
+		var retry bool
+		systemstack(func() {
+			if fastAttempt {
+				fastAttempt = false
+				var revision, generation uint64
+				if kolkovApiAtomicLoadFastBegin(uintptr(unsafe.Pointer(addr)), 4, pc, racectx, &token, &revision, &generation) {
+					value = atomic.Load(addr)
+					if kolkovApiAtomicLoadFastEnd(racectx, &token, revision, generation) {
+						context = racectx
+						return
+					}
+					value = 0
+				}
+			}
+			context, retry = kolkovAtomicLoadBegin(uintptr(unsafe.Pointer(addr)), 4, racectx, synchronize, &token)
+			if retry {
 				return
 			}
+			value = atomic.Load(addr)
+			if synchronize {
+				kolkovApiAtomicLoadEnd(uintptr(unsafe.Pointer(addr)), 4, pc, context, &token)
+			} else {
+				kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 4, pc, context, &token, false, false)
+			}
+		})
+		if racectx <= 1 && context > 1 {
+			gp.racectx = context
+			kolkovCacheShadowPtr()
+			racectx = context
 		}
-		context = kolkovAtomicLoadBegin(uintptr(unsafe.Pointer(addr)), 4, racectx, synchronize, &token)
-		value = atomic.Load(addr)
-		if synchronize {
-			kolkovApiAtomicLoadEnd(uintptr(unsafe.Pointer(addr)), 4, pc, context, &token)
-		} else {
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 4, pc, context, &token, false, false)
+		if !retry {
+			break
 		}
-	})
-	if racectx <= 1 && context > 1 {
-		gp.racectx = context
-		kolkovCacheShadowPtr()
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return value
@@ -501,26 +534,43 @@ func kolkovAtomicLoad64(addr *uint64, pc uintptr) (value uint64) {
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
-	systemstack(func() {
-		var revision, generation uint64
-		if synchronize && racectx > 1 && kolkovApiAtomicLoadFastBegin(uintptr(unsafe.Pointer(addr)), 8, pc, racectx, &token, &revision, &generation) {
-			value = atomic.Load64(addr)
-			if kolkovApiAtomicLoadFastEnd(racectx, &token, revision, generation) {
-				context = racectx
+	fastAttempt := synchronize && racectx > 1
+	retryDelay := uint32(1)
+	for {
+		var retry bool
+		systemstack(func() {
+			if fastAttempt {
+				fastAttempt = false
+				var revision, generation uint64
+				if kolkovApiAtomicLoadFastBegin(uintptr(unsafe.Pointer(addr)), 8, pc, racectx, &token, &revision, &generation) {
+					value = atomic.Load64(addr)
+					if kolkovApiAtomicLoadFastEnd(racectx, &token, revision, generation) {
+						context = racectx
+						return
+					}
+					value = 0
+				}
+			}
+			context, retry = kolkovAtomicLoadBegin(uintptr(unsafe.Pointer(addr)), 8, racectx, synchronize, &token)
+			if retry {
 				return
 			}
+			value = atomic.Load64(addr)
+			if synchronize {
+				kolkovApiAtomicLoadEnd(uintptr(unsafe.Pointer(addr)), 8, pc, context, &token)
+			} else {
+				kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 8, pc, context, &token, false, false)
+			}
+		})
+		if racectx <= 1 && context > 1 {
+			gp.racectx = context
+			kolkovCacheShadowPtr()
+			racectx = context
 		}
-		context = kolkovAtomicLoadBegin(uintptr(unsafe.Pointer(addr)), 8, racectx, synchronize, &token)
-		value = atomic.Load64(addr)
-		if synchronize {
-			kolkovApiAtomicLoadEnd(uintptr(unsafe.Pointer(addr)), 8, pc, context, &token)
-		} else {
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 8, pc, context, &token, false, false)
+		if !retry {
+			break
 		}
-	})
-	if racectx <= 1 && context > 1 {
-		gp.racectx = context
-		kolkovCacheShadowPtr()
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return value
@@ -536,30 +586,47 @@ func kolkovAtomicLoadUintptr(addr *uintptr, pc uintptr) (value uintptr) {
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
-	systemstack(func() {
-		var revision, generation uint64
-		if synchronize && racectx > 1 && kolkovApiAtomicLoadFastBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, racectx, &token, &revision, &generation) {
-			value = atomic.Loaduintptr(addr)
-			if kolkovApiAtomicLoadFastEnd(racectx, &token, revision, generation) {
-				context = racectx
+	fastAttempt := synchronize && racectx > 1
+	retryDelay := uint32(1)
+	for {
+		var retry bool
+		systemstack(func() {
+			if fastAttempt {
+				fastAttempt = false
+				var revision, generation uint64
+				if kolkovApiAtomicLoadFastBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, racectx, &token, &revision, &generation) {
+					value = atomic.Loaduintptr(addr)
+					if kolkovApiAtomicLoadFastEnd(racectx, &token, revision, generation) {
+						context = racectx
+						return
+					}
+					value = 0
+				}
+			}
+			// A second hardware load is reachable only after fast validation has
+			// rejected the speculative value. It must be repeated inside the locked
+			// Begin/End transaction so the acquired release matches that value's
+			// modification order.
+			context, retry = kolkovAtomicLoadBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+			if retry {
 				return
 			}
+			value = atomic.Loaduintptr(addr)
+			if synchronize {
+				kolkovApiAtomicLoadEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token)
+			} else {
+				kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, false, false)
+			}
+		})
+		if racectx <= 1 && context > 1 {
+			gp.racectx = context
+			kolkovCacheShadowPtr()
+			racectx = context
 		}
-		// A second hardware load is reachable only after fast validation has
-		// rejected the speculative value. It must be repeated inside the locked
-		// Begin/End transaction so the acquired release matches that value's
-		// modification order.
-		context = kolkovAtomicLoadBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
-		value = atomic.Loaduintptr(addr)
-		if synchronize {
-			kolkovApiAtomicLoadEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token)
-		} else {
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, false, false)
+		if !retry {
+			break
 		}
-	})
-	if racectx <= 1 && context > 1 {
-		gp.racectx = context
-		kolkovCacheShadowPtr()
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return value
@@ -575,26 +642,43 @@ func kolkovAtomicLoadPointer(addr *unsafe.Pointer, pc uintptr) (value unsafe.Poi
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
-	systemstack(func() {
-		var revision, generation uint64
-		if synchronize && racectx > 1 && kolkovApiAtomicLoadFastBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, racectx, &token, &revision, &generation) {
-			value = atomic.Loadp(unsafe.Pointer(addr))
-			if kolkovApiAtomicLoadFastEnd(racectx, &token, revision, generation) {
-				context = racectx
+	fastAttempt := synchronize && racectx > 1
+	retryDelay := uint32(1)
+	for {
+		var retry bool
+		systemstack(func() {
+			if fastAttempt {
+				fastAttempt = false
+				var revision, generation uint64
+				if kolkovApiAtomicLoadFastBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, racectx, &token, &revision, &generation) {
+					value = atomic.Loadp(unsafe.Pointer(addr))
+					if kolkovApiAtomicLoadFastEnd(racectx, &token, revision, generation) {
+						context = racectx
+						return
+					}
+					value = nil
+				}
+			}
+			context, retry = kolkovAtomicLoadBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+			if retry {
 				return
 			}
+			value = atomic.Loadp(unsafe.Pointer(addr))
+			if synchronize {
+				kolkovApiAtomicLoadEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token)
+			} else {
+				kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, false, false)
+			}
+		})
+		if racectx <= 1 && context > 1 {
+			gp.racectx = context
+			kolkovCacheShadowPtr()
+			racectx = context
 		}
-		context = kolkovAtomicLoadBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
-		value = atomic.Loadp(unsafe.Pointer(addr))
-		if synchronize {
-			kolkovApiAtomicLoadEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token)
-		} else {
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, false, false)
+		if !retry {
+			break
 		}
-	})
-	if racectx <= 1 && context > 1 {
-		gp.racectx = context
-		kolkovCacheShadowPtr()
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return value
@@ -611,14 +695,26 @@ func kolkovAtomicStore32(addr *uint32, value uint32, pc uintptr) {
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
-	systemstack(func() {
-		context = kolkovAtomicPlainBegin(uintptr(unsafe.Pointer(addr)), 4, racectx, false, synchronize, &token)
-		atomic.Store(addr, value)
-		kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 4, pc, context, &token, true, synchronize)
-	})
-	if racectx <= 1 && context > 1 {
-		gp.racectx = context
-		kolkovCacheShadowPtr()
+	retryDelay := uint32(1)
+	for {
+		var retry bool
+		systemstack(func() {
+			context, retry = kolkovAtomicStoreBegin(uintptr(unsafe.Pointer(addr)), 4, racectx, synchronize, &token)
+			if retry {
+				return
+			}
+			atomic.Store(addr, value)
+			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 4, pc, context, &token, true, synchronize)
+		})
+		if racectx <= 1 && context > 1 {
+			gp.racectx = context
+			kolkovCacheShadowPtr()
+			racectx = context
+		}
+		if !retry {
+			break
+		}
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 }
@@ -638,14 +734,26 @@ func kolkovAtomicStore64(addr *uint64, value uint64, pc uintptr) {
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
-	systemstack(func() {
-		context = kolkovAtomicPlainBegin(uintptr(unsafe.Pointer(addr)), 8, racectx, false, synchronize, &token)
-		atomic.Store64(addr, value)
-		kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 8, pc, context, &token, true, synchronize)
-	})
-	if racectx <= 1 && context > 1 {
-		gp.racectx = context
-		kolkovCacheShadowPtr()
+	retryDelay := uint32(1)
+	for {
+		var retry bool
+		systemstack(func() {
+			context, retry = kolkovAtomicStoreBegin(uintptr(unsafe.Pointer(addr)), 8, racectx, synchronize, &token)
+			if retry {
+				return
+			}
+			atomic.Store64(addr, value)
+			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 8, pc, context, &token, true, synchronize)
+		})
+		if racectx <= 1 && context > 1 {
+			gp.racectx = context
+			kolkovCacheShadowPtr()
+			racectx = context
+		}
+		if !retry {
+			break
+		}
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 }
@@ -661,14 +769,26 @@ func kolkovAtomicStoreUintptr(addr *uintptr, value uintptr, pc uintptr) {
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
-	systemstack(func() {
-		context = kolkovAtomicPlainBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, false, synchronize, &token)
-		atomic.Storeuintptr(addr, value)
-		kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, true, synchronize)
-	})
-	if racectx <= 1 && context > 1 {
-		gp.racectx = context
-		kolkovCacheShadowPtr()
+	retryDelay := uint32(1)
+	for {
+		var retry bool
+		systemstack(func() {
+			context, retry = kolkovAtomicStoreBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+			if retry {
+				return
+			}
+			atomic.Storeuintptr(addr, value)
+			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, true, synchronize)
+		})
+		if racectx <= 1 && context > 1 {
+			gp.racectx = context
+			kolkovCacheShadowPtr()
+			racectx = context
+		}
+		if !retry {
+			break
+		}
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 }
@@ -729,14 +849,26 @@ func kolkovAtomicStorePointer(addr *unsafe.Pointer, new unsafe.Pointer, pc uintp
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
-	systemstack(func() {
-		context = kolkovAtomicPlainBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, false, synchronize, &token)
-		kolkovAtomicStorePointerHardware(addr, new)
-		kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, true, synchronize)
-	})
-	if racectx <= 1 && context > 1 {
-		gp.racectx = context
-		kolkovCacheShadowPtr()
+	retryDelay := uint32(1)
+	for {
+		var retry bool
+		systemstack(func() {
+			context, retry = kolkovAtomicStoreBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+			if retry {
+				return
+			}
+			kolkovAtomicStorePointerHardware(addr, new)
+			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, true, synchronize)
+		})
+		if racectx <= 1 && context > 1 {
+			gp.racectx = context
+			kolkovCacheShadowPtr()
+			racectx = context
+		}
+		if !retry {
+			break
+		}
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	KeepAlive(addr)
@@ -776,7 +908,7 @@ func kolkovAtomicSwapPointer(addr *unsafe.Pointer, new unsafe.Pointer, pc uintpt
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	KeepAlive(addr)
@@ -818,7 +950,7 @@ func kolkovAtomicCASPointer(addr *unsafe.Pointer, old, new unsafe.Pointer, pc ui
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	KeepAlive(addr)
@@ -856,7 +988,7 @@ func kolkovAtomicSwap32(addr *uint32, new uint32, pc uintptr) (old uint32) {
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return old
@@ -894,7 +1026,7 @@ func kolkovAtomicSwap64(addr *uint64, new uint64, pc uintptr) (old uint64) {
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return old
@@ -929,7 +1061,7 @@ func kolkovAtomicSwapUintptr(addr *uintptr, new uintptr, pc uintptr) (old uintpt
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return old
@@ -964,7 +1096,7 @@ func kolkovAtomicCAS32(addr *uint32, old, new uint32, pc uintptr) (swapped bool)
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return swapped
@@ -1002,7 +1134,7 @@ func kolkovAtomicCAS64(addr *uint64, old, new uint64, pc uintptr) (swapped bool)
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return swapped
@@ -1037,7 +1169,7 @@ func kolkovAtomicCASUintptr(addr *uintptr, old, new uintptr, pc uintptr) (swappe
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return swapped
@@ -1072,7 +1204,7 @@ func kolkovAtomicAdd32(addr *uint32, delta uint32, pc uintptr) (value uint32) {
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return value
@@ -1110,7 +1242,7 @@ func kolkovAtomicAdd64(addr *uint64, delta uint64, pc uintptr) (value uint64) {
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return value
@@ -1145,7 +1277,7 @@ func kolkovAtomicAddUintptr(addr *uintptr, delta uintptr, pc uintptr) (value uin
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return value
@@ -1180,7 +1312,7 @@ func kolkovAtomicAnd32(addr *uint32, mask uint32, pc uintptr) (old uint32) {
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return old
@@ -1218,7 +1350,7 @@ func kolkovAtomicAnd64(addr *uint64, mask uint64, pc uintptr) (old uint64) {
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return old
@@ -1253,7 +1385,7 @@ func kolkovAtomicAndUintptr(addr *uintptr, mask uintptr, pc uintptr) (old uintpt
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return old
@@ -1288,7 +1420,7 @@ func kolkovAtomicOr32(addr *uint32, mask uint32, pc uintptr) (old uint32) {
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return old
@@ -1326,7 +1458,7 @@ func kolkovAtomicOr64(addr *uint64, mask uint64, pc uintptr) (old uint64) {
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return old
@@ -1361,7 +1493,7 @@ func kolkovAtomicOrUintptr(addr *uintptr, mask uintptr, pc uintptr) (old uintptr
 		if !retry {
 			break
 		}
-		kolkovAtomicRMWRetry(&retryDelay)
+		kolkovAtomicRetry(&retryDelay)
 	}
 	gp.raceguard--
 	return old

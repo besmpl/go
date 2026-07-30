@@ -58,6 +58,48 @@ func raceAtomicBeginLoad(addr, size, racectx uintptr, token *[8]unsafe.Pointer) 
 	return uintptr(unsafe.Pointer(ctx))
 }
 
+//go:linkname raceAtomicBeginLoadCooperative
+//go:nocheckptr
+func raceAtomicBeginLoadCooperative(addr, size, racectx uintptr, token *[8]unsafe.Pointer) (context uintptr, retry bool) {
+	if apiInitCalled.Load() == 0 {
+		ensureInitialized()
+	}
+	if enabled.Load() == 0 {
+		return 0, false
+	}
+	var ctx *goroutine.RaceContext
+	if racectx > 1 {
+		ctx = (*goroutine.RaceContext)(unsafe.Pointer(racectx))
+	} else {
+		ctx = getCurrentContext()
+	}
+	if token != nil {
+		retry = det.AtomicBeginLoadCooperative(addr, size, ctx, (*detector.AtomicToken)(token))
+	}
+	return uintptr(unsafe.Pointer(ctx)), retry
+}
+
+//go:linkname raceAtomicBeginStoreCooperative
+//go:nocheckptr
+func raceAtomicBeginStoreCooperative(addr, size, racectx uintptr, token *[8]unsafe.Pointer) (context uintptr, retry bool) {
+	if apiInitCalled.Load() == 0 {
+		ensureInitialized()
+	}
+	if enabled.Load() == 0 {
+		return 0, false
+	}
+	var ctx *goroutine.RaceContext
+	if racectx > 1 {
+		ctx = (*goroutine.RaceContext)(unsafe.Pointer(racectx))
+	} else {
+		ctx = getCurrentContext()
+	}
+	if token != nil {
+		retry = det.AtomicBeginStoreCooperative(addr, size, ctx, (*detector.AtomicToken)(token))
+	}
+	return uintptr(unsafe.Pointer(ctx)), retry
+}
+
 // raceAtomicBeginRMW is used only by enabled read-modify-write and
 // compare-and-swap operations. An aligned exact-mask operation may reuse an
 // existing capability, but a miss takes the general path and never enrolls.

@@ -136,3 +136,38 @@ func TestPureGoAtomicValueSwapContendedProgress(t *testing.T) {
 		t.Fatalf("final atomic.Value = %#v, want a swapped uint64", value.Load())
 	}
 }
+
+func TestPureGoAtomicValueLoadStoreContendedProgress(t *testing.T) {
+	const (
+		workers    = 16
+		operations = 250
+	)
+	var value atomic.Value
+	value.Store(uint64(1))
+	start := make(chan struct{})
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			<-start
+			for operation := 0; operation < operations; operation++ {
+				value.Store(uint64(worker*operations + operation + 1))
+				if _, ok := value.Load().(uint64); !ok {
+					panic("atomic.Value returned a non-uint64 value")
+				}
+			}
+		}(worker)
+	}
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	close(start)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("contended atomic.Value loads and stores did not make scheduler progress")
+	}
+}
