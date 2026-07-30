@@ -116,7 +116,7 @@ func TestNewRaceReport(t *testing.T) {
 
 // TestRaceReport_Format tests the Format() method.
 func TestRaceReport_Format(t *testing.T) {
-	addr := uintptr(0xabcdef123456)
+	addr := uintptr(0xabcdef12)
 	prevEpoch := epoch.NewEpoch(5, 100) // tid=5, clock=100
 	currEpoch := epoch.NewEpoch(7, 200) // tid=7, clock=200
 
@@ -130,8 +130,8 @@ func TestRaceReport_Format(t *testing.T) {
 			raceType: "write-write",
 			wantContains: []string{
 				"WARNING: DATA RACE",
-				"Write at 0x0000abcdef123456 by goroutine 7:",
-				"Previous Write at 0x0000abcdef123456 by goroutine 5:",
+				"Write at 0x00000000abcdef12 by goroutine 7:",
+				"Previous Write at 0x00000000abcdef12 by goroutine 5:",
 				// Phase 5 Task 5.2: Now has real stack traces
 				"TestRaceReport_Format",                       // Should appear in current access stack
 				"(previous access stack trace not available)", // Previous doesn't have stack
@@ -145,8 +145,8 @@ func TestRaceReport_Format(t *testing.T) {
 			raceType: "read-write",
 			wantContains: []string{
 				"WARNING: DATA RACE",
-				"Write at 0x0000abcdef123456 by goroutine 7:",
-				"Previous Read at 0x0000abcdef123456 by goroutine 5:",
+				"Write at 0x00000000abcdef12 by goroutine 7:",
+				"Previous Read at 0x00000000abcdef12 by goroutine 5:",
 			},
 		},
 		{
@@ -154,8 +154,8 @@ func TestRaceReport_Format(t *testing.T) {
 			raceType: "write-read",
 			wantContains: []string{
 				"WARNING: DATA RACE",
-				"Read at 0x0000abcdef123456 by goroutine 7:",
-				"Previous Write at 0x0000abcdef123456 by goroutine 5:",
+				"Read at 0x00000000abcdef12 by goroutine 7:",
+				"Previous Write at 0x00000000abcdef12 by goroutine 5:",
 			},
 		},
 	}
@@ -360,6 +360,18 @@ func BenchmarkCaptureStackTrace(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = captureStackTrace(5)
+	}
+}
+
+func TestRuntimeReportFrameAdapter(t *testing.T) {
+	pcs := captureStackTrace(1)
+	if len(pcs) == 0 {
+		t.Fatal("runtime caller adapter returned no PCs")
+	}
+	frames := runtimeCallersFramesReport(pcs)
+	pc, function, file, line, _ := runtimeFramesNextReport(frames)
+	if pc == 0 || function == "" || file == "" || line <= 0 {
+		t.Fatalf("runtime frame adapter returned incomplete frame: pc=%#x function=%q file=%q line=%d", pc, function, file, line)
 	}
 }
 

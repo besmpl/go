@@ -42,8 +42,8 @@ const detectorSpinlockMaxBackoff = uint32(64)
 
 // spinlock is the runtime-compatible detector lock. Failed acquisition polls
 // before CAS and uses bounded runtime backoff to avoid invalidating the owner’s
-// cache line continuously. runtimeKolkovSpinWait never enters the scheduler on
-// g0 and may yield a test/direct caller only at the saturated delay.
+// cache line continuously. runtimeKolkovSpinWait uses bounded procyield, then
+// an OS-thread yield at the saturated delay on g0.
 type spinlock struct {
 	state atomic.Uint32
 }
@@ -59,6 +59,11 @@ func (s *spinlock) lock() {
 			delay <<= 1
 		}
 	}
+}
+
+//go:nosplit
+func (s *spinlock) tryLock() bool {
+	return s.state.CompareAndSwap(0, 1)
 }
 
 //go:nosplit
@@ -166,6 +171,9 @@ type DetectorOptions struct {
 // for all memory locations) and goroutine contexts (tracking logical time
 // for each thread).
 type Detector struct {
+	// atomicArena owns every atomic history object and is reset only after the
+	// shadow lifecycle/capability gates have quiesced.
+	atomicArena *AtomicHistoryArena
 	// shadowMemory stores VarState cells for all instrumented addresses.
 	// This is the core data structure that tracks the last write and read
 	// epochs for every memory location.
@@ -269,6 +277,7 @@ func NewDetector() *Detector {
 func NewDetectorWithOptions(opts DetectorOptions) *Detector {
 	shadow := shadowmem.NewPageTableShadow()
 	d := &Detector{
+		atomicArena:  newAtomicHistoryArena(),
 		shadowMemory: shadow,
 		slotMemory:   shadow,
 		rangeMemory:  shadow,
@@ -459,7 +468,7 @@ func (d *Detector) onWriteSized(addr, size uintptr, ctx *goroutine.RaceContext, 
 	// GetOrCreate is thread-safe and may allocate on first access.
 	vs := d.slotMemory.GetOrCreateSlot(addr).Isolate(uint8(addr & 7))
 	var pending pendingRangeRace
-	captureAtomicWriteLocked(addr, 1, vs, ctx, pc, &pending)
+	d.captureAtomicWriteLocked(addr, 1, vs, ctx, pc, &pending)
 	d.applyOrdinaryWriteLocked(addr, vs, ctx, pc, &pending)
 	vs.UnlockAccess()
 	pending.report(d)
@@ -535,10 +544,11 @@ func (d *Detector) onReadSized(addr, size uintptr, ctx *goroutine.RaceContext, p
 	// ordinary compact no-op may seed an address-only cache entry. Changed
 	// compact histories remain uncached so their unexposed state can be reused.
 	if !marker {
-		if cacheableNoop, ok := d.rangeMemory.TryCompactRead(addr, ctx.GetEpoch(), ctx.C, pc); ok {
-			if cacheableNoop {
-				ctx.RecordAddressOnlyReadRange(addr, size)
-			}
+		switch d.rangeMemory.TryCompactRead(addr, ctx.GetEpoch(), ctx.C, pc) {
+		case shadowmem.CompactReadExactNoop:
+			ctx.RecordAddressOnlyReadRange(addr, size)
+			return
+		case shadowmem.CompactReadHandled:
 			return
 		}
 	}
@@ -547,7 +557,7 @@ func (d *Detector) onReadSized(addr, size uintptr, ctx *goroutine.RaceContext, p
 	// GetOrCreate is thread-safe and may allocate on first access.
 	vs := d.slotMemory.GetOrCreateSlot(addr).Isolate(uint8(addr & 7))
 	var pending pendingRangeRace
-	captureAtomicReadLocked(addr, 1, vs, ctx, pc, marker, &pending)
+	d.captureAtomicReadLocked(addr, 1, vs, ctx, pc, marker, &pending)
 	d.applyOrdinaryReadLocked(addr, vs, ctx, pc, &pending)
 	// Publish both the redundant-read address and the exact state generation
 	// while its access lock is retained. ClearRange drains that lock before
@@ -669,6 +679,7 @@ func (d *Detector) RacesDetected() int {
 //	// OnAcquire merges previous Unlock's clock into current thread
 //	x = 42     // Now happens-after previous critical section
 func (d *Detector) OnAcquire(addr uintptr, ctx *goroutine.RaceContext) {
+	next := ctx.PreflightClockAdvance()
 	// Periodic overflow detection runs on synchronization events.
 	// TID/clock overflow happens at clock advancement, not memory access.
 	d.checkOverflowPeriodically()
@@ -687,7 +698,7 @@ func (d *Detector) OnAcquire(addr uintptr, ctx *goroutine.RaceContext) {
 
 	// Step 3: Increment logical clock to advance time.
 	// This must be done AFTER joining to maintain happens-before invariant.
-	ctx.IncrementClock()
+	ctx.CommitClockAdvance(next)
 }
 
 // OnRelease handles synchronization release operations.
@@ -714,6 +725,7 @@ func (d *Detector) OnAcquire(addr uintptr, ctx *goroutine.RaceContext) {
 //	mu.Unlock()  // Compiler inserts: racerelease(&mu)
 //	// OnRelease captures current clock for next Lock to see
 func (d *Detector) OnRelease(addr uintptr, ctx *goroutine.RaceContext) {
+	next := ctx.PreflightClockAdvance()
 	// Periodic overflow detection runs on synchronization events.
 	d.checkOverflowPeriodically()
 
@@ -727,7 +739,7 @@ func (d *Detector) OnRelease(addr uintptr, ctx *goroutine.RaceContext) {
 
 	// Step 3: Increment logical clock to advance time.
 	// This must be done AFTER updating release clock to maintain happens-before.
-	ctx.IncrementClock()
+	ctx.CommitClockAdvance(next)
 }
 
 // OnReleaseMerge handles RWMutex read unlock operations.
@@ -765,6 +777,7 @@ func (d *Detector) OnRelease(addr uintptr, ctx *goroutine.RaceContext) {
 //	mu.Lock()    // Acquire (sees union of Reader 1 and Reader 2 clocks)
 //	x = 42       // Write happens-after both readers
 func (d *Detector) OnReleaseMerge(addr uintptr, ctx *goroutine.RaceContext) {
+	next := ctx.PreflightClockAdvance()
 	// Step 1: Get or create SyncVar for this mutex address.
 	syncVar := d.syncShadow.GetOrCreate(addr)
 
@@ -774,7 +787,7 @@ func (d *Detector) OnReleaseMerge(addr uintptr, ctx *goroutine.RaceContext) {
 	syncVar.MergeReleaseClock(ctx.C)
 
 	// Step 3: Increment logical clock to advance time.
-	ctx.IncrementClock()
+	ctx.CommitClockAdvance(next)
 }
 
 // ShadowGet returns the VarState for addr without creating it.
@@ -824,6 +837,7 @@ func (d *Detector) Reset() {
 
 	// Clear shadow memory.
 	d.shadowMemory.Reset()
+	d.atomicArena.reset()
 
 	// Clear sync shadow memory.
 	d.syncShadow.Reset()

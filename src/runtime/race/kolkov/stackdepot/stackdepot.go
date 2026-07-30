@@ -1,13 +1,5 @@
-// Package stackdepot implements stack trace storage and deduplication for race reports.
-//
-// Stack Depot is a global storage for stack traces that deduplicates identical stacks.
-// This saves memory by storing each unique stack only once, referenced by a 64-bit hash.
-//
-// Design (ThreadSanitizer v2 approach):
-//   - Fixed-size stack traces (8 frames, 64 bytes per stack)
-//   - Hash-based deduplication (FNV-1a hash)
-//   - CAS-based storage (runtime-compatible, no sync.Map)
-//   - Memory overhead: 64 bytes per unique stack + 8 bytes hash per VarState
+// Package stackdepot implements bounded stack trace storage and exact
+// deduplication for race reports.
 package stackdepot
 
 import (
@@ -15,169 +7,230 @@ import (
 	"unsafe"
 )
 
-// NOTE: We use runtime.Callers and runtime.CallersFrames via go:linkname
-// because this package is part of runtime and can access internal functions.
-
-//go:linkname runtimeCallers runtime.Callers
-func runtimeCallers(skip int, pc []uintptr) int
-
-//go:linkname runtimeCallersFrames runtime.CallersFrames
-func runtimeCallersFrames(callers []uintptr) *runtimeFrames
-
-type runtimeFrames struct{}
-
-//go:linkname runtimeFramesNext runtime.kolkovFramesNext
-func runtimeFramesNext(f *runtimeFrames) (pc uintptr, function, file string, line int, more bool)
-
 const (
-	// MaxFrames is the maximum number of stack frames to capture.
-	// ThreadSanitizer uses 8 frames as a good balance between detail and memory.
+	// MaxFrames is the maximum number of stack frames retained for a capture.
 	MaxFrames = 8
 
-	// depotSize is the number of slots in the stack depot.
-	depotSize = 65536
+	// depotSize is the maximum number of unique stacks retained in one
+	// generation. Stack IDs use a 1-based record index, so 17 bits are needed
+	// to represent every record while reserving ID zero as unavailable.
+	depotSize       = 65536
+	recordIndexBits = 17
+	recordIndexMask = uint64(1<<recordIndexBits) - 1
+	// maxGeneration is reserved as a terminal exhausted state. It is never
+	// encoded into an issued ID, so generation rollover cannot revive stale IDs.
+	maxGeneration = uint64(1<<(64-recordIndexBits)) - 1
+
+	// Hash buckets are bounded by the fixed record arena. Colliding records are
+	// linked through immutable record indexes, so lookup does not have an
+	// arbitrary probe limit.
+	bucketCount = 1024
 )
 
-// StackTrace represents a captured stack trace with fixed size.
-//
-// Memory layout: 8 × 8 bytes = 64 bytes per stack trace.
-// Stored in global depot, deduplicated by hash.
+// StackTrace is the report-facing view of a stored trace. Trailing entries are
+// zero. The exact frame count is retained in the depot record.
 type StackTrace struct {
-	PC [MaxFrames]uintptr // Program counters (64 bytes).
+	PC [MaxFrames]uintptr
 }
 
-// depotCell is a cell in the CAS-based stack depot.
-type depotCell struct {
-	hash  uint64
-	trace *StackTrace
+// depotRecord is initialized completely before ready and its bucket head are
+// published. It is never changed again during that generation.
+type depotRecord struct {
+	trace  StackTrace
+	hash   uint64
+	next   uint32 // 1-based record index, or zero at the end of the chain.
+	frames uint8
+	ready  atomic.Uint64 // generation; release-publishes all fields above.
 }
 
-// stackDepot is the global deduplication store for stack traces.
-// Uses CAS-based fixed-size array for runtime-compatible storage.
-var stackDepot [depotSize]atomic.Pointer[depotCell]
+type depotBucket struct {
+	lock atomic.Uint32
+	head atomic.Uint32 // 1-based record index.
+}
 
-// CaptureStack captures the current stack trace and returns its hash.
-//
-// The stack is stored in the global depot for later retrieval.
-// If the same stack was captured before, returns existing hash (deduplication).
-//
-// Returns:
-//   - uint64 hash: Unique identifier for this stack (0 if no stack available)
-//
-// Thread Safety: Safe for concurrent calls from multiple goroutines.
+var (
+	stackRecords    [depotSize]depotRecord
+	stackBuckets    [bucketCount]depotBucket
+	recordCount     atomic.Uint32
+	depotGeneration atomic.Uint64
+)
+
+// CaptureStack captures the current stack and returns an opaque stack ID.
+// Equal stacks in the current generation return the same ID. Zero means that
+// no stack was available, the fixed depot is full, or generations are
+// exhausted.
 func CaptureStack() uint64 {
-	// Capture current stack trace.
-	// Skip 2 frames: runtimeCallers itself + CaptureStack
 	var pcs [MaxFrames]uintptr
+	// Skip runtime.Callers and CaptureStack. The non-race runtime helper adjusts
+	// for its public-API wrapper.
 	n := runtimeCallers(2, pcs[:])
-
 	if n == 0 {
 		return 0
 	}
-
-	// Compute hash for deduplication (FNV-1a).
-	hash := hashStack(pcs[:n])
-
-	// Try to find or store in depot.
-	idx := hash & (depotSize - 1)
-
-	// Linear probe up to 8 slots.
-	for i := uint64(0); i < 8; i++ {
-		slot := (idx + i) & (depotSize - 1)
-		cellPtr := stackDepot[slot].Load()
-
-		// Found existing with same hash.
-		if cellPtr != nil && cellPtr.hash == hash {
-			return hash
-		}
-
-		// Empty slot - try to insert.
-		if cellPtr == nil {
-			trace := &StackTrace{PC: pcs}
-			newCell := &depotCell{hash: hash, trace: trace}
-			if stackDepot[slot].CompareAndSwap(nil, newCell) {
-				return hash
-			}
-			// CAS failed, check if same hash was inserted.
-			cellPtr = stackDepot[slot].Load()
-			if cellPtr != nil && cellPtr.hash == hash {
-				return hash
-			}
-		}
-	}
-
-	// Overflow - store anyway (rare).
-	trace := &StackTrace{PC: pcs}
-	newCell := &depotCell{hash: hash, trace: trace}
-	stackDepot[idx].Store(newCell)
-	return hash
+	return storeStack(pcs[:n], hashStack(pcs[:n]))
 }
 
-// GetStack retrieves a stack trace by hash.
-//
-// Returns nil if hash not found or is 0.
-//
-// Thread Safety: Safe for concurrent calls.
-func GetStack(hash uint64) *StackTrace {
-	if hash == 0 {
+// storeStack stores pcs using hash for bucket selection. Keeping the hash as
+// an input makes collision behavior directly testable; hash is never exposed
+// as stack identity.
+func storeStack(pcs []uintptr, hash uint64) uint64 {
+	if len(pcs) == 0 {
+		return 0
+	}
+	if len(pcs) > MaxFrames {
+		pcs = pcs[:MaxFrames]
+	}
+
+	generation := currentGeneration()
+	if generation == 0 {
+		return 0
+	}
+	bucket := &stackBuckets[hash&(bucketCount-1)]
+	lockBucket(bucket)
+	defer unlockBucket(bucket)
+
+	for recordIndex := bucket.head.LoadAcquire(); recordIndex != 0; {
+		record := &stackRecords[recordIndex-1]
+		if record.ready.Load() == generation &&
+			record.hash == hash && equalStack(record, pcs) {
+			return encodeID(generation, recordIndex)
+		}
+		recordIndex = record.next
+	}
+
+	recordIndex := reserveRecord()
+	if recordIndex == 0 {
+		return 0
+	}
+
+	record := &stackRecords[recordIndex-1]
+	record.trace.PC = [MaxFrames]uintptr{}
+	copy(record.trace.PC[:], pcs)
+	record.hash = hash
+	record.frames = uint8(len(pcs))
+	record.next = bucket.head.Load()
+
+	// Direct ID lookup synchronizes with ready. Bucket traversal synchronizes
+	// with head. Both publications happen only after every immutable field is
+	// initialized.
+	record.ready.Store(generation)
+	bucket.head.StoreRelease(recordIndex)
+	return encodeID(generation, recordIndex)
+}
+
+func equalStack(record *depotRecord, pcs []uintptr) bool {
+	if int(record.frames) != len(pcs) {
+		return false
+	}
+	for i, pc := range pcs {
+		if record.trace.PC[i] != pc {
+			return false
+		}
+	}
+	return true
+}
+
+func reserveRecord() uint32 {
+	for {
+		count := recordCount.Load()
+		if count >= depotSize {
+			return 0
+		}
+		if recordCount.CompareAndSwap(count, count+1) {
+			return count + 1
+		}
+	}
+}
+
+func lockBucket(bucket *depotBucket) {
+	for {
+		if bucket.lock.CompareAndSwap(0, 1) {
+			return
+		}
+		for bucket.lock.LoadAcquire() != 0 {
+		}
+	}
+}
+
+func unlockBucket(bucket *depotBucket) {
+	bucket.lock.StoreRelease(0)
+}
+
+func currentGeneration() uint64 {
+	for {
+		generation := depotGeneration.Load()
+		if generation == maxGeneration {
+			return 0
+		}
+		if generation != 0 {
+			return generation
+		}
+		if depotGeneration.CompareAndSwap(0, 1) {
+			return 1
+		}
+	}
+}
+
+func encodeID(generation uint64, recordIndex uint32) uint64 {
+	return generation<<recordIndexBits | uint64(recordIndex)
+}
+
+// GetStack retrieves the exact immutable record named by id. It does not
+// search by hash. IDs from older generations and malformed IDs are unavailable.
+func GetStack(id uint64) *StackTrace {
+	if id == 0 {
+		return nil
+	}
+	generation := id >> recordIndexBits
+	recordIndex := id & recordIndexMask
+	if generation == 0 || generation != depotGeneration.Load() ||
+		recordIndex == 0 || recordIndex > depotSize {
 		return nil
 	}
 
-	idx := hash & (depotSize - 1)
-
-	// Linear probe up to 8 slots.
-	for i := uint64(0); i < 8; i++ {
-		slot := (idx + i) & (depotSize - 1)
-		cellPtr := stackDepot[slot].Load()
-
-		if cellPtr == nil {
-			return nil
-		}
-
-		if cellPtr.hash == hash {
-			return cellPtr.trace
-		}
+	record := &stackRecords[recordIndex-1]
+	if record.ready.Load() != generation {
+		return nil
 	}
-
-	return nil
+	return &record.trace
 }
 
-// FNV-1a constants.
 const (
 	fnvOffset64 = 14695981039346656037
 	fnvPrime64  = 1099511628211
 )
 
-// hashStack computes FNV-1a hash of program counters.
-//
-// FNV-1a implementation without hash/fnv import (runtime-compatible).
+// hashStack computes FNV-1a over the exact frame count and PCs.
 //
 //go:nosplit
 func hashStack(pcs []uintptr) uint64 {
 	hash := uint64(fnvOffset64)
-
+	hash ^= uint64(len(pcs))
+	hash *= fnvPrime64
 	for _, pc := range pcs {
-		// Hash each byte of the PC.
-		pcBytes := (*[8]byte)(unsafe.Pointer(&pc))
-		for j := 0; j < 8; j++ {
-			hash ^= uint64(pcBytes[j])
+		for shift := uint(0); shift < uint(unsafe.Sizeof(pc))*8; shift += 8 {
+			hash ^= uint64(byte(pc >> shift))
 			hash *= fnvPrime64
 		}
 	}
-
 	return hash
 }
 
-// FormatStack formats a stack trace as a string for race reports.
-//
-// The output format matches Go's official race detector.
-// This function filters out runtime internal frames to show only user code.
+// FormatStack formats a trace in the form used by race reports and omits
+// runtime-internal frames.
 func (st *StackTrace) FormatStack() string {
 	if st == nil {
 		return "  <unknown>\n"
 	}
 
-	frames := runtimeCallersFrames(st.PC[:])
+	frameCount := 0
+	for frameCount < len(st.PC) && st.PC[frameCount] != 0 {
+		frameCount++
+	}
+	if frameCount == 0 {
+		return "  <runtime internal>\n"
+	}
+	frames := runtimeCallersFrames(st.PC[:frameCount])
 
 	result := ""
 	for {
@@ -185,92 +238,75 @@ func (st *StackTrace) FormatStack() string {
 		if pc == 0 {
 			break
 		}
-
-		// Skip runtime internal frames.
 		if hasPrefix(function, "runtime.") {
 			if !more {
 				break
 			}
 			continue
 		}
-
-		// Format: "  function_name()\n"
 		result += "  " + function + "()\n"
-
-		// Format: "      file.go:line\n"
 		result += "      " + file + ":" + itoa(line) + "\n"
-
 		if !more {
 			break
 		}
 	}
-
 	if result == "" {
 		return "  <runtime internal>\n"
 	}
-
 	return result
 }
 
-// hasPrefix checks if s starts with prefix (no strings import).
 func hasPrefix(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
 
-// itoa converts int to string (no fmt import).
 func itoa(n int) string {
 	if n == 0 {
 		return "0"
 	}
-
 	neg := n < 0
 	if neg {
 		n = -n
 	}
-
-	// Max int has 19 digits.
 	var buf [20]byte
 	i := len(buf)
-
 	for n > 0 {
 		i--
 		buf[i] = byte('0' + n%10)
 		n /= 10
 	}
-
 	if neg {
 		i--
 		buf[i] = '-'
 	}
-
 	return string(buf[i:])
 }
 
-// Reset clears the stack depot (for testing).
-//
-// Thread Safety: NOT safe for concurrent calls.
+// Reset starts an empty generation. It is not safe to call concurrently with
+// CaptureStack, GetStack, FormatStack, or Stats. Record storage may be reused
+// only after the generation has advanced, so every old ID becomes stale first.
+// At generation exhaustion, the depot remains unavailable rather than wrapping.
 func Reset() {
-	for i := range stackDepot {
-		stackDepot[i].Store(nil)
+	generation := depotGeneration.Load()
+	if generation == 0 {
+		generation = 1
+	} else if generation >= maxGeneration-1 {
+		generation = maxGeneration
+	} else {
+		generation++
 	}
+	depotGeneration.Store(generation)
+	for i := range stackBuckets {
+		stackBuckets[i].head.Store(0)
+		stackBuckets[i].lock.Store(0)
+	}
+	recordCount.Store(0)
 }
 
-// Stats returns statistics about the stack depot.
-//
-// Returns:
-//   - uniqueStacks: Number of unique stacks stored
-//   - totalMemory: Approximate memory usage in bytes
+// Stats reports occupied records and their fixed-record footprint. It does
+// not count unused capacity in the statically allocated arena.
 func Stats() (uniqueStacks int, totalMemory int64) {
-	for i := range stackDepot {
-		if stackDepot[i].Load() != nil {
-			uniqueStacks++
-		}
-	}
-
-	// Each StackTrace is 64 bytes (8 frames × 8 bytes).
-	// Plus overhead: ~24 bytes per cell (hash + pointer + padding).
-	const bytesPerStack = 64 + 24
-	totalMemory = int64(uniqueStacks) * bytesPerStack
-
+	uniqueStacks = int(recordCount.Load())
+	totalMemory = int64(uniqueStacks) * int64(unsafe.Sizeof(depotRecord{}))
 	return uniqueStacks, totalMemory
 }

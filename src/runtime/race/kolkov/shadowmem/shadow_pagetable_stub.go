@@ -56,8 +56,8 @@ func (pt *PageTableShadow) TryCompactWrite(_ uintptr, _ epoch.Epoch, _ *vectorcl
 }
 
 // TryCompactRead is unavailable without the direct page-table block layout.
-func (pt *PageTableShadow) TryCompactRead(_ uintptr, _ epoch.Epoch, _ *vectorclock.VectorClock, _ uintptr) (bool, bool) {
-	return false, false
+func (pt *PageTableShadow) TryCompactRead(_ uintptr, _ epoch.Epoch, _ *vectorclock.VectorClock, _ uintptr) CompactReadResult {
+	return CompactReadMiss
 }
 
 // AccessRange uses the exact slot protocol on architectures without the

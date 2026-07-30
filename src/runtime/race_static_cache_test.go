@@ -164,6 +164,62 @@ func main() {
 	}
 }
 
+// TestRaceStaticSizedReadOverlap verifies that the compiler's exact-width
+// scalar hook retains every byte in the static read cache. The atomic store
+// touches only the upper half of value, so start-address-only tracking would
+// miss the final conflicting read.
+func TestRaceStaticSizedReadOverlap(t *testing.T) {
+	goTool := testenv.GoToolPath(t)
+	src := filepath.Join(t.TempDir(), "main.go")
+	const program = `package main
+
+import (
+	"runtime"
+	"sync/atomic"
+	"unsafe"
+)
+
+var value uint64
+var ready uint32
+
+//go:noinline
+func readValue() uint64 { return value }
+
+func main() {
+	if readValue() == 42 {
+		panic("unreachable")
+	}
+	go func() {
+		upper := (*uint32)(unsafe.Pointer(uintptr(unsafe.Pointer(&value)) + 4))
+		atomic.StoreUint32(upper, 1)
+		runtime.RaceDisable()
+		atomic.StoreUint32(&ready, 1)
+		runtime.RaceEnable()
+	}()
+	runtime.RaceDisable()
+	for atomic.LoadUint32(&ready) == 0 {
+		runtime.Gosched()
+	}
+	runtime.RaceEnable()
+	if readValue() == 42 {
+		panic("unreachable")
+	}
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := testenv.Command(t, goTool, "run", "-race", src)
+	cmd.Env = append(withoutRaceBackendEnv(cmd.Environ()), "CGO_ENABLED=0", "GOMAXPROCS=2")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("partially overlapping static access unexpectedly succeeded:\n%s", out)
+	}
+	if !bytes.Contains(out, []byte("WARNING: DATA RACE")) {
+		t.Fatalf("partially overlapping static access did not report a race:\n%s", out)
+	}
+}
+
 // TestRaceStaticReadCacheFinalizerHandoff reproduces the one-way finalizer
 // synchronization that used to leave a source goroutine's static read cache
 // valid. A blocked first finalizer lets main queue the writing finalizer, seed

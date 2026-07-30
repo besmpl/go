@@ -165,6 +165,19 @@ func (c *compactGroups) groupLoad(slot int) *compactGroup {
 	return overflow[slot-compactInlineGroups].Load()
 }
 
+// groupLoadCached is the block-locked directory-scan counterpart of groupLoad.
+// The cold directory cannot be published or detached while the owning block
+// lock is held, so callers may load it once without changing node lifetimes.
+func (c *compactGroups) groupLoadCached(slot int, overflow *compactGroupOverflow) *compactGroup {
+	if slot < compactInlineGroups {
+		return c.groups[slot].Load()
+	}
+	if overflow == nil {
+		return nil
+	}
+	return overflow[slot-compactInlineGroups].Load()
+}
+
 // groupStore publishes one logical slot. A non-nil cold-tail store is an
 // ordinary detector allocation boundary reached only after palette migration
 // was attempted and rejected. Nil stores never allocate.
@@ -992,8 +1005,9 @@ func (c *compactGroups) clearRangeWithHistory(offset, size uintptr, defaultHasHi
 	membershipRepresented := false
 	var locked [compactGroupCapacity]*VarState
 	lockedCount := 0
+	overflow := c.overflow.Load()
 	for i := 0; i < compactGroupCapacity; i++ {
-		group := c.groupLoad(i)
+		group := c.groupLoadCached(i, overflow)
 		if group == nil || !group.intersects(start, end) {
 			continue
 		}
@@ -1239,8 +1253,9 @@ func (c *compactGroups) removeMembershipRange(offset, size uintptr) {
 		size = rangeBlockSize - start
 	}
 	end := start + size
+	overflow := c.overflow.Load()
 	for i := 0; i < compactGroupCapacity; i++ {
-		group := c.groupLoad(i)
+		group := c.groupLoadCached(i, overflow)
 		if group == nil {
 			continue
 		}

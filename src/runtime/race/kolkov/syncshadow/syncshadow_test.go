@@ -1,7 +1,10 @@
 package syncshadow
 
 import (
+	"internal/runtime/atomic"
+	"runtime"
 	"testing"
+	"time"
 
 	"runtime/race/kolkov/vectorclock"
 )
@@ -60,7 +63,7 @@ func TestGetOrCreate_DifferentAddresses(t *testing.T) {
 // collidingAddresses returns addresses that map to the same top-level hash
 // bucket. Keeping this in the package (rather than hard-coding addresses) makes
 // the collision regression independent of the particular hash mixer.
-func collidingAddresses(t *testing.T, count int) []uintptr {
+func collidingAddresses(t testing.TB, count int) []uintptr {
 	t.Helper()
 
 	target := fastHashSync(1)
@@ -119,6 +122,101 @@ func TestGetOrCreate_Concurrent(t *testing.T) {
 		if sv != firstSV {
 			t.Errorf("Concurrent GetOrCreate returned different SyncVar instances")
 		}
+	}
+
+	page := findPage(&shadow.buckets[fastHashSync(addr)], addr>>syncPageShift)
+	if page == nil {
+		t.Fatal("concurrent publication did not publish its page")
+	}
+	if got := findSyncVar(page, addr); got != firstSV {
+		t.Fatal("concurrent publication exposed a different cell identity")
+	}
+	if stats := shadow.Stats(); stats.LivePages != 1 || stats.LiveEntries != 1 {
+		t.Fatalf("concurrent publication cardinality = %+v, want 1 page and 1 entry", stats)
+	}
+}
+
+func TestSpinlockForcedFallbackAndProgress(t *testing.T) {
+	var lock spinlock
+	lock.lock()
+	if got := lock.state.Load(); got != 1 {
+		t.Fatalf("locked state = %d, want 1", got)
+	}
+
+	var fallbacks atomic.Uint64
+	acquired := make(chan struct{})
+	go func() {
+		lock.lockWithFallbackCounter(&fallbacks)
+		close(acquired)
+		lock.unlock()
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for fallbacks.Load() == 0 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if fallbacks.Load() == 0 {
+		lock.unlock()
+		select {
+		case <-acquired:
+		case <-time.After(2 * time.Second):
+		}
+		t.Fatal("forced contention did not reach the yielding fallback")
+	}
+
+	lock.unlock()
+	select {
+	case <-acquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not acquire after unlock")
+	}
+	if got := lock.state.Load(); got != 0 {
+		t.Fatalf("final lock state = %d, want 0", got)
+	}
+}
+
+func TestSpinlockContentionProgress(t *testing.T) {
+	const (
+		workers    = 16
+		iterations = 1000
+	)
+	var lock spinlock
+	var total int
+	start := make(chan struct{})
+	done := make(chan struct{}, workers)
+	for range workers {
+		go func() {
+			<-start
+			for range iterations {
+				lock.lock()
+				total++
+				lock.unlock()
+			}
+			done <- struct{}{}
+		}()
+	}
+	close(start)
+
+	timeout := time.After(5 * time.Second)
+	for range workers {
+		select {
+		case <-done:
+		case <-timeout:
+			t.Fatal("contending lock workers did not all make progress")
+		}
+	}
+	if want := workers * iterations; total != want {
+		t.Fatalf("protected total = %d, want %d", total, want)
+	}
+}
+
+func TestSpinlockUncontendedHasNoAllocations(t *testing.T) {
+	var lock spinlock
+	if allocs := testing.AllocsPerRun(1000, func() {
+		lock.lock()
+		lock.unlock()
+	}); allocs != 0 {
+		t.Fatalf("uncontended lock allocated %.2f times per acquisition", allocs)
 	}
 }
 
@@ -190,6 +288,81 @@ func TestClearRange_LargeSparseRange(t *testing.T) {
 	}
 	if got := shadow.GetOrCreate(outside); got != outsideState {
 		t.Fatal("large ClearRange removed the first out-of-range entry")
+	}
+}
+
+func TestSyncShadowQuiescentCardinality(t *testing.T) {
+	shadow := NewSyncShadow()
+	addrs := []uintptr{0x1010, 0x1020, 0x1080, 0x2010}
+	for _, addr := range addrs {
+		shadow.GetOrCreate(addr)
+	}
+	if got := shadow.Stats(); got.LivePages != 2 || got.LiveEntries != 4 {
+		t.Fatalf("initial cardinality = %+v, want 2 pages and 4 entries", got)
+	}
+
+	shadow.ClearRange(0x1010, 0x18)
+	if got := shadow.Stats(); got.LivePages != 2 || got.LiveEntries != 2 {
+		t.Fatalf("partial-clear cardinality = %+v, want 2 pages and 2 entries", got)
+	}
+	shadow.ClearRange(0x1080, 1)
+	if got := shadow.Stats(); got.LivePages != 1 || got.LiveEntries != 1 {
+		t.Fatalf("page-clear cardinality = %+v, want 1 page and 1 entry", got)
+	}
+
+	shadow.Reset()
+	if got := shadow.Stats(); got.LivePages != 0 || got.LiveEntries != 0 {
+		t.Fatalf("reset cardinality = %+v, want empty", got)
+	}
+}
+
+func TestClearRangeHasNoAllocations(t *testing.T) {
+	const runs = 1000
+	shadow := NewSyncShadow()
+	const base = uintptr(0x100000)
+	for i := 0; i <= runs; i++ { // AllocsPerRun performs one warmup call.
+		shadow.GetOrCreate(base + uintptr(i)<<syncPageShift)
+	}
+
+	next := 0
+	if allocs := testing.AllocsPerRun(runs, func() {
+		shadow.ClearRange(base+uintptr(next)<<syncPageShift, 1)
+		next++
+	}); allocs != 0 {
+		t.Fatalf("ClearRange allocated %.2f times per populated page", allocs)
+	}
+	if got := shadow.Stats(); got.LivePages != 0 || got.LiveEntries != 0 {
+		t.Fatalf("clear-all cardinality = %+v, want empty", got)
+	}
+}
+
+func TestClearRangeRetainsReaderSnapshotLifetime(t *testing.T) {
+	shadow := NewSyncShadow()
+	addr := uintptr(0x1234)
+	want := shadow.GetOrCreate(addr)
+	clock := vectorclock.New()
+	clock.Set(7, 19)
+	want.SetReleaseClock(clock)
+
+	page := findPage(&shadow.buckets[fastHashSync(addr)], addr>>syncPageShift)
+	if page == nil {
+		t.Fatal("published page disappeared before its reader snapshot")
+	}
+	cell := page.segments[segmentIndex(addr)].Load()
+	if cell == nil || cell.addr != addr || cell.syncVar != want {
+		t.Fatal("published cell did not contain the initialized identity")
+	}
+
+	shadow.ClearRange(addr, 1)
+	runtime.GC()
+	if cell.addr != addr || cell.syncVar != want {
+		t.Fatal("removed cell changed while retained by a reader snapshot")
+	}
+	if got := cell.syncVar.GetReleaseClock(); got == nil || got.Get(7) != 19 {
+		t.Fatal("removed cell lost its published happens-before state")
+	}
+	if fresh := shadow.GetOrCreate(addr); fresh == want {
+		t.Fatal("address reuse republished the removed identity")
 	}
 }
 
@@ -464,20 +637,4 @@ func TestSyncVarConcurrentReleaseAcquireSeesCompleteClock(t *testing.T) {
 	close(start)
 	<-done
 	<-done
-}
-
-// BenchmarkGetOrCreate_Cached measures the common synchronization lookup after
-// the address owner and its page index have been published.
-func BenchmarkGetOrCreate_Cached(b *testing.B) {
-	shadow := NewSyncShadow()
-	addr := uintptr(0x1234)
-	want := shadow.GetOrCreate(addr)
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if got := shadow.GetOrCreate(addr); got != want {
-			b.Fatal("cached lookup changed SyncVar identity")
-		}
-	}
 }

@@ -2,12 +2,14 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build race
+
 // Runtime-bridge goroutine ID extraction.
 //
 // This file provides fast goroutine ID extraction by calling directly into
 // the Go runtime via linkname. Since this package is compiled as part of
-// the Go runtime (runtime/race/kolkov/api), the runtime bridge function
-// kolkovGetGoid is always available.
+// the Go runtime (runtime/race/kolkov/api), the runtime bridge function is
+// available to race builds. Non-race unit tests use runtime.Stack instead.
 //
 // This replaces the previous approach of:
 //   - Assembly TLS access (goid_amd64.s, goid_arm64.s)
@@ -24,6 +26,8 @@
 package api
 
 import _ "unsafe" // for go:linkname
+
+const goroutineIDUsesRuntimeBridge = true
 
 // kolkovGetGoid returns the current goroutine's ID via runtime bridge.
 // The implementation is in runtime/race_kolkov_detector.go and uses

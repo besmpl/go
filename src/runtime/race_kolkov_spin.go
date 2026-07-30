@@ -8,9 +8,10 @@ import _ "unsafe" // for go:linkname
 
 // kolkovSpinWait backs the pure-Go race detector's runtime-compatible locks.
 // Production detector hooks run on g0, which cannot enter the goroutine
-// scheduler. Package tests and direct detector callers may run on a user
-// goroutine, where yielding at saturated backoff prevents a waiter from
-// monopolizing the only P while the lock owner is runnable.
+// scheduler. At saturated backoff they yield the OS thread instead. Package
+// tests and direct detector callers may run on a user goroutine, where yielding
+// to the goroutine scheduler prevents a waiter from monopolizing the only P
+// while the lock owner is runnable.
 //
 //go:linkname kolkovSpinWait
 //go:nosplit
@@ -21,9 +22,13 @@ func kolkovSpinWait(cycles uint32, yield bool) {
 	}
 
 	gp := getg()
-	if gp == gp.m.curg && canPreemptM(gp.m) {
-		Gosched()
+	if gp == gp.m.curg {
+		if canPreemptM(gp.m) {
+			Gosched()
+			return
+		}
+		procyield(cycles)
 		return
 	}
-	procyield(cycles)
+	osyield()
 }

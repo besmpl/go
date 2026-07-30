@@ -137,6 +137,33 @@ func TestClockOverflowFailsClosed(t *testing.T) {
 	}
 }
 
+func TestNextClockIsCheckOnly(t *testing.T) {
+	ResetOverflowFlags()
+	if got := NextClock(41); got != 42 {
+		t.Fatalf("NextClock(41) = %d, want 42", got)
+	}
+	_, overflow, _, near := CheckOverflows()
+	if overflow || near {
+		t.Fatalf("ordinary preflight changed overflow flags: overflow=%v near=%v", overflow, near)
+	}
+}
+
+func TestNextClockOverflowFailsClosed(t *testing.T) {
+	if os.Getenv("KOLKOV_NEXT_CLOCK_OVERFLOW") == "1" {
+		NextClock(MaxClock)
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestNextClockOverflowFailsClosed$")
+	cmd.Env = append(os.Environ(), "KOLKOV_NEXT_CLOCK_OVERFLOW=1")
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("NextClock(MaxClock) succeeded; output:\n%s", output)
+	}
+	if !strings.Contains(string(output), "race detector logical clock overflow") {
+		t.Fatalf("overflow output did not contain fail-closed diagnostic:\n%s", output)
+	}
+}
+
 func TestOverflowConstants(t *testing.T) {
 	if TIDBits != 32 || ClockBits != 32 || MaxTID != ^uint32(0) || MaxClock != uint64(^uint32(0)) {
 		t.Fatalf("unexpected epoch geometry: tidBits=%d clockBits=%d maxTID=%d maxClock=%d", TIDBits, ClockBits, MaxTID, MaxClock)

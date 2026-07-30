@@ -27,8 +27,9 @@ type atomicAccess struct {
 // sync.RWMutex marker read. Letting either implementation class replace a user
 // access could therefore hide a real mixed atomic/plain race.
 type atomicHistory struct {
-	user     map[uint32]atomicAccess
-	internal map[uint32]atomicAccess
+	arena    *AtomicHistoryArena
+	user     atomicHistoryClass
+	internal atomicHistoryClass
 }
 
 const atomicPCClassCacheSlots = 64
@@ -97,9 +98,6 @@ func pcHasFunctionPrefix(pc uintptr, prefix string) bool {
 	return runtimePCFunctionHasPrefix(pc, prefix)
 }
 
-//go:linkname runtimePCFunctionHasPrefix runtime.kolkovPCFunctionHasPrefix
-func runtimePCFunctionHasPrefix(pc uintptr, prefix string) bool
-
 const atomicReleaseDeltaCapacity = 64
 
 type atomicReleaseDelta struct {
@@ -129,14 +127,16 @@ func newAtomicReleaseStream() uint64 {
 // monotonic point updates. Once refs reaches zero, atomicState may recycle the
 // object and its buffers, but every reuse receives a new non-ABA stream.
 type atomicRelease struct {
-	runs    []vectorclock.FiniteRange
-	retired []vectorclock.RetiredRange
-	deltas  []atomicReleaseDelta
-	stream  uint64
-	version uint64
-	refs    uint8
-	deltaN  uint8
-	deltaAt uint8
+	arena    *AtomicHistoryArena
+	runs     *atomicReleaseRange
+	retired  *atomicReleaseRange
+	deltas   [atomicReleaseDeltaCapacity]atomicReleaseDelta
+	freeNext *atomicRelease
+	stream   uint64
+	version  uint64
+	refs     uint8
+	deltaN   uint8
+	deltaAt  uint8
 }
 
 // atomicState is deliberately separate from VarState's ordinary FastTrack
@@ -144,6 +144,10 @@ type atomicRelease struct {
 // other atomic operations. Copy-on-write ordinary groups may share this pointer:
 // its own transaction lock protects all width-aware per-lane state.
 type atomicState struct {
+	arena    *AtomicHistoryArena
+	handle   atomicArenaHandle
+	owners   uint32
+	freeNext *atomicState
 	// mu remains held across the hardware access. Distinct histories involved
 	// in one mixed-width operation are locked in stable pointer order.
 	mu     spinlock
@@ -164,8 +168,6 @@ type atomicState struct {
 	// releases contains the latest modification snapshot for each exact lane.
 	// All lanes written by one operation share one snapshot pointer.
 	releases [AtomicTokenSlots]*atomicRelease
-	recycled [AtomicTokenSlots]*atomicRelease
-	recycleN uint8
 
 	// writerRevision is even only between complete atomic modifications. A
 	// cached load may execute without mu only when it observes the same even
@@ -174,6 +176,24 @@ type atomicState struct {
 	// and release publication are complete.
 	writerRevision iatomic.Uint64
 	readFrontiers  *atomicReadFrontier
+
+	transactionAddr     uintptr
+	transactionSize     uintptr
+	transactionContext  *goroutine.RaceContext
+	transactionSyncMode int8 // -1 accepts ignored/general completion; 0/1 is exact.
+	transactionActive   bool
+}
+
+//go:nocheckptr
+func retainAtomicArenaState(p unsafe.Pointer) {
+	s := (*atomicState)(p)
+	s.arena.retainState(s)
+}
+
+//go:nocheckptr
+func releaseAtomicArenaState(p unsafe.Pointer) {
+	s := (*atomicState)(p)
+	s.arena.releaseState(s)
 }
 
 // atomicReadFrontier is one registered exact read witness. Identity fields are
@@ -182,12 +202,44 @@ type atomicState struct {
 // scan the list until the retained AtomicFastPath capability has drained.
 type atomicReadFrontier struct {
 	next       *atomicReadFrontier
+	freeNext   *atomicReadFrontier
+	arena      *AtomicHistoryArena
 	tid        uint32
 	mask       iatomic.Uint32
 	clock      iatomic.Uint32
 	generation iatomic.Uint64
 	pc         uintptr
 	internal   bool
+}
+
+func (s *atomicState) initHistories() {
+	s.reads.arena = s.arena
+	s.writes.arena = s.arena
+	s.plainReads.arena = s.arena
+	s.plainWrites.arena = s.arena
+}
+
+func (s *atomicState) beginTransaction(addr, size uintptr, ctx *goroutine.RaceContext, syncMode int8) {
+	if s.transactionActive {
+		atomicRuntimeThrow("race detector atomic transaction already active")
+	}
+	s.transactionAddr, s.transactionSize = addr, size
+	s.transactionContext, s.transactionSyncMode, s.transactionActive = ctx, syncMode, true
+}
+
+func (s *atomicState) validateTransaction(addr, size uintptr, ctx *goroutine.RaceContext, synchronize bool) {
+	if !s.transactionActive || s.transactionAddr != addr || s.transactionSize != size || s.transactionContext != ctx ||
+		(s.transactionSyncMode >= 0 && (s.transactionSyncMode == 1) != synchronize) {
+		atomicRuntimeThrow("race detector invalid or reused atomic transaction token")
+	}
+}
+
+func (s *atomicState) endTransaction() {
+	if !s.transactionActive {
+		atomicRuntimeThrow("race detector atomic transaction imbalance")
+	}
+	s.transactionAddr, s.transactionSize, s.transactionContext = 0, 0, nil
+	s.transactionSyncMode, s.transactionActive = 0, false
 }
 
 func (s *atomicState) beginWriter() {
@@ -227,8 +279,7 @@ func (s *atomicState) registerReadFrontier(ctx *goroutine.RaceContext, mask uint
 		}
 		node.generation.Store(generation + 1)
 	} else {
-		node = new(atomicReadFrontier)
-		node.generation.Store(1)
+		node = s.arena.allocFrontier()
 	}
 	node.next = s.readFrontiers
 	node.tid = ctx.TID
@@ -268,17 +319,13 @@ func (s *atomicState) foldReadFrontier(node *atomicReadFrontier, mask uint8) {
 	if node.internal {
 		frontier = &s.reads.internal
 	}
-	if *frontier == nil {
-		*frontier = make(map[uint32]atomicAccess)
-	}
-	access := (*frontier)[node.tid]
+	access := &frontier.insert(s.arena, node.tid).access
 	for lane := uint8(0); lane < AtomicTokenSlots; lane++ {
 		if mask&(uint8(1)<<lane) != 0 && clock >= access.clocks[lane] {
 			access.clocks[lane] = clock
 			access.pcs[lane] = node.pc
 		}
 	}
-	(*frontier)[node.tid] = access
 }
 
 func (s *atomicState) refreshReadFrontiers(mask uint8) {
@@ -344,12 +391,20 @@ func (s *atomicState) pruneReadFrontiers(ctx *goroutine.RaceContext, mask uint8)
 // detector locks retained or release a different transaction.
 type AtomicToken [AtomicTokenSlots]unsafe.Pointer
 
+// existingAtomicStateLocked decodes an overlay installed only by this package.
+// The arena handle check below validates the decoded layout before it is used.
+//
+//go:nocheckptr
 func existingAtomicStateLocked(vs *shadowmem.VarState) *atomicState {
 	p := vs.GetAtomicState()
 	if p == nil {
 		return nil
 	}
-	return (*atomicState)(p)
+	s := (*atomicState)(p)
+	if s.arena == nil || s.handle.generation != s.arena.generation || s.handle.index == 0 {
+		atomicRuntimeThrow("race detector stale atomic arena handle")
+	}
+	return s
 }
 
 func (s *atomicState) releaseMembership(release *atomicRelease) uint8 {
@@ -363,12 +418,12 @@ func (s *atomicState) releaseMembership(release *atomicRelease) uint8 {
 }
 
 func releaseHasForeignMetadata(release *atomicRelease, own uint32) bool {
-	for _, run := range release.runs {
-		if run.First != own || run.Last != own {
+	for run := release.runs; run != nil; run = run.next {
+		if run.first != own || run.last != own {
 			return true
 		}
 	}
-	if len(release.retired) != 0 {
+	if release.retired != nil {
 		// Retirement is +infinity causal metadata and is always part of the
 		// foreign projection proof, including malformed own-TID retirement.
 		return true
@@ -448,11 +503,35 @@ func (s *atomicState) acquire(ctx *goroutine.RaceContext, mask uint8) {
 			}
 		}
 
-		ctx.C.JoinCanonicalRanges(release.runs)
+		var finite [32]vectorclock.FiniteRange
+		n := 0
+		for run := release.runs; run != nil; run = run.next {
+			finite[n] = vectorclock.FiniteRange{First: run.first, Last: run.last, Clock: run.clock}
+			n++
+			if n == len(finite) {
+				ctx.C.JoinCanonicalRanges(finite[:])
+				n = 0
+			}
+		}
+		if n != 0 {
+			ctx.C.JoinCanonicalRanges(finite[:n])
+		}
 		// Retirement is +infinity causal metadata, not a finite MaxUint32
 		// clock. Apply it after finite joins so it remains immutable and drops
 		// any covered finite coordinates in the destination.
-		ctx.C.RetireRanges(release.retired)
+		var retired [32]vectorclock.RetiredRange
+		n = 0
+		for run := release.retired; run != nil; run = run.next {
+			retired[n] = vectorclock.RetiredRange{First: run.first, Last: run.last}
+			n++
+			if n == len(retired) {
+				ctx.C.RetireRanges(retired[:])
+				n = 0
+			}
+		}
+		if n != 0 {
+			ctx.C.RetireRanges(retired[:n])
+		}
 		if releaseHasForeignMetadata(release, ctx.TID) {
 			ctx.NoteForeignImport()
 		}
@@ -476,130 +555,117 @@ func (s *atomicState) retireReleases(mask uint8) {
 		s.releases[lane] = nil
 		old.refs--
 		if old.refs == 0 {
-			s.recycled[s.recycleN] = old
-			s.recycleN++
+			s.arena.freeReleaseObject(old)
 		}
 	}
 }
 
 func (s *atomicState) allocateRelease() *atomicRelease {
-	var release *atomicRelease
-	if s.recycleN != 0 {
-		s.recycleN--
-		release = s.recycled[s.recycleN]
-		s.recycled[s.recycleN] = nil
-		release.runs = release.runs[:0]
-		release.retired = release.retired[:0]
-		release.deltaN = 0
-		release.deltaAt = 0
-	} else {
-		release = new(atomicRelease)
+	if s.arena == nil {
+		// Direct package tests may exercise the release state machine without a
+		// Detector. Production states always arrive from Detector.atomicArena.
+		s.arena = newAtomicHistoryArena()
+		s.initHistories()
 	}
+	release := s.arena.allocRelease()
 	release.stream = newAtomicReleaseStream()
 	release.version = 1
 	return release
 }
 
 func snapshotAtomicRelease(release *atomicRelease, ctx *goroutine.RaceContext) {
-	release.runs = release.runs[:0]
-	release.retired = release.retired[:0]
+	release.arena.freeRangeList(release.runs)
+	release.arena.freeRangeList(release.retired)
+	release.runs, release.retired = nil, nil
+	var runTail **atomicReleaseRange = &release.runs
 	ctx.C.RangeRuns(func(first, last, clock uint32) bool {
-		release.runs = append(release.runs, vectorclock.FiniteRange{First: first, Last: last, Clock: clock})
+		n := release.arena.allocRange()
+		n.first, n.last, n.clock = first, last, clock
+		*runTail = n
+		runTail = &n.next
 		return true
 	})
+	var retiredTail **atomicReleaseRange = &release.retired
 	ctx.C.RangeRetired(func(first, last uint32) bool {
-		release.retired = append(release.retired, vectorclock.RetiredRange{First: first, Last: last})
+		n := release.arena.allocRange()
+		n.first, n.last = first, last
+		*retiredTail = n
+		retiredTail = &n.next
 		return true
 	})
 	release.deltaN = 0
 	release.deltaAt = 0
 }
 
-func deleteAtomicReleaseRun(runs []vectorclock.FiniteRange, index int) []vectorclock.FiniteRange {
-	copy(runs[index:], runs[index+1:])
-	runs[len(runs)-1] = vectorclock.FiniteRange{}
-	return runs[:len(runs)-1]
-}
-
-func mergeAtomicReleasePoint(runs []vectorclock.FiniteRange, index int) []vectorclock.FiniteRange {
-	if index > 0 && runs[index-1].Clock == runs[index].Clock && runs[index-1].Last != ^uint32(0) && runs[index-1].Last+1 == runs[index].First {
-		runs[index-1].Last = runs[index].Last
-		runs = deleteAtomicReleaseRun(runs, index)
-		index--
-	}
-	if index+1 < len(runs) && runs[index].Clock == runs[index+1].Clock && runs[index].Last != ^uint32(0) && runs[index].Last+1 == runs[index+1].First {
-		runs[index].Last = runs[index+1].Last
-		runs = deleteAtomicReleaseRun(runs, index+1)
-	}
-	return runs
-}
-
-func insertAtomicReleaseRuns(runs []vectorclock.FiniteRange, index, count int) []vectorclock.FiniteRange {
-	oldLen := len(runs)
-	for i := 0; i < count; i++ {
-		runs = append(runs, vectorclock.FiniteRange{})
-	}
-	copy(runs[index+count:], runs[index:oldLen])
-	return runs
-}
-
 // pointMaxAtomicRelease applies one monotonic coordinate update to canonical
-// ranges. Existing singleton owners take only a binary search and local edits;
-// onboarding a new owner may grow/shift the run buffer once.
+// ranges. The linked representation keeps every node at a stable arena address
+// and never allocates a backing slice during a runtime callback.
 func pointMaxAtomicRelease(release *atomicRelease, tid, clock uint32) bool {
-	runs := release.runs
-	lo, hi := 0, len(runs)
-	for lo < hi {
-		mid := int(uint(lo+hi) >> 1)
-		if runs[mid].Last < tid {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
+	link := &release.runs
+	var prev *atomicReleaseRange
+	for *link != nil && (*link).last < tid {
+		prev = *link
+		link = &(*link).next
 	}
-	index := lo
-	if index == len(runs) || runs[index].First > tid {
-		left := index > 0 && runs[index-1].Clock == clock && runs[index-1].Last != ^uint32(0) && runs[index-1].Last+1 == tid
-		right := index < len(runs) && runs[index].Clock == clock && tid != ^uint32(0) && tid+1 == runs[index].First
-		switch {
-		case left && right:
-			runs[index-1].Last = runs[index].Last
-			runs = deleteAtomicReleaseRun(runs, index)
-		case left:
-			runs[index-1].Last = tid
-		case right:
-			runs[index].First = tid
-		default:
-			runs = insertAtomicReleaseRuns(runs, index, 1)
-			runs[index] = vectorclock.FiniteRange{First: tid, Last: tid, Clock: clock}
+	cur := *link
+	if cur == nil || cur.first > tid {
+		left := prev != nil && prev.clock == clock && prev.last != ^uint32(0) && prev.last+1 == tid
+		right := cur != nil && cur.clock == clock && tid != ^uint32(0) && tid+1 == cur.first
+		if left && right {
+			prev.last, prev.next = cur.last, cur.next
+			cur.next = nil
+			release.arena.freeRangeList(cur)
+		} else if left {
+			prev.last = tid
+		} else if right {
+			cur.first = tid
+		} else {
+			n := release.arena.allocRange()
+			n.first, n.last, n.clock, n.next = tid, tid, clock, cur
+			*link = n
 		}
-		release.runs = runs
 		return true
 	}
-	old := runs[index]
-	if old.Clock >= clock {
+	if cur.clock >= clock {
 		return false
 	}
-	switch {
-	case old.First == tid && old.Last == tid:
-		runs[index].Clock = clock
-	case old.First == tid:
-		runs = insertAtomicReleaseRuns(runs, index, 1)
-		runs[index] = vectorclock.FiniteRange{First: tid, Last: tid, Clock: clock}
-		runs[index+1].First = tid + 1
-	case old.Last == tid:
-		runs = insertAtomicReleaseRuns(runs, index+1, 1)
-		runs[index].Last = tid - 1
-		runs[index+1] = vectorclock.FiniteRange{First: tid, Last: tid, Clock: clock}
-		index++
-	default:
-		runs = insertAtomicReleaseRuns(runs, index+1, 2)
-		runs[index].Last = tid - 1
-		runs[index+1] = vectorclock.FiniteRange{First: tid, Last: tid, Clock: clock}
-		runs[index+2] = vectorclock.FiniteRange{First: tid + 1, Last: old.Last, Clock: old.Clock}
-		index++
+	oldLast, oldClock, oldNext := cur.last, cur.clock, cur.next
+	if cur.first == tid && cur.last == tid {
+		cur.clock = clock
+	} else if cur.first == tid {
+		cur.first++
+		n := release.arena.allocRange()
+		n.first, n.last, n.clock, n.next = tid, tid, clock, cur
+		*link = n
+		cur = n
+	} else if cur.last == tid {
+		cur.last--
+		n := release.arena.allocRange()
+		n.first, n.last, n.clock, n.next = tid, tid, clock, oldNext
+		cur.next = n
+		cur = n
+	} else {
+		cur.last = tid - 1
+		middle := release.arena.allocRange()
+		right := release.arena.allocRange()
+		middle.first, middle.last, middle.clock = tid, tid, clock
+		right.first, right.last, right.clock, right.next = tid+1, oldLast, oldClock, oldNext
+		cur.next, middle.next = middle, right
+		cur = middle
 	}
-	release.runs = mergeAtomicReleasePoint(runs, index)
+	// Merge equal-clock neighbors created by the point update.
+	if prev != nil && prev.next == cur && prev.clock == cur.clock && prev.last != ^uint32(0) && prev.last+1 == cur.first {
+		prev.last, prev.next = cur.last, cur.next
+		cur.next = nil
+		release.arena.freeRangeList(cur)
+		cur = prev
+	}
+	if cur.next != nil && cur.clock == cur.next.clock && cur.last != ^uint32(0) && cur.last+1 == cur.next.first {
+		next := cur.next
+		cur.last, cur.next = next.last, next.next
+		next.next = nil
+		release.arena.freeRangeList(next)
+	}
 	return true
 }
 
@@ -612,9 +678,6 @@ func bumpAtomicReleaseVersion(release *atomicRelease) uint64 {
 }
 
 func appendAtomicReleaseDelta(release *atomicRelease, version uint64, tid, clock uint32) {
-	if release.deltas == nil {
-		release.deltas = make([]atomicReleaseDelta, atomicReleaseDeltaCapacity)
-	}
 	release.deltas[release.deltaAt] = atomicReleaseDelta{version: version, tid: tid, clock: clock}
 	release.deltaAt = (release.deltaAt + 1) % atomicReleaseDeltaCapacity
 	if release.deltaN < atomicReleaseDeltaCapacity {
@@ -692,23 +755,20 @@ func atomicAccessEmpty(access atomicAccess) bool {
 }
 
 func clearAtomicHistoryMask(history *atomicHistory, mask uint8) {
-	clearClass := func(frontier map[uint32]atomicAccess) {
-		for tid, access := range frontier {
+	clearClass := func(frontier *atomicHistoryClass) {
+		frontier.visit(func(entry *atomicHistoryEntry) bool {
+			access := &entry.access
 			for lane := uint8(0); lane < AtomicTokenSlots; lane++ {
 				if mask&(uint8(1)<<lane) != 0 {
-					access.clocks[lane] = 0
-					access.pcs[lane] = 0
+					access.clocks[lane], access.pcs[lane] = 0, 0
 				}
 			}
-			if atomicAccessEmpty(access) {
-				delete(frontier, tid)
-			} else {
-				frontier[tid] = access
-			}
-		}
+			return true
+		})
+		frontier.removeEmpty(history.arena)
 	}
-	clearClass(history.user)
-	clearClass(history.internal)
+	clearClass(&history.user)
+	clearClass(&history.internal)
 }
 
 // clearReboundMask forgets atomic history for lanes which are being attached
@@ -745,13 +805,13 @@ func (s *atomicState) publishReleaseUnlessPoisoned(ctx *goroutine.RaceContext, m
 // mutex access can replace only another internal access because an internal
 // witness may later be suppressed where the user witness would be reportable.
 func pruneAtomicAccess(history *atomicHistory, ctx *goroutine.RaceContext, mask uint8, currentInternal bool) {
-	prune := func(frontier map[uint32]atomicAccess) {
-		for tid, access := range frontier {
-			changed := false
+	prune := func(frontier *atomicHistoryClass) {
+		frontier.visit(func(entry *atomicHistoryEntry) bool {
+			access := &entry.access
 			// Every lane in one frontier entry has the same owner. Resolve its
 			// observed clock once rather than repeating the vector lookup for
 			// each byte of a 32- or 64-bit atomic access.
-			observed := ctx.C.Get(tid)
+			observed := ctx.C.Get(entry.tid)
 			for lane := uint8(0); lane < AtomicTokenSlots; lane++ {
 				if mask&(uint8(1)<<lane) == 0 {
 					continue
@@ -760,23 +820,16 @@ func pruneAtomicAccess(history *atomicHistory, ctx *goroutine.RaceContext, mask 
 				if clock != 0 && clock <= observed {
 					access.clocks[lane] = 0
 					access.pcs[lane] = 0
-					changed = true
 				}
 			}
-			if !changed {
-				continue
-			}
-			if atomicAccessEmpty(access) {
-				delete(frontier, tid)
-			} else {
-				frontier[tid] = access
-			}
-		}
+			return true
+		})
+		frontier.removeEmpty(history.arena)
 	}
 
-	prune(history.internal)
+	prune(&history.internal)
 	if !currentInternal {
-		prune(history.user)
+		prune(&history.user)
 	}
 }
 
@@ -793,44 +846,45 @@ func recordAtomicAccess(history *atomicHistory, ctx *goroutine.RaceContext, pc u
 	// only bounds the frontier; stale HB-dominated entries cannot manufacture a
 	// false negative and will be removed when a new TID is inserted. Avoiding a
 	// full map scan is the common path for long-lived atomic users.
-	if access, ok := (*frontier)[ctx.TID]; ok {
+	if entry, ok := frontier.find(ctx.TID); ok {
+		access := &entry.access
 		for lane := uint8(0); lane < AtomicTokenSlots; lane++ {
 			if mask&(uint8(1)<<lane) != 0 {
 				access.clocks[lane] = clock
 				access.pcs[lane] = pc
 			}
 		}
-		(*frontier)[ctx.TID] = access
 		return
 	}
 
 	pruneAtomicAccess(history, ctx, mask, internal)
-	if *frontier == nil {
-		*frontier = make(map[uint32]atomicAccess)
-	}
-	access := (*frontier)[ctx.TID]
+	access := &frontier.insert(history.arena, ctx.TID).access
 	for lane := uint8(0); lane < AtomicTokenSlots; lane++ {
 		if mask&(uint8(1)<<lane) != 0 {
 			access.clocks[lane] = clock
 			access.pcs[lane] = pc
 		}
 	}
-	(*frontier)[ctx.TID] = access
 }
 
-func firstConcurrentAtomicClass(history map[uint32]atomicAccess, ctx *goroutine.RaceContext, mask uint8) (epoch.Epoch, uintptr, uint8, bool) {
+func firstConcurrentAtomicClass(history *atomicHistoryClass, ctx *goroutine.RaceContext, mask uint8) (prev epoch.Epoch, pc uintptr, foundLane uint8, found bool) {
 	for lane := uint8(0); lane < AtomicTokenSlots; lane++ {
 		if mask&(uint8(1)<<lane) == 0 {
 			continue
 		}
-		for tid, access := range history {
-			clock := access.clocks[lane]
-			if clock > ctx.C.Get(tid) {
-				return epoch.NewEpoch(tid, uint64(clock)), access.pcs[lane], lane, true
+		history.visit(func(entry *atomicHistoryEntry) bool {
+			clock := entry.access.clocks[lane]
+			if clock > ctx.C.Get(entry.tid) {
+				prev, pc, foundLane, found = epoch.NewEpoch(entry.tid, uint64(clock)), entry.access.pcs[lane], lane, true
+				return false
 			}
+			return true
+		})
+		if found {
+			return
 		}
 	}
-	return 0, 0, 0, false
+	return
 }
 
 // firstConcurrentAtomic returns a user witness before considering an internal
@@ -839,10 +893,10 @@ func firstConcurrentAtomicClass(history map[uint32]atomicAccess, ctx *goroutine.
 // a genuine same-operation conflict. Within one reporting class, lane order is
 // deterministic while map iteration may choose any conflicting thread.
 func firstConcurrentAtomic(history atomicHistory, ctx *goroutine.RaceContext, mask uint8) (epoch.Epoch, uintptr, uint8, bool) {
-	if prev, pc, lane, conflict := firstConcurrentAtomicClass(history.user, ctx, mask); conflict {
+	if prev, pc, lane, conflict := firstConcurrentAtomicClass(&history.user, ctx, mask); conflict {
 		return prev, pc, lane, true
 	}
-	return firstConcurrentAtomicClass(history.internal, ctx, mask)
+	return firstConcurrentAtomicClass(&history.internal, ctx, mask)
 }
 
 // firstReportableConcurrentAtomic filters implementation-only conflicts before
@@ -852,13 +906,13 @@ func firstConcurrentAtomic(history atomicHistory, ctx *goroutine.RaceContext, ma
 // user read witness in the other history. User atomic witnesses are reportable
 // against every plain access and therefore retain priority.
 func firstReportableConcurrentAtomic(history atomicHistory, ctx *goroutine.RaceContext, mask uint8, plainPC uintptr) (epoch.Epoch, uintptr, uint8, bool) {
-	if prev, pc, lane, conflict := firstConcurrentAtomicClass(history.user, ctx, mask); conflict {
+	if prev, pc, lane, conflict := firstConcurrentAtomicClass(&history.user, ctx, mask); conflict {
 		return prev, pc, lane, true
 	}
 	if rwMutexMarkerPC(plainPC) {
 		return 0, 0, 0, false
 	}
-	return firstConcurrentAtomicClass(history.internal, ctx, mask)
+	return firstConcurrentAtomicClass(&history.internal, ctx, mask)
 }
 
 func exactConcurrentPlainRead(state *atomicState, ordinary *shadowmem.VarState, ctx *goroutine.RaceContext, mask uint8) (epoch.Epoch, uintptr, bool) {
@@ -866,11 +920,12 @@ func exactConcurrentPlainRead(state *atomicState, ordinary *shadowmem.VarState, 
 	var userPC, internalPC uintptr
 	classify := func(read epoch.Epoch) bool {
 		tid, clock := read.Decode()
-		for class, frontier := range [2]map[uint32]atomicAccess{state.plainReads.user, state.plainReads.internal} {
-			access, ok := frontier[tid]
+		for class, frontier := range [2]*atomicHistoryClass{&state.plainReads.user, &state.plainReads.internal} {
+			entry, ok := frontier.find(tid)
 			if !ok {
 				continue
 			}
+			access := entry.access
 			for lane := uint8(0); lane < AtomicTokenSlots; lane++ {
 				if mask&(uint8(1)<<lane) != 0 && access.clocks[lane] == uint32(clock) {
 					if class == 0 && userPrev == 0 {
@@ -958,7 +1013,7 @@ type atomicTokenGroup struct {
 // non-empty token must be completed according to AtomicToken's matching and
 // exactly-once contract.
 func (d *Detector) AtomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, acquire bool, token *AtomicToken) {
-	d.atomicBegin(addr, size, ctx, acquire, false, false, true, token)
+	d.atomicBegin(addr, size, ctx, acquire, false, false, true, true, -1, false, token)
 }
 
 // AtomicBeginRMW starts an enabled read-modify-write or compare-and-swap
@@ -968,7 +1023,17 @@ func (d *Detector) AtomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, a
 // Failed compare-and-swaps must complete through AtomicEndMode with write=false;
 // every AtomicBeginRMW token must be completed with synchronize=true.
 func (d *Detector) AtomicBeginRMW(addr, size uintptr, ctx *goroutine.RaceContext, acquire bool, token *AtomicToken) {
-	d.atomicBegin(addr, size, ctx, acquire, true, false, true, token)
+	d.atomicBegin(addr, size, ctx, acquire, true, false, true, true, 1, false, token)
+}
+
+// AtomicBeginRMWCooperative starts the public runtime RMW transaction. It is
+// identical to AtomicBeginRMW except when an exact retained capability exists
+// and another transaction holds its state lock: in that one case it releases
+// the capability without producing a token or changing detector state and asks
+// the user-goroutine wrapper to yield before retrying. Capability misses and
+// general or mixed-width transactions retain the authoritative blocking path.
+func (d *Detector) AtomicBeginRMWCooperative(addr, size uintptr, ctx *goroutine.RaceContext, acquire bool, token *AtomicToken) (retry bool) {
+	return d.atomicBegin(addr, size, ctx, acquire, true, false, true, true, 1, true, token)
 }
 
 // AtomicBeginPlain starts an aligned plain Load or Store transaction.
@@ -989,23 +1054,34 @@ func (d *Detector) AtomicBeginPlain(addr, size uintptr, ctx *goroutine.RaceConte
 	// End reveals whether a trusted direct caller performed a read or write, so
 	// conservatively bracket every locked transaction. Cache hits are the only
 	// path which may omit a revision transition.
-	d.atomicBegin(addr, size, ctx, acquire, synchronize, synchronize, true, token)
+	syncMode := int8(0)
+	if synchronize {
+		syncMode = 1
+	}
+	d.atomicBegin(addr, size, ctx, acquire, synchronize, synchronize, true, synchronize, syncMode, false, token)
 }
 
 // AtomicBeginLoad is the trusted enabled public-Load fallback. Unlike the
 // general Plain entry point its operation kind is known before hardware access,
 // so it need not perturb the writer revision and invalidate other readers.
 func (d *Detector) AtomicBeginLoad(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken) {
-	d.atomicBegin(addr, size, ctx, true, true, true, false, token)
+	d.atomicBegin(addr, size, ctx, true, true, true, false, false, 1, false, token)
 }
 
 func deactivateAtomicLoadEntry(entry goroutine.AtomicLoadCacheEntry) *atomicReadFrontier {
 	if entry.State == nil || entry.Frontier == nil {
 		return nil
 	}
+	frontier := (*atomicReadFrontier)(entry.Frontier)
+	// Sidecar retirement invalidates and recycles registered frontier nodes
+	// before reusing their owning state. Reject that stale cache entry without
+	// locking through its now-recyclable State pointer.
+	if frontier.generation.Load() != entry.Generation {
+		return nil
+	}
 	state := (*atomicState)(entry.State)
 	state.mu.lock()
-	spare := state.deactivateReadFrontier((*atomicReadFrontier)(entry.Frontier), entry.Generation)
+	spare := state.deactivateReadFrontier(frontier, entry.Generation)
 	state.mu.unlock()
 	return spare
 }
@@ -1098,7 +1174,12 @@ func DeactivateAtomicLoadCache(ctx *goroutine.RaceContext) {
 	for i := range ctx.AtomicLoadCache {
 		entry := ctx.AtomicLoadCache[i]
 		ctx.AtomicLoadCache[i] = goroutine.AtomicLoadCacheEntry{}
-		deactivateAtomicLoadEntry(entry)
+		if spare := deactivateAtomicLoadEntry(entry); spare != nil {
+			spare.arena.freeFrontierNode(spare)
+		} else if entry.State == nil && entry.Frontier != nil {
+			spare := (*atomicReadFrontier)(entry.Frontier)
+			spare.arena.freeFrontierNode(spare)
+		}
 	}
 	ctx.AtomicLoadCacheNext = 0
 }
@@ -1107,6 +1188,8 @@ func DeactivateAtomicLoadCache(ctx *goroutine.RaceContext) {
 // immutable AtomicFastPath capability but deliberately does not lock or inspect
 // atomicState release metadata. A hit is valid only at the exact even writer
 // revision imported by an earlier locked load on this context.
+//
+//go:nocheckptr
 func (d *Detector) AtomicBeginLoadFast(addr, size uintptr, ctx *goroutine.RaceContext, pc uintptr, token *AtomicToken) (uint64, uint64, bool) {
 	if token == nil {
 		return 0, 0, false
@@ -1162,6 +1245,7 @@ func (d *Detector) AtomicBeginLoadFast(addr, size uintptr, ctx *goroutine.RaceCo
 	}
 	token[0] = unsafe.Pointer(fast)
 	token[1] = unsafe.Pointer(frontier)
+	state.arena.pin()
 	return revision, generation, true
 }
 
@@ -1169,6 +1253,8 @@ func (d *Detector) AtomicBeginLoadFast(addr, size uintptr, ctx *goroutine.RaceCo
 // publishes its exact read witness before releasing the lifecycle capability.
 // False asks the runtime wrapper to discard the speculative value and repeat
 // the load through the existing locked transaction.
+//
+//go:nocheckptr
 func (d *Detector) AtomicEndLoadFast(ctx *goroutine.RaceContext, token *AtomicToken, revision, generation uint64) bool {
 	if ctx == nil || token == nil || token[0] == nil || token[1] == nil {
 		return false
@@ -1179,6 +1265,7 @@ func (d *Detector) AtomicEndLoadFast(ctx *goroutine.RaceContext, token *AtomicTo
 		for i := range token {
 			token[i] = nil
 		}
+		state.arena.unpin()
 		fast.Release()
 		return false
 	}
@@ -1187,6 +1274,7 @@ func (d *Detector) AtomicEndLoadFast(ctx *goroutine.RaceContext, token *AtomicTo
 		for i := range token {
 			token[i] = nil
 		}
+		state.arena.unpin()
 		fast.Release()
 		return false
 	}
@@ -1202,6 +1290,7 @@ func (d *Detector) AtomicEndLoadFast(ctx *goroutine.RaceContext, token *AtomicTo
 		for i := range token {
 			token[i] = nil
 		}
+		state.arena.unpin()
 		fast.Release()
 		return false
 	}
@@ -1209,6 +1298,7 @@ func (d *Detector) AtomicEndLoadFast(ctx *goroutine.RaceContext, token *AtomicTo
 	for i := range token {
 		token[i] = nil
 	}
+	state.arena.unpin()
 	fast.Release()
 	return true
 }
@@ -1217,15 +1307,21 @@ func (d *Detector) AtomicEndLoadFast(ctx *goroutine.RaceContext, token *AtomicTo
 // partially covered ordinary groups, locks each resulting equivalence group,
 // attaches the detector overlay while those locks are held, then locks distinct
 // atomic histories in stable pointer order across the hardware operation.
-func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, acquire, reuseFast, enrollFast, writer bool, token *AtomicToken) {
+func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, acquire, reuseFast, enrollFast, writer, advance bool, syncMode int8, cooperative bool, token *AtomicToken) (retry bool) {
 	if token == nil {
-		return
+		return false
 	}
 	for i := range token {
 		token[i] = nil
 	}
 	if ctx == nil || !validAtomicAccess(addr, size) {
-		return
+		return false
+	}
+	if advance {
+		// Validate exhaustion before the hardware access, release import, writer
+		// revision, or history publication. End validates the same successor and
+		// commits it only after all authoritative state is visible.
+		ctx.PreflightClockAdvance()
 	}
 
 	firstBase := addr &^ uintptr(7)
@@ -1236,7 +1332,16 @@ func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, a
 		if slot := d.slotMemory.GetSlot(addr); slot != nil {
 			if fast := slot.TryAtomicFast(fastMask); fast != nil {
 				state := (*atomicState)(fast.Overlay())
-				state.mu.lock()
+				if cooperative {
+					if !state.mu.tryLock() {
+						fast.Release()
+						return true
+					}
+				} else {
+					state.mu.lock()
+				}
+				state.arena.pin()
+				state.beginTransaction(addr, size, ctx, syncMode)
 				if writer {
 					state.beginWriter()
 				}
@@ -1248,7 +1353,7 @@ func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, a
 					state.acquire(ctx, fastMask)
 				}
 				token[0] = unsafe.Pointer(fast)
-				return
+				return false
 			}
 		}
 	}
@@ -1302,7 +1407,7 @@ func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, a
 					}
 					existing.mu.unlock()
 					for i := 0; i < setup.provisionalCount; i++ {
-						setup.provisional[i].SetAtomicState(unsafe.Pointer(existing))
+						setup.provisional[i].SetAtomicStateOwned(unsafe.Pointer(existing), retainAtomicArenaState, releaseAtomicArenaState)
 						setup.provisional[i] = nil
 						setup.provisionalMasks[i] = 0
 					}
@@ -1316,14 +1421,14 @@ func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, a
 				return
 			}
 			if setup.state == nil {
-				setup.state = &atomicState{base: base}
+				setup.state = d.atomicArena.newState(base)
 			}
 			if setup.fromExisting {
 				setup.state.mu.lock()
 				setup.state.clearReboundMask(groupMask)
 				setup.state.mu.unlock()
 			}
-			state.SetAtomicState(unsafe.Pointer(setup.state))
+			state.SetAtomicStateOwned(unsafe.Pointer(setup.state), retainAtomicArenaState, releaseAtomicArenaState)
 			if !setup.fromExisting {
 				setup.provisional[setup.provisionalCount] = state
 				setup.provisionalMasks[setup.provisionalCount] = groupMask
@@ -1352,6 +1457,8 @@ func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, a
 		if fast := firstSlot.TryAtomicFast(fastMask); fast != nil {
 			state := (*atomicState)(fast.Overlay())
 			state.mu.lock()
+			state.arena.pin()
+			state.beginTransaction(addr, size, ctx, syncMode)
 			if writer {
 				state.beginWriter()
 			}
@@ -1365,13 +1472,15 @@ func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, a
 				token[i] = nil
 			}
 			token[0] = unsafe.Pointer(fast)
-			return
+			return false
 		}
 	}
 
 	states, stateCount := atomicTokenStates(token, addr, size)
 	for i := 0; i < stateCount; i++ {
 		states[i].state.mu.lock()
+		states[i].state.arena.pin()
+		states[i].state.beginTransaction(addr, size, ctx, syncMode)
 		if writer {
 			states[i].state.beginWriter()
 		}
@@ -1379,6 +1488,7 @@ func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, a
 			states[i].state.acquire(ctx, states[i].mask)
 		}
 	}
+	return false
 }
 
 // AtomicEnd completes a normally synchronizing atomic operation. addr, size,
@@ -1405,11 +1515,18 @@ func (d *Detector) AtomicEndMode(addr, size uintptr, ctx *goroutine.RaceContext,
 }
 
 func (d *Detector) atomicEndMode(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken, pc uintptr, write, synchronize, cacheLoad bool) {
-	if ctx == nil || token == nil || !validAtomicAccess(addr, size) || token[0] == nil {
+	if token == nil || token[0] == nil {
 		return
+	}
+	if ctx == nil || !validAtomicAccess(addr, size) {
+		atomicRuntimeThrow("race detector invalid atomic transaction completion")
 	}
 	if pc == 0 {
 		pc = captureCallerPC()
+	}
+	var next uint64
+	if synchronize && write {
+		next = ctx.PreflightClockAdvance()
 	}
 	if fast := atomicFastToken(token); fast != nil {
 		d.atomicEndPlainFast(addr, size, ctx, token, fast, pc, write, synchronize, cacheLoad)
@@ -1417,8 +1534,14 @@ func (d *Detector) atomicEndMode(addr, size uintptr, ctx *goroutine.RaceContext,
 	}
 	current := ctx.GetEpoch()
 	internal := atomicInternalMutexPC(pc)
+	firstOrdinary := (*shadowmem.VarState)(token[0])
+	firstState := existingAtomicStateLocked(firstOrdinary)
+	firstState.validateTransaction(addr, size, ctx, synchronize)
 	groups, groupCount := atomicTokenGroups(token, addr, size)
 	states, stateCount := atomicTokenStates(token, addr, size)
+	for i := 0; i < stateCount; i++ {
+		states[i].state.validateTransaction(addr, size, ctx, synchronize)
+	}
 	for i := 0; i < stateCount; i++ {
 		entry := states[i]
 		if write {
@@ -1476,10 +1599,12 @@ func (d *Detector) atomicEndMode(addr, size uintptr, ctx *goroutine.RaceContext,
 	}
 
 	for i := stateCount - 1; i >= 0; i-- {
+		states[i].state.endTransaction()
 		if states[i].state.writerRevision.Load()&1 != 0 {
 			states[i].state.endWriter()
 		}
 		states[i].state.mu.unlock()
+		states[i].state.arena.unpin()
 	}
 	// Keep the ordinary generation retained through the same context/token
 	// bookkeeping covered by the fast capability gate. ClearRange drains these
@@ -1487,7 +1612,7 @@ func (d *Detector) atomicEndMode(addr, size uintptr, ctx *goroutine.RaceContext,
 	// publication while the corresponding atomic transaction is still live.
 	if synchronize {
 		if write {
-			ctx.IncrementClock()
+			ctx.CommitClockAdvance(next)
 		} else {
 			ctx.WeakenReadCache()
 		}
@@ -1516,7 +1641,12 @@ func atomicFastToken(token *AtomicToken) *shadowmem.AtomicFastPath {
 // admits at most one non-empty group, which is checked with the same predicates
 // as the locked path after the exact atomic frontier/release transition.
 func (d *Detector) atomicEndPlainFast(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken, fast *shadowmem.AtomicFastPath, pc uintptr, write, synchronize, cacheLoad bool) {
+	var next uint64
+	if synchronize && write {
+		next = ctx.PreflightClockAdvance()
+	}
 	state := (*atomicState)(fast.Overlay())
+	state.validateTransaction(addr, size, ctx, synchronize)
 	mask := fast.Mask()
 	internal := atomicInternalMutexPC(pc)
 	ordinaryMask := fast.OrdinaryMask()
@@ -1573,14 +1703,16 @@ func (d *Detector) atomicEndPlainFast(addr, size uintptr, ctx *goroutine.RaceCon
 	if state.writerRevision.Load()&1 != 0 {
 		state.endWriter()
 	}
+	state.endTransaction()
 	if loadFrontier != nil {
 		recordAtomicLoadCache(ctx, fast, state, loadFrontier, state.writerRevision.Load(), mask, pc, internal)
 	}
 	state.mu.unlock()
+	state.arena.unpin()
 
 	if synchronize {
 		if write {
-			ctx.IncrementClock()
+			ctx.CommitClockAdvance(next)
 		} else {
 			ctx.WeakenReadCache()
 		}
@@ -1595,6 +1727,11 @@ func (d *Detector) atomicEndPlainFast(addr, size uintptr, ctx *goroutine.RaceCon
 	pending.report(d)
 }
 
+// atomicTokenGroups and atomicTokenStates decode a runtime-constructed opaque
+// token after atomicEndMode has validated its address, width, and context.
+// Token entries are pointers retained from detector-owned objects by Begin.
+//
+//go:nocheckptr
 func atomicTokenGroups(token *AtomicToken, addr, size uintptr) ([AtomicTokenSlots]atomicTokenGroup, int) {
 	var groups [AtomicTokenSlots]atomicTokenGroup
 	count := 0
@@ -1622,6 +1759,7 @@ func atomicTokenGroups(token *AtomicToken, addr, size uintptr) ([AtomicTokenSlot
 	return groups, count
 }
 
+//go:nocheckptr
 func atomicTokenStates(token *AtomicToken, addr, size uintptr) ([AtomicTokenSlots]atomicTokenState, int) {
 	var states [AtomicTokenSlots]atomicTokenState
 	count := 0
@@ -1643,12 +1781,13 @@ func atomicTokenStates(token *AtomicToken, addr, size uintptr) ([AtomicTokenSlot
 			states[found].mask |= bit
 		}
 	}
-	// Distinct histories can interleave after mixed-width overlapping atomics.
-	// Pointer order is stable for every transaction; first-lane order is not.
+	// Lock exact physical words in ascending application-address order. Handle
+	// index is a stable tie-breaker for distinct surviving overlays at one word.
 	for i := 1; i < count; i++ {
 		entry := states[i]
 		j := i
-		for j > 0 && uintptr(unsafe.Pointer(states[j-1].state)) > uintptr(unsafe.Pointer(entry.state)) {
+		for j > 0 && (states[j-1].state.base > entry.state.base ||
+			(states[j-1].state.base == entry.state.base && states[j-1].state.handle.index > entry.state.handle.index)) {
 			states[j] = states[j-1]
 			j--
 		}
@@ -1669,32 +1808,27 @@ func firstMaskLane(mask uint8) uint8 {
 // captureAtomicReadLocked captures an ordinary read conflicting with a prior
 // atomic write. The caller holds vs's access lock; reporting is deferred until
 // after the ordinary access has been published and all locks are released.
-func captureAtomicReadLocked(addr, size uintptr, vs *shadowmem.VarState, ctx *goroutine.RaceContext, pc uintptr, marker bool, pending *pendingRangeRace) bool {
+func (d *Detector) captureAtomicReadLocked(addr, size uintptr, vs *shadowmem.VarState, ctx *goroutine.RaceContext, pc uintptr, marker bool, pending *pendingRangeRace) bool {
 	state := existingAtomicStateLocked(vs)
 	if state == nil {
 		if !marker {
 			return false
 		}
-		state = &atomicState{base: addr &^ uintptr(7)}
+		state = d.atomicArena.newState(addr &^ uintptr(7))
 		for _, read := range vs.GetReadEpochs() {
 			tid, clock := read.Decode()
-			access := state.plainReads.user[tid]
-			if state.plainReads.user == nil {
-				state.plainReads.user = make(map[uint32]atomicAccess)
-			}
+			access := &state.plainReads.user.insert(state.arena, tid).access
 			access.clocks[addr&7] = uint32(clock)
-			state.plainReads.user[tid] = access
 		}
 		if vs.IsPromoted() {
-			state.plainReads.user = make(map[uint32]atomicAccess)
+			state.plainReads.user.clear(state.arena)
 			vs.GetReadClock().Range(func(tid, clock uint32) bool {
-				access := state.plainReads.user[tid]
+				access := &state.plainReads.user.insert(state.arena, tid).access
 				access.clocks[addr&7] = clock
-				state.plainReads.user[tid] = access
 				return true
 			})
 		}
-		vs.SetAtomicState(unsafe.Pointer(state))
+		vs.SetAtomicStateOwned(unsafe.Pointer(state), retainAtomicArenaState, releaseAtomicArenaState)
 	}
 	mask := state.mask(addr, size)
 	if mask == 0 {
@@ -1716,7 +1850,7 @@ func captureAtomicReadLocked(addr, size uintptr, vs *shadowmem.VarState, ctx *go
 
 // captureAtomicWriteLocked detects an ordinary write conflicting with prior
 // atomic reads or writes without reporting under detector locks.
-func captureAtomicWriteLocked(addr, size uintptr, vs *shadowmem.VarState, ctx *goroutine.RaceContext, pc uintptr, pending *pendingRangeRace) bool {
+func (d *Detector) captureAtomicWriteLocked(addr, size uintptr, vs *shadowmem.VarState, ctx *goroutine.RaceContext, pc uintptr, pending *pendingRangeRace) bool {
 	state := existingAtomicStateLocked(vs)
 	if state == nil {
 		return false

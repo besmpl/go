@@ -41,19 +41,19 @@ func TestPageTableCompactPaletteReadNoopClassification(t *testing.T) {
 	}
 
 	const firstReadPC = uintptr(0xb001)
-	if cacheable, ok := pt.TryCompactRead(base, current, clock, firstReadPC); !ok || cacheable {
-		t.Fatalf("changed dense read = (%v,%v), want (false,true)", cacheable, ok)
+	if got := pt.TryCompactRead(base, current, clock, firstReadPC); got != CompactReadHandled {
+		t.Fatalf("changed dense read = %v, want handled", got)
 	}
-	if cacheable, ok := pt.TryCompactRead(base, current, clock, firstReadPC); !ok || !cacheable {
-		t.Fatalf("exact dense read no-op = (%v,%v), want (true,true)", cacheable, ok)
+	if got := pt.TryCompactRead(base, current, clock, firstReadPC); got != CompactReadExactNoop {
+		t.Fatalf("exact dense read no-op = %v, want exact no-op", got)
 	}
 
 	const changedReadPC = uintptr(0xb002)
-	if cacheable, ok := pt.TryCompactRead(base, current, clock, changedReadPC); !ok || cacheable {
-		t.Fatalf("changed-PC dense read = (%v,%v), want (false,true)", cacheable, ok)
+	if got := pt.TryCompactRead(base, current, clock, changedReadPC); got != CompactReadHandled {
+		t.Fatalf("changed-PC dense read = %v, want handled", got)
 	}
-	if cacheable, ok := pt.TryCompactRead(base, current, clock, changedReadPC); !ok || !cacheable {
-		t.Fatalf("repeated changed-PC dense read = (%v,%v), want (true,true)", cacheable, ok)
+	if got := pt.TryCompactRead(base, current, clock, changedReadPC); got != CompactReadExactNoop {
+		t.Fatalf("repeated changed-PC dense read = %v, want exact no-op", got)
 	}
 	if slot := pt.GetSlot(base); slot != nil {
 		t.Fatalf("dense read classification materialized exact slot %p", slot)
@@ -142,6 +142,51 @@ func TestCompactPaletteUniformMissingTargetAdoption(t *testing.T) {
 			t.Fatalf("tombstone anchor %d descriptor=%+v ok=%v, want R=%v PC=%#x lifecycle=%v",
 				anchor, descriptor, ok, reader, readPC, groups.lifecycle)
 		}
+	}
+}
+
+func TestCompactPaletteUniformSameEpochSizedWriteFallsBackOnlyForCompleteClass(t *testing.T) {
+	groups := newCompactGroups()
+	palette := new(compactPalette)
+	groups.palette.Store(palette)
+	current := epoch.NewEpoch(31, 9)
+	clock := compactTestClock(current)
+	const (
+		start = uintptr(64)
+		size  = uintptr(8)
+		pc    = uintptr(0x7350)
+	)
+	if !groups.tryRange(start, size, nil, current, clock, pc, true) {
+		t.Fatal("uniform sized write setup failed")
+	}
+	owner := palette.owner(start)
+	record := palette.shapeRecord(owner, false)
+	if record == nil || record.members != uint16(size) {
+		t.Fatalf("source owner=%d record=%+v", owner, record)
+	}
+	beforeRevision := groups.revision.Load()
+	beforeDescriptor, ok := palette.descriptor(start)
+	if !ok {
+		t.Fatal("source descriptor missing")
+	}
+	if groups.tryRange(start, size, nil, current, clock, pc, true) {
+		t.Fatal("complete same-epoch write class did not request authoritative fallback")
+	}
+	if groups.revision.Load() != beforeRevision {
+		t.Fatalf("fallback request changed revision: got %d want %d", groups.revision.Load(), beforeRevision)
+	}
+	for anchor := start; anchor < start+size; anchor++ {
+		descriptor, ok := palette.descriptor(anchor)
+		if !ok || descriptor != beforeDescriptor || palette.owner(anchor) != owner {
+			t.Fatalf("fallback request changed anchor %d: descriptor=%+v ok=%v owner=%d", anchor, descriptor, ok, palette.owner(anchor))
+		}
+	}
+
+	// A partial physical alias must remain compact: materializing it would split
+	// an equivalence class whose unselected members still resolve through the
+	// same dense record.
+	if !groups.tryRange(start, size/2, nil, current, clock, pc, true) {
+		t.Fatal("partial same-epoch alias unexpectedly requested fallback")
 	}
 }
 
@@ -1233,6 +1278,29 @@ func BenchmarkCompactPaletteUniformScalarReadWrite(b *testing.B) {
 		if !groups.tryRange(anchor, 8, nil, current, clock, readPC, false) ||
 			!groups.tryRange(anchor, 8, nil, current, clock, writePC, true) {
 			b.Fatal("uniform scalar transition fell back")
+		}
+	}
+}
+
+func BenchmarkCompactPaletteUniformSizedWriteFallback(b *testing.B) {
+	groups := newCompactGroups()
+	palette := new(compactPalette)
+	groups.palette.Store(palette)
+	current := epoch.NewEpoch(9, 2)
+	clock := compactTestClock(current)
+	const (
+		anchor = uintptr(3000)
+		size   = uintptr(8)
+		pc     = uintptr(0xd301)
+	)
+	if !groups.tryRange(anchor, size, nil, current, clock, pc, true) {
+		b.Fatal("uniform sized setup failed")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if groups.tryRange(anchor, size, nil, current, clock, pc, true) {
+			b.Fatal("same-epoch sized write did not request fallback")
 		}
 	}
 }

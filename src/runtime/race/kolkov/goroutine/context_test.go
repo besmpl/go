@@ -1,6 +1,9 @@
 package goroutine
 
 import (
+	"bytes"
+	"os"
+	"os/exec"
 	"testing"
 	"unsafe"
 
@@ -293,6 +296,68 @@ func TestIncrementClock(t *testing.T) {
 			verifyEpochCache(t, ctx, tt.tid, tt.wantClock, tt.increments)
 			verifyThreadIsolation(t, ctx)
 		})
+	}
+}
+
+func TestClockAdvancePreflightAndCommit(t *testing.T) {
+	ctx := Alloc(17)
+	defer ctx.C.Release()
+	const addr = uintptr(0x1700)
+	state := unsafe.Pointer(new(byte))
+	ctx.RecordRead(addr, state)
+
+	next := ctx.PreflightClockAdvance()
+	if next != 2 || ctx.C.Get(ctx.TID) != 1 || ctx.Epoch != epoch.NewEpoch(ctx.TID, 1) {
+		t.Fatalf("preflight mutated clock state: next=%d C=%d epoch=%s", next, ctx.C.Get(ctx.TID), ctx.Epoch)
+	}
+	slot := (addr >> 3) & (ReadCacheSlots - 1)
+	if ctx.ReadCache[slot] != addr || ctx.ReadCacheStates[slot] != state || ctx.ReadCacheWidths[slot] != 1 {
+		t.Fatal("preflight weakened the read cache")
+	}
+
+	ctx.CommitClockAdvance(next)
+	if ctx.C.Get(ctx.TID) != 2 || ctx.Epoch != epoch.NewEpoch(ctx.TID, 2) {
+		t.Fatalf("commit did not publish matching clock and epoch: C=%d epoch=%s", ctx.C.Get(ctx.TID), ctx.Epoch)
+	}
+	if ctx.ReadCacheStates[slot] != nil || ctx.ReadCacheWidths[slot] != ReadCacheWeakWidth|1 {
+		t.Fatal("commit did not weaken the prior-epoch cache")
+	}
+}
+
+func TestClockAdvanceRejectsNonSuccessor(t *testing.T) {
+	if os.Getenv("KOLKOV_NON_SUCCESSOR_CLOCK") == "1" {
+		ctx := Alloc(18)
+		ctx.CommitClockAdvance(3)
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestClockAdvanceRejectsNonSuccessor$")
+	cmd.Env = append(os.Environ(), "KOLKOV_NON_SUCCESSOR_CLOCK=1")
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("non-successor commit succeeded; output:\n%s", output)
+	}
+	if !bytes.Contains(output, []byte("race detector non-successor clock commit")) {
+		t.Fatalf("non-successor output did not contain fail-closed diagnostic:\n%s", output)
+	}
+}
+
+func TestClockAdvanceOverflowFailsBeforeCacheMutation(t *testing.T) {
+	if os.Getenv("KOLKOV_CONTEXT_CLOCK_OVERFLOW") == "1" {
+		ctx := Alloc(19)
+		ctx.C.Set(ctx.TID, ^uint32(0))
+		ctx.Epoch = epoch.NewEpoch(ctx.TID, epoch.MaxClock)
+		ctx.RecordRead(0x1900, unsafe.Pointer(new(byte)))
+		ctx.PreflightClockAdvance()
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestClockAdvanceOverflowFailsBeforeCacheMutation$")
+	cmd.Env = append(os.Environ(), "KOLKOV_CONTEXT_CLOCK_OVERFLOW=1")
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("overflowing preflight succeeded; output:\n%s", output)
+	}
+	if !bytes.Contains(output, []byte("race detector logical clock overflow")) {
+		t.Fatalf("overflow output did not contain fail-closed diagnostic:\n%s", output)
 	}
 }
 

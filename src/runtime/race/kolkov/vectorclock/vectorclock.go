@@ -382,6 +382,20 @@ func (vc *VectorClock) joinSparseRuns(other []finiteRun) {
 			return
 		}
 	}
+	// A growing frontier commonly contributes only TIDs above the receiver's
+	// current sparse maximum. Appending that suffix cannot overwrite unread
+	// receiver state, so retained destination capacity is safe to reuse.
+	if len(vc.sparseRuns) != 0 && vc.sparseRuns[len(vc.sparseRuns)-1].Last < otherFirst &&
+		!sparseRunsOverlapRetiredFrom(other, floor, vc.retired) {
+		for i, r := range other {
+			if i == 0 {
+				r.First = otherFirst
+			}
+			vc.sparseRuns = appendFiniteRun(vc.sparseRuns, r)
+		}
+		vc.maybePromoteDenseTail()
+		return
+	}
 
 	// Repeated release-merge/acquire frequently advances clocks without
 	// changing their run boundaries. Update that layout in place and coalesce
@@ -982,10 +996,27 @@ func (vc *VectorClock) RetireRanges(ranges []RetiredRange) {
 		return
 	}
 
-	merged := make([]RetiredRange, 0, len(vc.retired)+len(ranges))
+	// When destination capacity is reusable, move the old ranges behind the
+	// incoming prefix before merging toward the front. The prefix is exactly
+	// enough scratch space to keep every write behind both unread cursors.
+	// A reverse merge cannot merely coalesce with its immediate successor: a
+	// broad incoming range may subsume several already-emitted old intervals.
+	oldLen := len(vc.retired)
+	total := oldLen + len(ranges)
+	var merged []RetiredRange
+	var old []RetiredRange
+	if cap(vc.retired) < total {
+		merged = make([]RetiredRange, total)
+		old = vc.retired
+	} else {
+		merged = vc.retired[:total]
+		copy(merged[len(ranges):], merged[:oldLen])
+		old = merged[len(ranges):]
+	}
+	write := 0
 	appendRange := func(r RetiredRange) {
-		if n := len(merged); n != 0 {
-			last := &merged[n-1]
+		if write != 0 {
+			last := &merged[write-1]
 			if r.First <= last.Last || (last.Last != ^uint32(0) && r.First == last.Last+1) {
 				if r.Last > last.Last {
 					last.Last = r.Last
@@ -993,19 +1024,21 @@ func (vc *VectorClock) RetireRanges(ranges []RetiredRange) {
 				return
 			}
 		}
-		merged = append(merged, r)
+		merged[write] = r
+		write++
 	}
 	i, j := 0, 0
-	for i < len(vc.retired) || j < len(ranges) {
-		if j == len(ranges) || (i < len(vc.retired) && vc.retired[i].First <= ranges[j].First) {
-			appendRange(vc.retired[i])
+	for i < len(old) || j < len(ranges) {
+		if j == len(ranges) || (i < len(old) && old[i].First <= ranges[j].First) {
+			appendRange(old[i])
 			i++
 		} else {
 			appendRange(ranges[j])
 			j++
 		}
 	}
-	vc.retired = merged
+	clear(merged[write:])
+	vc.retired = merged[:write]
 	vc.dropRetiredFiniteEntries()
 }
 

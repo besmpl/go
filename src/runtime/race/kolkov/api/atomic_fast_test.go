@@ -83,3 +83,53 @@ func TestAtomicRMWBridgeMissNeverEnrolls(t *testing.T) {
 		raceAtomicEnd(addr, 8, 0x6200+uintptr(operation), ctx, &token, true, true)
 	}
 }
+
+func TestAtomicRMWCooperativeBridgeContentionReturnsCleanRetry(t *testing.T) {
+	Reset()
+	defer Reset()
+	Enable()
+	const addr = uintptr(0x7f3000)
+
+	var token [8]unsafe.Pointer
+	ctx := raceAtomicBeginPlain(addr, 8, 0, false, &token)
+	raceAtomicEnd(addr, 8, 0x6300, ctx, &token, true, true)
+
+	ctx = raceAtomicBeginRMW(addr, 8, ctx, true, &token)
+	if token[0] == nil || token[1] != nil {
+		t.Fatalf("blocking owner token = [%p %p], want exact capability", token[0], token[1])
+	}
+	var contender [8]unsafe.Pointer
+	contender[0] = unsafe.Pointer(new(byte))
+	gotContext, retry := raceAtomicBeginRMWCooperative(addr, 8, ctx, true, &contender)
+	if gotContext != ctx {
+		t.Fatalf("contention context = %#x, want %#x", gotContext, ctx)
+	}
+	if !retry {
+		t.Fatal("cooperative bridge contention did not request a retry")
+	}
+	for i, retained := range contender {
+		if retained != nil {
+			t.Fatalf("contention retained token[%d] = %p", i, retained)
+		}
+	}
+	raceAtomicEnd(addr, 8, 0x6301, ctx, &token, true, true)
+
+	gotContext, retry = raceAtomicBeginRMWCooperative(addr, 8, ctx, true, &contender)
+	if gotContext != ctx || retry {
+		t.Fatalf("uncontended cooperative begin = (%#x, %v), want (%#x, false)", gotContext, retry, ctx)
+	}
+	if contender[0] == nil || contender[1] != nil {
+		t.Fatalf("uncontended cooperative token = [%p %p], want exact capability", contender[0], contender[1])
+	}
+	raceAtomicEnd(addr, 8, 0x6302, ctx, &contender, true, true)
+
+	var miss [8]unsafe.Pointer
+	gotContext, retry = raceAtomicBeginRMWCooperative(addr+8, 8, ctx, true, &miss)
+	if gotContext != ctx || retry {
+		t.Fatalf("general cooperative miss = (%#x, %v), want (%#x, false)", gotContext, retry, ctx)
+	}
+	if miss[0] == nil || miss[1] == nil {
+		t.Fatalf("general cooperative miss token = [%p %p], want blocking transaction", miss[0], miss[1])
+	}
+	raceAtomicEnd(addr+8, 8, 0x6303, ctx, &miss, true, true)
+}

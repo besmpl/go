@@ -1,10 +1,14 @@
 package api
 
 import (
+	"bytes"
+	"os"
+	"os/exec"
 	"testing"
 	"unsafe"
 
 	"runtime/race/kolkov/goroutine"
+	"runtime/race/kolkov/vectorclock"
 )
 
 func TestFinalizerHandoffInvalidatesStrongAtomicReleaseProof(t *testing.T) {
@@ -227,10 +231,115 @@ func TestClearShadowMaintainsAddressLifecycleWhileDisabled(t *testing.T) {
 		t.Fatal("disabled allocator clear retained the old address lifetime")
 	}
 
-	Enable()
+	Reset()
 	det.OnWrite(addr, second, 0x202)
 	if got := det.RacesDetected(); got != 0 {
 		t.Fatalf("reused address inherited stale race history: got %d races", got)
+	}
+}
+
+func TestDirtyDisabledReenablesOnlyThroughQuiescentDrain(t *testing.T) {
+	Reset()
+	const rootedGID = int64(1<<52 + 501)
+	rooted := allocRegisteredContext(rootedGID)
+	detachedTID, detachedStart := allocTID()
+	detached := goroutine.AllocWithStartClock(detachedTID, detachedStart)
+	detachedPtr := uintptr(unsafe.Pointer(detached))
+	lifecycleMu.lock()
+	detachedContexts = map[uintptr]*goroutine.RaceContext{detachedPtr: detached}
+	delete(pendingTIDs, detachedTID)
+	lifecycleMu.unlock()
+	spawnClock := vectorclock.NewFromPool()
+	spawnClock.Set(rooted.TID, 7)
+	info := &spawnInfo{parentClock: spawnClock}
+	spawnContextsMu.lock()
+	spawnContextsSlice = append(spawnContextsSlice, info)
+	spawnContextsMu.unlock()
+	_, _ = allocTID() // leave one unpublished reservation for Reset to drain
+	highWater := nextTID.load64()
+
+	Disable()
+	if got := detectorLifecycle(lifecycleState.Load()); got != lifecycleDirtyDisabled || enabled.Load() != 0 {
+		t.Fatalf("Disable state = (%d,%d), want dirty-disabled", got, enabled.Load())
+	}
+	Reset()
+	Enable()
+	if got := detectorLifecycle(lifecycleState.Load()); got != lifecycleEnabled || enabled.Load() != 1 {
+		t.Fatalf("Enable state = (%d,%d), want enabled after drain", got, enabled.Load())
+	}
+	if rooted.C != nil || detached.C != nil || info.parentClock != nil {
+		t.Fatal("quiescent drain retained a rooted, detached, or pending spawn clock")
+	}
+	if _, ok := contextsMap.Load(rootedGID); ok {
+		t.Fatal("quiescent drain retained rooted context ownership")
+	}
+	lifecycleMu.lock()
+	gotDetached, gotPending := len(detachedContexts), len(pendingTIDs)
+	lifecycleMu.unlock()
+	spawnContextsMu.lock()
+	gotSpawns := len(spawnContextsSlice)
+	spawnContextsMu.unlock()
+	if gotDetached != 0 || gotPending != 0 || gotSpawns != 0 {
+		t.Fatalf("drain retained registries: detached=%d pending=%d spawns=%d", gotDetached, gotPending, gotSpawns)
+	}
+	if nextTID.load64() != highWater {
+		t.Fatalf("Reset rewound TID high-water: got %d want %d", nextTID.load64(), highWater)
+	}
+}
+
+func TestDirtyDisabledEnableFailsClosed(t *testing.T) {
+	if os.Getenv("KOLKOV_DIRTY_ENABLE") == "1" {
+		Reset()
+		Disable()
+		Enable()
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDirtyDisabledEnableFailsClosed$")
+	cmd.Env = append(os.Environ(), "KOLKOV_DIRTY_ENABLE=1")
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("Enable resumed dirty lifecycle; output:\n%s", output)
+	}
+	if !bytes.Contains(output, []byte("race detector dirty state requires quiescent Reset before Enable")) {
+		t.Fatalf("dirty Enable output did not contain fail-closed diagnostic:\n%s", output)
+	}
+}
+
+func TestRepeatedInitFiniResetNeverReusesTID(t *testing.T) {
+	var previous uint64
+	var priorContexts []*goroutine.RaceContext
+	for cycle := 0; cycle < 3; cycle++ {
+		Init()
+		if got := detectorLifecycle(lifecycleState.Load()); got != lifecycleEnabled {
+			t.Fatalf("cycle %d Init state = %d, want enabled", cycle, got)
+		}
+		ctx, ok := contextsMap.Load(getGoroutineID())
+		if !ok || ctx == nil || ctx.C == nil {
+			t.Fatalf("cycle %d Init did not root caller context", cycle)
+		}
+		if uint64(ctx.TID) <= previous {
+			t.Fatalf("cycle %d reused TID %d after %d", cycle, ctx.TID, previous)
+		}
+		for _, prior := range priorContexts {
+			if prior.C != nil {
+				t.Fatalf("cycle %d retained prior context clock", cycle)
+			}
+		}
+		previous = uint64(ctx.TID)
+		priorContexts = append(priorContexts, ctx)
+		Fini()
+		if got := detectorLifecycle(lifecycleState.Load()); got != lifecycleDirtyDisabled {
+			t.Fatalf("cycle %d Fini state = %d, want dirty-disabled", cycle, got)
+		}
+	}
+	Reset()
+	for _, prior := range priorContexts {
+		if prior.C != nil {
+			t.Fatal("final Reset retained a context clock")
+		}
+	}
+	if nextTID.load64() < previous {
+		t.Fatalf("final Reset rewound high-water below %d", previous)
 	}
 }
 

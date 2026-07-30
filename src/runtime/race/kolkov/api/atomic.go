@@ -69,6 +69,32 @@ func raceAtomicBeginRMW(addr, size, racectx uintptr, acquire bool, token *[8]uns
 	return atomicBegin(addr, size, racectx, acquire, atomicBeginRMW, token)
 }
 
+// raceAtomicBeginRMWCooperative is the public-runtime RMW entry point. A true
+// retry result is a clean exact-capability lock miss: token is empty and the
+// caller must leave systemstack, yield its user goroutine, and begin again.
+// General misses remain blocking and return a normal transaction token.
+//
+//go:linkname raceAtomicBeginRMWCooperative
+//go:nocheckptr
+func raceAtomicBeginRMWCooperative(addr, size, racectx uintptr, acquire bool, token *[8]unsafe.Pointer) (context uintptr, retry bool) {
+	if apiInitCalled.Load() == 0 {
+		ensureInitialized()
+	}
+	if enabled.Load() == 0 {
+		return 0, false
+	}
+	var ctx *goroutine.RaceContext
+	if racectx > 1 {
+		ctx = (*goroutine.RaceContext)(unsafe.Pointer(racectx))
+	} else {
+		ctx = getCurrentContext()
+	}
+	if token != nil {
+		retry = det.AtomicBeginRMWCooperative(addr, size, ctx, acquire, (*detector.AtomicToken)(token))
+	}
+	return uintptr(unsafe.Pointer(ctx)), retry
+}
+
 type atomicBeginMode uint8
 
 const (

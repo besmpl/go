@@ -10,6 +10,24 @@ import (
 	"runtime/race/kolkov/vectorclock"
 )
 
+func TestCompactReadResultDistinguishesMissHandledAndExactNoop(t *testing.T) {
+	pt := NewPageTableShadow()
+	const addr = uintptr(0x9b000)
+	current := epoch.NewEpoch(41, 1)
+	clock := vectorclock.New()
+	clock.Set(41, 1)
+	if got := pt.TryCompactRead(addr, current, clock, 0x7100); got != CompactReadHandled {
+		t.Fatalf("virgin compact read = %v, want handled", got)
+	}
+	if got := pt.TryCompactRead(addr, current, clock, 0x7100); got != CompactReadExactNoop {
+		t.Fatalf("identical compact read = %v, want exact no-op", got)
+	}
+	pt.GetOrCreate(addr)
+	if got := pt.TryCompactRead(addr, current, clock, 0x7100); got != CompactReadMiss {
+		t.Fatalf("materialized compact read = %v, want miss", got)
+	}
+}
+
 func TestCompactGroupsStorageLayout(t *testing.T) {
 	var groups compactGroups
 	if got := unsafe.Sizeof(groups); got != 96 {

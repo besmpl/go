@@ -26,7 +26,9 @@ func TestGetGoroutineID_Basic(t *testing.T) {
 	}
 }
 
-// TestGetGoroutineID_FastVsSlow validates runtime bridge against Stack parsing.
+// TestGetGoroutineID_FastVsSlow validates the selected implementation against
+// Stack parsing. Under race this compares the private bridge with the public
+// runtime result; without race both paths intentionally use public behavior.
 //
 // This is CRITICAL: if fast and slow paths disagree, the race detector
 // will malfunction (goroutines will be tracked incorrectly).
@@ -40,7 +42,9 @@ func TestGetGoroutineID_FastVsSlow(t *testing.T) {
 	// They MUST match exactly.
 	if fast != slow {
 		t.Errorf("Fast and slow paths disagree! fast=%d, slow=%d", fast, slow)
-		t.Error("This indicates a bug in the runtime bridge (kolkovGetGoid).")
+		if goroutineIDUsesRuntimeBridge {
+			t.Error("This indicates a bug in the runtime bridge (kolkovGetGoid).")
+		}
 	}
 }
 
@@ -293,6 +297,9 @@ func TestParseGID(t *testing.T) {
 //
 // The runtime bridge (getg().goid) must not allocate.
 func TestGetGoroutineID_NoAllocations(t *testing.T) {
+	if !goroutineIDUsesRuntimeBridge {
+		t.Skip("non-race identity intentionally uses runtime.Stack")
+	}
 	// Warm up
 	for i := 0; i < 100; i++ {
 		_ = getGoroutineIDFast()

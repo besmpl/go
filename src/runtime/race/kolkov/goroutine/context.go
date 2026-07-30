@@ -69,8 +69,9 @@ type AtomicLoadCacheEntry struct {
 //   - C: hybrid dense/sparse vector clock tracking observed logical IDs
 //   - Epoch: Cached value of C[TID] as compact 64-bit epoch
 //
-// Invariant: Epoch must ALWAYS equal epoch.NewEpoch(TID, C[TID]).
-// This invariant is maintained by IncrementClock() which atomically updates both.
+// Invariant: Epoch must ALWAYS equal epoch.NewEpoch(TID, C[TID]). The checked
+// PreflightClockAdvance/CommitClockAdvance pair maintains it; IncrementClock is
+// the convenience wrapper for operations with no other fallible mutation.
 type RaceContext struct {
 	// TID is a process-lifetime monotonic logical goroutine identifier. IDs
 	// are never recycled, because collapsing unrelated lifetimes onto one
@@ -131,7 +132,7 @@ type RaceContext struct {
 	AtomicLoadCache [AtomicLoadCacheSlots]AtomicLoadCacheEntry
 
 	// ForeignGeneration advances for every actual or conservative import into
-	// the context's non-own projection. IncrementClock changes only the owning
+	// the context's non-own projection. Own-clock commit changes only the owning
 	// coordinate and deliberately leaves this generation unchanged.
 	ForeignGeneration uint64
 
@@ -211,19 +212,44 @@ func Alloc(tid uint32) *RaceContext {
 //	ctx.IncrementClock()
 //	// ctx.C[5] = 3, ctx.Epoch = 3@5
 func (rc *RaceContext) IncrementClock() {
+	next := rc.PreflightClockAdvance()
+	rc.CommitClockAdvance(next)
+}
+
+// PreflightClockAdvance validates an own-clock advance without changing the
+// vector clock, epoch, or any context-owned cache. Compound detector operations
+// use the returned successor to order every possible failure before mutation.
+func (rc *RaceContext) PreflightClockAdvance() uint64 {
+	if rc == nil || rc.C == nil {
+		runtimeThrow("race detector clock advance on released context")
+	}
+	return epoch.NextClock(uint64(rc.C.Get(rc.TID)))
+}
+
+// CommitClockAdvance weakens epoch-scoped caches and publishes a previously
+// checked successor. A stale or fabricated value fails before any mutation.
+func (rc *RaceContext) CommitClockAdvance(next uint64) {
+	if rc == nil || rc.C == nil {
+		runtimeThrow("race detector clock advance on released context")
+	}
+	current := uint64(rc.C.Get(rc.TID))
+	if current >= epoch.MaxClock || next != current+1 || next > epoch.MaxClock {
+		runtimeThrow("race detector non-successor clock commit")
+	}
+
 	// A new synchronization epoch makes prior reads non-redundant, but retains
 	// their address and width as non-semantic hints. The detector can use a
 	// matching hint to materialize a compact history on the next read without
 	// making the runtime fast path accept the old epoch's entry.
 	rc.WeakenReadCache()
 
-	// Step 1: Increment the vector clock for this thread.
-	rc.C.Increment(rc.TID)
-	clock := rc.C.Get(rc.TID)
+	// Step 1: Publish the checked successor for this thread.
+	clock := uint32(next)
+	rc.C.Set(rc.TID, clock)
 
 	// Step 2: Update the cached epoch to match C[TID].
 	// This maintains the invariant: Epoch == epoch.NewEpoch(TID, C[TID]).
-	atomic.Store64((*uint64)(unsafe.Pointer(&rc.Epoch)), uint64(epoch.NewEpoch(rc.TID, uint64(clock))))
+	atomic.Store64((*uint64)(unsafe.Pointer(&rc.Epoch)), uint64(epoch.NewEpoch(rc.TID, next)))
 
 	// An observation of an older epoch cannot order accesses in this new one.
 	// Clear its marker when possible, while preserving an observation racing

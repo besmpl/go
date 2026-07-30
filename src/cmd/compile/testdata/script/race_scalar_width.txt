@@ -2,7 +2,7 @@
 
 # Inspect the generic SSA immediately after instrumentation. This avoids
 # depending on architecture-specific register allocation or assembly syntax.
-go tool compile -race -p=p -o scalar.o '-d=ssa/build/dump=Read1,ssa/build/dump=Write1,ssa/build/dump=Read2,ssa/build/dump=Write2,ssa/build/dump=Read4,ssa/build/dump=Write4,ssa/build/dump=Read8,ssa/build/dump=Write8,ssa/build/dump=ReadComposite,ssa/build/dump=WriteComposite' scalar.go
+go tool compile -race -p=p -o scalar.o '-d=ssa/build/dump=Read1,ssa/build/dump=Write1,ssa/build/dump=Read2,ssa/build/dump=Write2,ssa/build/dump=Read4,ssa/build/dump=Write4,ssa/build/dump=Read8,ssa/build/dump=Write8,ssa/build/dump=ReadComposite,ssa/build/dump=WriteComposite,ssa/build/dump=DeleteScalarKey' scalar.go
 ! stdout .
 ! stderr .
 
@@ -40,6 +40,19 @@ grep -count=1 'runtime.racereadrange}}' ReadComposite_01__build.dump
 grep -count=1 'Const(32|64) <uintptr> \[16\]' WriteComposite_01__build.dump
 grep -count=1 'runtime.racewriterange}}' WriteComposite_01__build.dump
 
+# Deletion reads both the global map header and scalar key at their exact width,
+# then invokes a mapdelete helper, which reaches runtime.raceReadObjectPC.
+grep -count=1 'Const(32|64) <uintptr> \[8\]' DeleteScalarKey_01__build.dump
+grep -count=2 'runtime.racereadn}}' DeleteScalarKey_01__build.dump
+grep -count=1 'runtime.mapdelete(_fast64)?}}' DeleteScalarKey_01__build.dump
+
+# The instrumented corpus must compile unchanged for both backend selections.
+env CGO_ENABLED=0
+go build -race -buildmode=archive -o scalar_purego.a scalar.go
+
+[cgo] env CGO_ENABLED=1
+[cgo] go build -race -buildmode=archive -o scalar_tsan.a scalar.go
+
 -- scalar.go --
 // Copyright 2026 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
@@ -52,6 +65,7 @@ var scalar2 uint16
 var scalar4 uint32
 var scalar8 uint64
 var composite [2]uint64
+var scalarMap = make(map[uint64]int)
 
 func Read1() byte              { return scalar1 }
 func Write1(x byte)            { scalar1 = x }
@@ -61,6 +75,7 @@ func Read4() uint32            { return scalar4 }
 func Write4(x uint32)          { scalar4 = x }
 func Read8() uint64            { return scalar8 }
 func Write8(x uint64)          { scalar8 = x }
+func DeleteScalarKey()         { delete(scalarMap, scalar8) }
 func ReadComposite() [2]uint64 { return composite }
 func WriteComposite(x [2]uint64) {
 	composite = x

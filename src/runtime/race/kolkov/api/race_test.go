@@ -7,8 +7,8 @@ import (
 
 // TestInit verifies global detector is initialized.
 func TestInit(t *testing.T) {
-	// Re-enable in case a previous test called Fini()
-	Enable()
+	// A previous test may have called Fini, leaving globally dirty state.
+	Reset()
 
 	if det == nil {
 		t.Fatal("Global detector not initialized")
@@ -310,8 +310,8 @@ func TestRaceRead_Disabled(t *testing.T) {
 		t.Errorf("raceread() when disabled changed race count: %d -> %d", racesBefore, racesAfter)
 	}
 
-	// Re-enable for other tests.
-	Enable()
+	// Re-enable only through an explicit quiescent reset.
+	Reset()
 }
 
 // TestRaceWrite_Disabled verifies racewrite is no-op when disabled.
@@ -330,12 +330,13 @@ func TestRaceWrite_Disabled(t *testing.T) {
 		t.Errorf("racewrite() when disabled changed race count: %d -> %d", racesBefore, racesAfter)
 	}
 
-	Enable()
+	Reset()
 }
 
 // TestEnableDisable verifies Enable/Disable functionality.
 func TestEnableDisable(t *testing.T) {
-	// Enable.
+	Reset()
+	// Enable is idempotent while already clean and enabled.
 	Enable()
 	if enabled.Load() == 0 {
 		t.Error("Enable() did not enable detector")
@@ -347,7 +348,8 @@ func TestEnableDisable(t *testing.T) {
 		t.Error("Disable() did not disable detector")
 	}
 
-	// Re-enable.
+	// A dirty lifecycle must be reset at an explicitly quiescent boundary.
+	Reset()
 	Enable()
 	if enabled.Load() == 0 {
 		t.Error("Re-Enable() did not enable detector")

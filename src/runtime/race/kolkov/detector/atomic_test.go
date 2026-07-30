@@ -950,6 +950,7 @@ func TestClearDropsOrdinaryPreStorePoisonGeneration(t *testing.T) {
 
 	completeAtomicSize(d, flag, 4, seed, false, true, 0x61c0)
 	old := atomicHistoryForTest(t, d, flag)
+	oldHandle := old.handle
 	d.OnWriteSized(flag, 4, plainWriter, 0x61c1)
 	if got := atomicHistoryCardinality(old.plainWrites); got == 0 {
 		t.Fatal("ordinary write did not seed pre-store poison")
@@ -958,8 +959,8 @@ func TestClearDropsOrdinaryPreStorePoisonGeneration(t *testing.T) {
 	d.ClearShadowRange(flag, 4)
 	completeAtomicSize(d, flag, 4, replacement, false, true, 0x61c2)
 	fresh := atomicHistoryForTest(t, d, flag)
-	if fresh == old {
-		t.Fatal("cleared address reused poisoned atomic overlay generation")
+	if fresh.handle == oldHandle {
+		t.Fatal("cleared address retained poisoned atomic overlay generation")
 	}
 	if got := atomicHistoryCardinality(fresh.plainWrites); got != 0 {
 		t.Fatalf("fresh atomic overlay inherited %d ordinary poison frontiers", got)
@@ -1199,15 +1200,16 @@ func TestAtomicSequentialFreshTIDRMWKeepsBoundedFrontierAndReleaseRuns(t *testin
 	if release == nil {
 		t.Fatal("sequential RMW chain published no release")
 	}
-	if len(release.runs) != 1 {
-		t.Fatalf("%d contiguous equal-clock TIDs encoded as %d runs, want 1", contexts, len(release.runs))
+	runs := atomicReleaseRunsForTest(release)
+	if len(runs) != 1 {
+		t.Fatalf("%d contiguous equal-clock TIDs encoded as %d runs, want 1", contexts, len(runs))
 	}
-	run := release.runs[0]
+	run := runs[0]
 	if run.First != firstTID || run.Last != firstTID+contexts-1 || run.Clock != 1 {
 		t.Fatalf("release run = [%d,%d]@%d, want [%d,%d]@1", run.First, run.Last, run.Clock, firstTID, firstTID+contexts-1)
 	}
-	if len(release.retired) != 0 {
-		t.Fatalf("fresh-TID chain unexpectedly encoded %d retired intervals", len(release.retired))
+	if retired := atomicReleaseRetiredForTest(release); len(retired) != 0 {
+		t.Fatalf("fresh-TID chain unexpectedly encoded %d retired intervals", len(retired))
 	}
 }
 
@@ -1222,14 +1224,15 @@ func TestAtomicReleasePreservesRetiredIntervals(t *testing.T) {
 	completeAtomicSize(d, addr, 8, writer, false, true, 0x2900)
 	state := atomicHistoryForTest(t, d, addr)
 	release := state.releases[0]
-	if release == nil || len(release.retired) != 1 {
+	if release == nil || len(atomicReleaseRetiredForTest(release)) != 1 {
 		t.Fatalf("published retired intervals = %+v, want one", release)
 	}
-	if got := release.retired[0]; got.First != retiredFirst || got.Last != retiredLast {
+	if got := atomicReleaseRetiredForTest(release)[0]; got.First != retiredFirst || got.Last != retiredLast {
 		t.Fatalf("published retired interval = [%d,%d], want [%d,%d]", got.First, got.Last, retiredFirst, retiredLast)
 	}
-	if len(release.runs) != 1 || release.runs[0].First != writer.TID || release.runs[0].Last != writer.TID {
-		t.Fatalf("retirement expanded into finite runs: %+v", release.runs)
+	runs := atomicReleaseRunsForTest(release)
+	if len(runs) != 1 || runs[0].First != writer.TID || runs[0].Last != writer.TID {
+		t.Fatalf("retirement expanded into finite runs: %+v", runs)
 	}
 
 	reader := goroutine.Alloc(91)
@@ -1244,8 +1247,9 @@ func TestAtomicReleasePreservesRetiredIntervals(t *testing.T) {
 	// than materializing all 100,000 logical IDs.
 	completeAtomicSize(d, addr, 8, reader, true, true, 0x2902)
 	republished := state.releases[0]
-	if len(republished.retired) != 1 || republished.retired[0].First != retiredFirst || republished.retired[0].Last != retiredLast {
-		t.Fatalf("republished retired intervals = %+v, want [%d,%d]", republished.retired, retiredFirst, retiredLast)
+	republishedRetired := atomicReleaseRetiredForTest(republished)
+	if len(republishedRetired) != 1 || republishedRetired[0].First != retiredFirst || republishedRetired[0].Last != retiredLast {
+		t.Fatalf("republished retired intervals = %+v, want [%d,%d]", republishedRetired, retiredFirst, retiredLast)
 	}
 }
 
@@ -1254,17 +1258,18 @@ func TestAtomicAcquireBulkJoinsFragmentedRelease(t *testing.T) {
 		first = uint32(50_000)
 		runs  = 4096
 	)
-	release := &atomicRelease{runs: make([]vectorclock.FiniteRange, runs)}
-	for i := range release.runs {
+	input := make([]vectorclock.FiniteRange, runs)
+	for i := range input {
 		tid := first + uint32(i)
-		release.runs[i] = vectorclock.FiniteRange{First: tid, Last: tid, Clock: uint32(i&1) + 1}
+		input[i] = vectorclock.FiniteRange{First: tid, Last: tid, Clock: uint32(i&1) + 1}
 	}
-	state := atomicState{}
+	a, release := atomicReleaseForTest(input)
+	state := atomicState{arena: a}
 	state.releases[0] = release
 	ctx := goroutine.Alloc(92)
 	state.acquire(ctx, 1)
 	for _, i := range []int{0, 1, runs / 2, runs - 1} {
-		r := release.runs[i]
+		r := input[i]
 		if got := ctx.C.Get(r.First); got != r.Clock {
 			t.Fatalf("fragmented acquire clock[%d] = %d, want %d", r.First, got, r.Clock)
 		}
@@ -1475,19 +1480,20 @@ func TestAtomicReleaseDeltaReplayCapacityBoundary(t *testing.T) {
 }
 
 func releaseClockForTest(release *atomicRelease, tid uint32) uint32 {
-	for _, run := range release.runs {
-		if run.First <= tid && tid <= run.Last {
-			return run.Clock
+	for run := release.runs; run != nil; run = run.next {
+		if run.first <= tid && tid <= run.last {
+			return run.clock
 		}
 	}
 	return 0
 }
 
 func TestAtomicReleasePointMaxMaintainsCanonicalRanges(t *testing.T) {
-	release := &atomicRelease{runs: []vectorclock.FiniteRange{
+	a, release := atomicReleaseForTest([]vectorclock.FiniteRange{
 		{First: 10, Last: 14, Clock: 1},
 		{First: 16, Last: 16, Clock: 3},
-	}}
+	})
+	_ = a
 	if !pointMaxAtomicRelease(release, 12, 2) {
 		t.Fatal("interior point max reported no change")
 	}
@@ -1497,8 +1503,8 @@ func TestAtomicReleasePointMaxMaintainsCanonicalRanges(t *testing.T) {
 		{First: 13, Last: 14, Clock: 1},
 		{First: 16, Last: 16, Clock: 3},
 	}
-	if !reflect.DeepEqual(release.runs, want) {
-		t.Fatalf("interior point ranges = %+v, want %+v", release.runs, want)
+	if got := atomicReleaseRunsForTest(release); !reflect.DeepEqual(got, want) {
+		t.Fatalf("interior point ranges = %+v, want %+v", got, want)
 	}
 	if !pointMaxAtomicRelease(release, 15, 3) {
 		t.Fatal("gap point max reported no change")
@@ -1509,8 +1515,8 @@ func TestAtomicReleasePointMaxMaintainsCanonicalRanges(t *testing.T) {
 		{First: 13, Last: 14, Clock: 1},
 		{First: 15, Last: 16, Clock: 3},
 	}
-	if !reflect.DeepEqual(release.runs, want) {
-		t.Fatalf("gap merge ranges = %+v, want %+v", release.runs, want)
+	if got := atomicReleaseRunsForTest(release); !reflect.DeepEqual(got, want) {
+		t.Fatalf("gap merge ranges = %+v, want %+v", got, want)
 	}
 	if pointMaxAtomicRelease(release, 12, 1) {
 		t.Fatal("decreasing point update changed canonical release")
@@ -1634,29 +1640,30 @@ func TestAtomicWarmedAlternatingDeltaStreamAllocatesZero(t *testing.T) {
 }
 
 func TestRecordAtomicAccessDefersPruneForExistingTID(t *testing.T) {
-	history := atomicHistory{user: make(map[uint32]atomicAccess)}
+	a := newAtomicHistoryArena()
+	history := atomicHistory{arena: a}
 	current := goroutine.Alloc(96)
 	const staleTID = uint32(97)
 	current.C.Set(staleTID, 3)
-	history.user[staleTID] = atomicAccess{clocks: [AtomicTokenSlots]uint32{3}}
-	history.user[current.TID] = atomicAccess{clocks: [AtomicTokenSlots]uint32{1}}
+	history.user.insert(a, staleTID).access = atomicAccess{clocks: [AtomicTokenSlots]uint32{3}}
+	history.user.insert(a, current.TID).access = atomicAccess{clocks: [AtomicTokenSlots]uint32{1}}
 
 	recordAtomicAccess(&history, current, 0x2b00, 1, false)
-	if _, ok := history.user[staleTID]; !ok {
+	if _, ok := history.user.find(staleTID); !ok {
 		t.Fatal("existing-TID update eagerly scanned and pruned the frontier")
 	}
-	if got := history.user[current.TID]; got.clocks[0] != current.C.Get(current.TID) || got.pcs[0] != 0x2b00 {
-		t.Fatalf("existing-TID witness = %+v, want current epoch/PC", got)
+	if entry, _ := history.user.find(current.TID); entry.access.clocks[0] != current.C.Get(current.TID) || entry.access.pcs[0] != 0x2b00 {
+		t.Fatalf("existing-TID witness = %+v, want current epoch/PC", entry.access)
 	}
 
 	// The next new-TID insertion performs the deferred bound-maintenance pass.
 	newcomer := goroutine.Alloc(98)
 	newcomer.C.Join(current.C)
 	recordAtomicAccess(&history, newcomer, 0x2b01, 1, false)
-	if _, ok := history.user[staleTID]; ok {
+	if _, ok := history.user.find(staleTID); ok {
 		t.Fatal("new-TID insertion did not prune the deferred HB-dominated witness")
 	}
-	if _, ok := history.user[newcomer.TID]; !ok {
+	if _, ok := history.user.find(newcomer.TID); !ok {
 		t.Fatal("new-TID insertion did not record its witness")
 	}
 }
@@ -1665,12 +1672,13 @@ func BenchmarkAtomicAcquireFragmentedRelease(b *testing.B) {
 	for _, runs := range []int{256, 4096} {
 		b.Run(strconv.Itoa(runs), func(b *testing.B) {
 			const first = uint32(50_000)
-			release := &atomicRelease{runs: make([]vectorclock.FiniteRange, runs)}
-			for i := range release.runs {
+			input := make([]vectorclock.FiniteRange, runs)
+			for i := range input {
 				tid := first + uint32(i)
-				release.runs[i] = vectorclock.FiniteRange{First: tid, Last: tid, Clock: uint32(i&1) + 1}
+				input[i] = vectorclock.FiniteRange{First: tid, Last: tid, Clock: uint32(i&1) + 1}
 			}
-			state := atomicState{}
+			a, release := atomicReleaseForTest(input)
+			state := atomicState{arena: a}
 			state.releases[0] = release
 			ctx := goroutine.Alloc(93)
 			state.acquire(ctx, 1) // Benchmark the dominated fragmented hot path.
@@ -2135,27 +2143,63 @@ func atomicHistoryForTest(t *testing.T, d *Detector, addr uintptr) *atomicState 
 }
 
 func atomicHistoryAccess(history atomicHistory, tid uint32) (atomicAccess, bool) {
-	if access, ok := history.user[tid]; ok {
-		return access, true
+	if entry, ok := history.user.find(tid); ok {
+		return entry.access, true
 	}
-	access, ok := history.internal[tid]
-	return access, ok
+	entry, ok := history.internal.find(tid)
+	if !ok {
+		return atomicAccess{}, false
+	}
+	return entry.access, true
 }
 
 func atomicHistoryCardinality(history atomicHistory) int {
-	return len(history.user) + len(history.internal)
+	count := 0
+	history.user.visit(func(*atomicHistoryEntry) bool { count++; return true })
+	history.internal.visit(func(*atomicHistoryEntry) bool { count++; return true })
+	return count
 }
 
 func atomicHistoryLaneCardinality(history atomicHistory, lane uint8) int {
 	count := 0
-	visit := func(frontier map[uint32]atomicAccess) {
-		for _, access := range frontier {
-			if access.clocks[lane] != 0 {
+	visit := func(frontier *atomicHistoryClass) {
+		frontier.visit(func(entry *atomicHistoryEntry) bool {
+			if entry.access.clocks[lane] != 0 {
 				count++
 			}
-		}
+			return true
+		})
 	}
-	visit(history.user)
-	visit(history.internal)
+	visit(&history.user)
+	visit(&history.internal)
 	return count
+}
+
+func atomicReleaseRunsForTest(release *atomicRelease) []vectorclock.FiniteRange {
+	var runs []vectorclock.FiniteRange
+	for n := release.runs; n != nil; n = n.next {
+		runs = append(runs, vectorclock.FiniteRange{First: n.first, Last: n.last, Clock: n.clock})
+	}
+	return runs
+}
+
+func atomicReleaseRetiredForTest(release *atomicRelease) []vectorclock.RetiredRange {
+	var runs []vectorclock.RetiredRange
+	for n := release.retired; n != nil; n = n.next {
+		runs = append(runs, vectorclock.RetiredRange{First: n.first, Last: n.last})
+	}
+	return runs
+}
+
+func atomicReleaseForTest(runs []vectorclock.FiniteRange) (*AtomicHistoryArena, *atomicRelease) {
+	a := newAtomicHistoryArena()
+	r := a.allocRelease()
+	var tail **atomicReleaseRange = &r.runs
+	for _, run := range runs {
+		n := a.allocRange()
+		n.first, n.last, n.clock = run.First, run.Last, run.Clock
+		*tail = n
+		tail = &n.next
+	}
+	return a, r
 }

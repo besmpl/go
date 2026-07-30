@@ -1,6 +1,9 @@
 package api
 
 import (
+	"bytes"
+	"os"
+	"os/exec"
 	"testing"
 	"unsafe"
 
@@ -76,6 +79,42 @@ func TestTIDAllocationPast65535Lifetimes(t *testing.T) {
 	}
 	if got := nextTID.Load(); got != base+lifetimes {
 		t.Fatalf("last issued TID = %d, want %d", got, base+lifetimes)
+	}
+}
+
+func TestTIDExhaustionFailsBeforeSentinel(t *testing.T) {
+	if os.Getenv("KOLKOV_TID_EXHAUSTION") == "1" {
+		nextTID.store64(uint64(^uint32(0)) - 1)
+		tid, _ := allocTID()
+		if tid != ^uint32(0) || nextTID.load64() != uint64(^uint32(0)) {
+			panic("maximum representable TID was not issued exactly once")
+		}
+		allocTID()
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestTIDExhaustionFailsBeforeSentinel$")
+	cmd.Env = append(os.Environ(), "KOLKOV_TID_EXHAUSTION=1")
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("TID exhaustion succeeded; output:\n%s", output)
+	}
+	if !bytes.Contains(output, []byte("race detector exhausted logical goroutine IDs")) {
+		t.Fatalf("TID exhaustion output did not contain fail-closed diagnostic:\n%s", output)
+	}
+}
+
+func TestTIDReservationBoundaryDoesNotPublishSentinel(t *testing.T) {
+	var highWater tidHighWater
+	highWater.store64(uint64(^uint32(0)) - 1)
+	if tid, ok := highWater.reserve(); !ok || tid != ^uint32(0) {
+		t.Fatalf("last representable reservation = (%d,%v), want (%d,true)", tid, ok, ^uint32(0))
+	}
+	before := highWater.load64()
+	if tid, ok := highWater.reserve(); ok || tid != 0 {
+		t.Fatalf("exhausted reservation = (%d,%v), want (0,false)", tid, ok)
+	}
+	if after := highWater.load64(); after != before || after >= exhaustedTIDHighWater {
+		t.Fatalf("failed reservation published state: before=%d after=%d sentinel=%d", before, after, exhaustedTIDHighWater)
 	}
 }
 

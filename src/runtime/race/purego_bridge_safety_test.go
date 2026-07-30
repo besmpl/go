@@ -12,8 +12,6 @@ import (
 	"internal/testenv"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -265,14 +263,6 @@ func bridgeStressEnv(env []string, gomaxprocs string) []string {
 	)
 }
 
-var compactRangeFrameRE = regexp.MustCompile(
-	`(?m)^.*TEXT\s+runtime/race/kolkov/shadowmem\.\(\*compactGroups\)\.tryRange\(SB\),\s+ABIInternal,\s+\$([0-9]+)-[0-9]+`,
-)
-
-var compactPaletteRangeFrameRE = regexp.MustCompile(
-	`(?m)^.*TEXT\s+runtime/race/kolkov/shadowmem\.\(\*compactPalette\)\.tryRangeLocked\(SB\),\s+ABIInternal,\s+\$([0-9]+)-[0-9]+`,
-)
-
 // TestPureGoCompactRangeFrameBudget prevents a recurrence of the oversized
 // monolithic frame that left almost no headroom on the fixed race-build g0
 // stack. This is a per-frame regression gate, not a proof of the full call
@@ -321,19 +311,17 @@ func TestPureGoCompactRangeFrameBudget(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, check := range []struct {
-				name string
-				re   *regexp.Regexp
+				name   string
+				symbol string
 			}{
-				{name: "compactGroups.tryRange", re: compactRangeFrameRE},
-				{name: "compactPalette.tryRangeLocked", re: compactPaletteRangeFrameRE},
+				{name: "compactGroups.tryRange", symbol: "runtime/race/kolkov/shadowmem.(*compactGroups).tryRange"},
+				{name: "compactPalette.tryRangeLocked", symbol: "runtime/race/kolkov/shadowmem.(*compactPalette).tryRangeLocked"},
+				{name: "compactGroup.firstAnchor", symbol: "runtime/race/kolkov/shadowmem.(*compactGroup).firstAnchor"},
+				{name: "compactGroups.mergeEquivalent", symbol: "runtime/race/kolkov/shadowmem.(*compactGroups).mergeEquivalent"},
 			} {
-				match := check.re.FindSubmatch(log)
-				if match == nil {
+				frame, ok := compilerFrameSize(log, check.symbol)
+				if !ok {
 					t.Fatalf("%s compiler output did not contain %s frame", goarch, check.name)
-				}
-				frame, err := strconv.Atoi(string(match[1]))
-				if err != nil {
-					t.Fatalf("parse %s %s frame %q: %v", goarch, check.name, match[1], err)
 				}
 				if frame > maxFrame {
 					t.Fatalf("%s %s frame = %d bytes, limit %d", goarch, check.name, frame, maxFrame)
@@ -342,4 +330,20 @@ func TestPureGoCompactRangeFrameBudget(t *testing.T) {
 			}
 		})
 	}
+}
+
+func compilerFrameSize(assembly []byte, symbol string) (int, bool) {
+	needle := []byte("TEXT\t" + symbol + "(SB), ABIInternal, $")
+	position := bytes.Index(assembly, needle)
+	if position < 0 {
+		return 0, false
+	}
+	position += len(needle)
+	frame := 0
+	start := position
+	for position < len(assembly) && assembly[position] >= '0' && assembly[position] <= '9' {
+		frame = frame*10 + int(assembly[position]-'0')
+		position++
+	}
+	return frame, position > start
 }

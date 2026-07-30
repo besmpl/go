@@ -13,6 +13,17 @@ import (
 	"runtime/race/kolkov/vectorclock"
 )
 
+// CompactReadResult distinguishes an unsupported/unstable compact probe from
+// a completed mutation and from the only outcome safe to seed the redundant
+// read cache.
+type CompactReadResult uint8
+
+const (
+	CompactReadMiss CompactReadResult = iota
+	CompactReadHandled
+	CompactReadExactNoop
+)
+
 //go:linkname runtimeThrow runtime.throw
 func runtimeThrow(s string)
 
@@ -64,8 +75,8 @@ type spinlock struct {
 }
 
 // Keep the maximum pause short enough to react promptly to an unlock while
-// reducing cache-line traffic under contention. The runtime helper preserves
-// nosplit spinning on g0 and yields schedulable callers only at this cap.
+// reducing cache-line traffic under contention. On g0 the runtime helper uses
+// bounded procyield, then an OS-thread yield at this cap.
 const spinlockMaxBackoff = uint32(64)
 
 //go:nosplit
@@ -214,10 +225,48 @@ func (vs *VarState) GetAtomicState() unsafe.Pointer {
 // The caller must hold the access lock and must have escaped any mapped fast
 // capability through its ShadowSlot protocol.
 func (vs *VarState) SetAtomicState(state unsafe.Pointer) {
+	vs.SetAtomicStateOwned(state, nil, nil)
+}
+
+// SetAtomicStateOwned publishes detector-owned sidecar state together with the
+// exact ownership callbacks for its typed arena slot. Each VarState attachment
+// owns one reference, including copy-on-write clones; replacement retains the
+// new sidecar before releasing the drained old binding so rebinding the same
+// overlay cannot transiently retire it.
+func (vs *VarState) SetAtomicStateOwned(state unsafe.Pointer, retain, release func(unsafe.Pointer)) {
+	if state == nil {
+		runtimeThrow("race detector cannot publish a nil atomic sidecar")
+	}
+	if retain != nil {
+		retain(state)
+	}
 	if binding := vs.atomicState.Load(); binding != nil {
 		binding.escapeIncompatible()
+		vs.atomicState.Store(nil)
+		if binding.releaseOverlay != nil {
+			binding.releaseOverlay(binding.overlay)
+		}
 	}
-	vs.atomicState.Store(&AtomicFastPath{overlay: state})
+	vs.atomicState.Store(&AtomicFastPath{
+		overlay: state, retainOverlay: retain, releaseOverlay: release,
+	})
+}
+
+// DetachAtomicStateLocked drops this VarState's ownership after its last shadow
+// slot membership has been removed. The caller holds accessMu. Closing the
+// binding first drains every retained fast capability, while accessMu itself
+// drains slow transactions; the release callback may therefore reclaim all
+// sidecar metadata immediately.
+func (vs *VarState) DetachAtomicStateLocked() {
+	binding := vs.atomicState.Load()
+	if binding == nil {
+		return
+	}
+	binding.escapeIncompatible()
+	vs.atomicState.Store(nil)
+	if binding.releaseOverlay != nil {
+		binding.releaseOverlay(binding.overlay)
+	}
 }
 
 // NewVarState creates a new zero-initialized variable state.
@@ -245,7 +294,11 @@ func (vs *VarState) CloneOrdinaryLocked() *VarState {
 	clone.readPC.Store(vs.readPC.Load())
 	clone.readEpoch0.Store(vs.readEpoch0.Load())
 	clone.readerState.Store(vs.readerState.Load())
-	clone.atomicState.Store(vs.atomicState.Load())
+	binding := vs.atomicState.Load()
+	if binding != nil && binding.retainOverlay != nil {
+		binding.retainOverlay(binding.overlay)
+	}
+	clone.atomicState.Store(binding)
 
 	vs.mu.lock()
 	clone.writeCount = vs.writeCount
@@ -283,9 +336,7 @@ func (vs *VarState) Reset() {
 	// before changing any ordinary field, detector overlay, or lifecycle byte so
 	// fast completion observes either the complete old generation or the
 	// complete reset generation, never a mixture of both.
-	if binding := vs.atomicState.Load(); binding != nil {
-		binding.escapeIncompatible()
-	}
+	vs.DetachAtomicStateLocked()
 
 	// Reset lock-free fields using atomic stores.
 	vs.W.Store(0)
@@ -312,8 +363,6 @@ func (vs *VarState) Reset() {
 	vs.readStackHash = 0
 	vs.mu.unlock()
 
-	// The binding was closed and drained before any state mutation above.
-	vs.atomicState.Store(nil)
 	vs.lifecycleID = allocateLifecycleID()
 }
 

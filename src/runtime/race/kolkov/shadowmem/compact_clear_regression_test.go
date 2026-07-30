@@ -188,6 +188,144 @@ func TestPageTablePartialCompactDefaultClearAllocatesNothing(t *testing.T) {
 	}
 }
 
+func TestPageTableSubBlockClearRepresentationPaths(t *testing.T) {
+	const base = uintptr(1)<<40 + 0x20000
+	current := epoch.NewEpoch(45, 9)
+	clock := compactClearClock(current)
+
+	setupBlock := func(t *testing.T, pt *PageTableShadow, blockBase, compactAddr uintptr) {
+		t.Helper()
+		if !pt.TryCompactWrite(compactAddr, current, clock, 0x4510) {
+			t.Fatal("compact setup failed")
+		}
+		pt.AccessRange(blockBase, rangeBlockSize, func(_ uintptr, _ uint8, _ *VarState) {})
+	}
+	assertCleared := func(t *testing.T, pt *PageTableShadow, start, size uintptr) {
+		t.Helper()
+		for addr := start; addr < start+size; addr++ {
+			if state := pt.Get(addr); state != nil {
+				t.Fatalf("cleared address %#x retained %p", addr, state)
+			}
+		}
+	}
+
+	t.Run("compact-default-only-256", func(t *testing.T) {
+		pt := NewPageTableShadow()
+		start := base + 128
+		setupBlock(t, pt, base, start+17)
+		view, _ := pt.blockFor(base, false)
+		left, right := pt.Get(start-1), pt.Get(start+256)
+		if view.slotTable(false) != nil || left == nil || right == nil {
+			t.Fatalf("setup slots=%p left=%p right=%p", view.slotTableOwner.Load(), left, right)
+		}
+
+		pt.ClearRange(start, 256)
+		assertCleared(t, pt, start, 256)
+		if view.slotTable(false) != nil {
+			t.Fatal("compact/default-only clear materialized a slot table")
+		}
+		if pt.Get(start-1) != left || pt.Get(start+256) != right {
+			t.Fatal("compact/default-only clear changed an adjacent history")
+		}
+		if allocs := testing.AllocsPerRun(100, func() { pt.ClearRange(start, 256) }); allocs != 0 {
+			t.Fatalf("256-byte compact/default clear allocated %.2f objects/op", allocs)
+		}
+	})
+
+	t.Run("materialized-mixed-256", func(t *testing.T) {
+		pt := NewPageTableShadow()
+		blockBase := base + rangeBlockSize
+		start := blockBase + 128
+		setupBlock(t, pt, blockBase, start+17)
+		materialized := start + 80
+		pt.GetOrCreate(materialized)
+		view, _ := pt.blockFor(blockBase, false)
+		left, right := pt.Get(start-1), pt.Get(start+256)
+		if view.slotTable(false) == nil || pt.GetSlot(materialized) == nil {
+			t.Fatal("mixed setup did not materialize its selected word")
+		}
+
+		pt.ClearRange(start, 256)
+		assertCleared(t, pt, start, 256)
+		if pt.GetSlot(materialized) == nil {
+			t.Fatal("mixed clear detached a published slot")
+		}
+		if pt.Get(start-1) != left || pt.Get(start+256) != right {
+			t.Fatal("mixed clear changed an adjacent history")
+		}
+	})
+
+	t.Run("crosses-4KiB-boundary", func(t *testing.T) {
+		pt := NewPageTableShadow()
+		first := base + 2*rangeBlockSize
+		second := first + rangeBlockSize
+		start := second - 128
+		setupBlock(t, pt, first, start+17)
+		setupBlock(t, pt, second, second+17)
+		left, right := pt.Get(start-1), pt.Get(start+256)
+
+		pt.ClearRange(start, 256)
+		assertCleared(t, pt, start, 256)
+		if pt.Get(start-1) != left || pt.Get(start+256) != right {
+			t.Fatal("cross-block clear changed an adjacent history")
+		}
+		for _, blockBase := range []uintptr{first, second} {
+			view, _ := pt.blockFor(blockBase, false)
+			if view.slotTable(false) != nil {
+				t.Fatalf("cross-block compact clear materialized block %#x", blockBase)
+			}
+		}
+	})
+
+	t.Run("exact-4KiB", func(t *testing.T) {
+		pt := NewPageTableShadow()
+		blockBase := base + 4*rangeBlockSize
+		setupBlock(t, pt, blockBase, blockBase+123)
+		pt.ClearRange(blockBase, rangeBlockSize)
+		assertCleared(t, pt, blockBase, rangeBlockSize)
+		view, _ := pt.blockFor(blockBase, false)
+		if view.history.state.Load() != nil {
+			t.Fatal("full-block clear retained its default")
+		}
+	})
+}
+
+func BenchmarkPageTableClearExactRange256(b *testing.B) {
+	const (
+		base  = uintptr(1)<<40 + 0x40000
+		start = base + 128
+	)
+	newTable := func() *PageTableShadow {
+		pt := NewPageTableShadow()
+		current := epoch.NewEpoch(46, 3)
+		if !pt.TryCompactWrite(start+17, current, compactClearClock(current), 0x4610) {
+			b.Fatal("compact setup failed")
+		}
+		pt.AccessRange(base, rangeBlockSize, func(_ uintptr, _ uint8, _ *VarState) {})
+		return pt
+	}
+
+	b.Run("batched", func(b *testing.B) {
+		pt := newTable()
+		b.ReportAllocs()
+		for b.Loop() {
+			pt.clearExactRange(start, 256)
+		}
+	})
+	b.Run("per-word-reference", func(b *testing.B) {
+		pt := newTable()
+		b.ReportAllocs()
+		for b.Loop() {
+			for addr := start; addr < start+256; addr += 8 {
+				view, _ := pt.blockFor(addr, false)
+				view.history.mu.lock()
+				clearUnmaterializedRangeBlockLocked(view, addr, 8)
+				view.history.mu.unlock()
+			}
+		}
+	})
+}
+
 func TestPageTableFullClearRetiresDefaultBeforeCompact(t *testing.T) {
 	oldProcs := runtime.GOMAXPROCS(2)
 	defer runtime.GOMAXPROCS(oldProcs)

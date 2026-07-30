@@ -3,7 +3,15 @@
 
 env CGO_ENABLED=0 GOOS=linux
 
+env GOARCH=amd64
+go list -race -f '{{join .GoFiles " "}}' runtime/race
+stdout '(^| )race_kolkov_import\.go( |$)'
+go list -race -f '{{join .SysoFiles " "}}' runtime/race
+! stdout .
+
 env GOARCH=arm64
+go list -race -f '{{join .GoFiles " "}}' runtime/race
+stdout '(^| )race_kolkov_import\.go( |$)'
 go list -race -f '{{join .SysoFiles " "}}' runtime/race
 ! stdout .
 go list -race -f '{{join .IgnoredOtherFiles " "}}' runtime/race
@@ -35,6 +43,8 @@ stdout '(^| )race_linux_s390x\.syso( |$)'
 
 # Enabling cgo must preserve selection of the ThreadSanitizer system object.
 env CGO_ENABLED=1 GOARCH=arm64
+go list -race -f '{{join .GoFiles " "}}' runtime/race
+! stdout 'race_kolkov_import\.go'
 go list -race -f '{{join .SysoFiles " "}}' runtime/race
 stdout '^race_linux_arm64\.syso$'
 
@@ -46,5 +56,12 @@ go list -race -f '{{join .IgnoredOtherFiles " "}}' runtime/race
 stdout '(^| )race_darwin_arm64\.syso( |$)'
 
 env CGO_ENABLED=1
+go list -race -f '{{join .GoFiles " "}}' runtime/race
+! stdout 'race_kolkov_import\.go'
 go list -race -f '{{join .SysoFiles " "}}' runtime/race
 stdout '^race_darwin_arm64\.syso$'
+
+# Ordinary builds must not select the Kolkov package import at all.
+env CGO_ENABLED=0
+go list -f '{{join .GoFiles " "}}' runtime/race
+! stdout 'race_kolkov_import\.go'

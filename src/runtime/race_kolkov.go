@@ -806,14 +806,21 @@ func racemalloc(p unsafe.Pointer, sz uintptr) {
 	gp.raceguard--
 }
 
-// racefree notifies the race detector of a memory free.
-// Clears shadow memory for the freed range to prevent false positives
-// when the allocator reuses the same addresses for new objects.
-//
-// Uses raceguard only for detector-private lifetimes; see racemalloc.
+// racefree notifies the race detector of an individual object free. PureGo
+// defers shadow retirement to racemalloc: every heap, stack, and arena address
+// is cleared at its allocation-side boundary before becoming user-visible.
+// Keeping the old generation until then avoids duplicate allocator work.
 //
 //go:nosplit
-func racefree(p unsafe.Pointer, sz uintptr) {
+func racefree(p unsafe.Pointer, sz uintptr) {}
+
+// raceheapspanfree notifies the detector that the allocator is returning a
+// whole span to the heap. Unlike individual object frees, this is a quiescent
+// lifetime boundary for every address in the span, so it directly clears the
+// exact full span and may discard retained full-block compact state.
+//
+//go:nosplit
+func raceheapspanfree(p unsafe.Pointer, size uintptr) {
 	gp := getg()
 	if gp.m != nil && gp.m.curg != nil {
 		gp = gp.m.curg
@@ -824,19 +831,9 @@ func racefree(p unsafe.Pointer, sz uintptr) {
 	raceClearReadCache(gp.racectx)
 	gp.raceguard++
 	systemstack(func() {
-		kolkovApiClearShadow(uintptr(p), sz)
+		kolkovApiClearShadow(uintptr(p), size)
 	})
 	gp.raceguard--
-}
-
-// raceheapspanfree notifies the detector that the allocator is returning a
-// whole span to the heap. Unlike individual object frees, this is a quiescent
-// lifetime boundary for every address in the span, so full shadow blocks may
-// discard their retained compact state.
-//
-//go:nosplit
-func raceheapspanfree(p unsafe.Pointer, size uintptr) {
-	racefree(p, size)
 }
 
 // racegostart notifies the race detector that a new goroutine is starting.

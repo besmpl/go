@@ -44,6 +44,23 @@ func NewEpoch(tid uint32, clock uint64) Epoch {
 	return Epoch(uint64(tid)<<ClockBits | (clock & ClockMask))
 }
 
+// NextClock validates an own-clock advance without mutating caller state. The
+// returned value can be committed only while the caller's current clock is
+// unchanged. Keeping this check separate from publication lets compound race
+// detector operations fail before weakening caches or publishing partial
+// happens-before state.
+func NextClock(clock uint64) uint64 {
+	if clock >= MaxClock {
+		clockOverflowDetected.Store(1)
+		runtimeThrow("race detector logical clock overflow")
+	}
+	next := clock + 1
+	if next > MaxClockWarning {
+		clockNearOverflow.Store(1)
+	}
+	return next
+}
+
 func (e Epoch) Decode() (tid uint32, clock uint64) {
 	return uint32(uint64(e) >> ClockBits), uint64(e) & ClockMask
 }

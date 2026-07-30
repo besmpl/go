@@ -734,6 +734,12 @@ func (p *compactPalette) tryUniformRangeLocked(c *compactGroups, start, end uint
 		return true, false
 	}
 	if next == descriptor.history {
+		// Match the scalar hot-write policy: when this sized access owns the
+		// complete equivalence class, let authoritative fallback materialize it
+		// once rather than rebuilding the same dense uniform proof forever.
+		if write && source != nil && source.members == uint16(end-start) {
+			return true, false
+		}
 		return true, true
 	}
 	nextDescriptor := descriptor

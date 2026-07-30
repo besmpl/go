@@ -1,6 +1,9 @@
 package syncshadow
 
-import "internal/runtime/atomic"
+import (
+	"internal/runtime/atomic"
+	_ "unsafe" // for go:linkname
+)
 
 const (
 	// Sync entries are grouped first by application page and then by cache-line
@@ -31,12 +34,48 @@ type spinlock struct {
 	state atomic.Uint32
 }
 
+//go:linkname runtimeKolkovSpinWait runtime.kolkovSpinWait
+func runtimeKolkovSpinWait(cycles uint32, yield bool)
+
+const spinlockMaxPollBudget = uint32(32)
+
+//go:nosplit
 func (l *spinlock) lock() {
-	for !l.state.CompareAndSwap(0, 1) {
-		// Sync metadata writes are short and allocation-free while locked.
+	l.lockWithFallbackCounter(nil)
+}
+
+// lockWithFallbackCounter implements the writer lock's TTAS schedule. The
+// optional counter is test observability: production callers pass nil, so the
+// immediate acquisition path remains only one CAS and never allocates.
+//
+//go:nosplit
+func (l *spinlock) lockWithFallbackCounter(fallbacks *atomic.Uint64) {
+	if l.state.CompareAndSwap(0, 1) {
+		return
+	}
+
+	for {
+		// Poll with successively larger atomic-read budgets. CAS is attempted
+		// only after a read observes an unlocked state, avoiding continuous
+		// invalidation of the owner's cache line under contention.
+		for budget := uint32(1); budget <= spinlockMaxPollBudget; budget <<= 1 {
+			for poll := uint32(0); poll < budget; poll++ {
+				if l.state.Load() == 0 && l.state.CompareAndSwap(0, 1) {
+					return
+				}
+			}
+		}
+
+		if fallbacks != nil {
+			fallbacks.Add(1)
+		}
+		// On a user goroutine the existing runtime helper yields here. On g0
+		// it remains a bounded processor pause because g0 cannot schedule.
+		runtimeKolkovSpinWait(spinlockMaxPollBudget, true)
 	}
 }
 
+//go:nosplit
 func (l *spinlock) unlock() {
 	l.state.Store(0)
 }
@@ -85,6 +124,14 @@ type syncBucket struct {
 // latency bounded.
 type SyncShadow struct {
 	buckets [syncBucketCount]syncBucket
+}
+
+// SyncShadowStats is the live cardinality of a quiescent SyncShadow.
+// Removed cells and pages are not counted even though the garbage collector
+// may retain them while a lock-free reader still holds a snapshot.
+type SyncShadowStats struct {
+	LivePages   uint64
+	LiveEntries uint64
 }
 
 // NewSyncShadow returns an empty synchronization shadow map.
@@ -307,6 +354,23 @@ func (s *SyncShadow) clearAllPagesInRange(firstPage, lastPage, first, last uintp
 		}
 		bucket.mu.unlock()
 	}
+}
+
+// Stats returns live page and address cardinality. It is intended for
+// diagnostics and tests at a quiescent point, with no concurrent GetOrCreate,
+// ClearRange, or Reset calls. Page entry counts are updated exactly under the
+// owning bucket lock. Quiescence makes it safe to inspect the writer-owned
+// entry counts directly without adding shared accounting writes to production
+// mutation paths.
+func (s *SyncShadow) Stats() SyncShadowStats {
+	var stats SyncShadowStats
+	for i := range s.buckets {
+		for page := s.buckets[i].pages.Load(); page != nil; page = page.next.Load() {
+			stats.LivePages++
+			stats.LiveEntries += uint64(page.entryCount)
+		}
+	}
+	return stats
 }
 
 // ClearRange removes synchronization shadow entries whose addresses are in

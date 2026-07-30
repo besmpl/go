@@ -24,13 +24,15 @@ const atomicFastEscaped = uint32(1) << 31
 // lane bindings may later publish a distinct object, so a cached pointer can
 // never revive through address reuse or re-enrollment.
 type AtomicFastPath struct {
-	overlay      unsafe.Pointer
-	state        *VarState
-	lifecycle    uint64
-	mask         uint8
-	ordinaryMask uint8
-	enrolled     atomic.Uint32
-	users        atomic.Uint32
+	overlay        unsafe.Pointer
+	retainOverlay  func(unsafe.Pointer)
+	releaseOverlay func(unsafe.Pointer)
+	state          *VarState
+	lifecycle      uint64
+	mask           uint8
+	ordinaryMask   uint8
+	enrolled       atomic.Uint32
+	users          atomic.Uint32
 	// rearm is the exact-mask probation signature for this already-closed
 	// descriptor. The first compatible setup after escape records its mask but
 	// remains slow; a second consecutive setup with that mask publishes a fresh
@@ -435,7 +437,10 @@ func (s *ShadowSlot) enrollAtomicFastLocked(mask uint8, states *[shadowSlotLanes
 			return
 		}
 		binding.rearm.Store(0)
-		binding = &AtomicFastPath{overlay: overlay}
+		binding = &AtomicFastPath{
+			overlay: overlay, retainOverlay: binding.retainOverlay,
+			releaseOverlay: binding.releaseOverlay,
+		}
 	}
 	binding.state = primary
 	binding.lifecycle = primary.GetLifecycleID()
@@ -602,6 +607,14 @@ func (s *ShadowSlot) clearMaskLocked(mask uint8) {
 	for i := uint8(0); i < shadowSlotLanes; i++ {
 		if mask&(uint8(1)<<i) != 0 {
 			s.states[i].Store(nil)
+		}
+	}
+	// A VarState may represent several lanes. Drop its arena ownership only
+	// after the final lane mapping has gone; partial clears preserve the shared
+	// sidecar and its exact surviving witnesses.
+	for i := 0; i < lockedCount; i++ {
+		if s.referenceMask(locked[i]) == 0 {
+			locked[i].DetachAtomicStateLocked()
 		}
 	}
 	for i := lockedCount - 1; i >= 0; i-- {

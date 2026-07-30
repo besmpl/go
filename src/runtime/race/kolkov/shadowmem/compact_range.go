@@ -97,6 +97,62 @@ func finishCompactRangeBlock(block *rangeBlock, result bool) bool {
 	return result
 }
 
+// compactRangeUniformNoop proves that every selected byte resolves through one
+// exact immutable bitmap state and that the requested transition does not
+// change it. The caller holds the owning block lock, so a successful proof can
+// bypass the general fixed-stack transaction planner without publication.
+// Defaults, tombstones, overlaps, unsupported states, and real transitions all
+// deliberately fall through to the complete planner.
+func (c *compactGroups) compactRangeUniformNoop(offset, size uintptr, current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr, write bool) bool {
+	firstWord := int(offset >> 6)
+	lastWord := int((offset + size - 1) >> 6)
+	var source *compactGroup
+
+	for i := 0; i < compactGroupCapacity; i++ {
+		group := c.groupLoad(i)
+		if group == nil {
+			continue
+		}
+		intersects := false
+		for word := firstWord; word <= lastWord; word++ {
+			selected := compactRangeWordMask(offset, size, word)
+			if group.members[word].Load()&selected != 0 {
+				intersects = true
+				break
+			}
+		}
+		if !intersects {
+			continue
+		}
+		if source != nil || group.retired || !group.joinable {
+			return false
+		}
+		source = group
+	}
+	if source == nil {
+		return false
+	}
+	for word := firstWord; word <= lastWord; word++ {
+		selected := compactRangeWordMask(offset, size, word)
+		if source.members[word].Load()&selected != selected || c.tombstoneWord(word)&selected != 0 {
+			return false
+		}
+	}
+
+	state := source.state.Load()
+	descriptor, ok := compactDescriptorFromState(state)
+	if !ok || descriptor != source.descriptor || state != source.state.Load() {
+		return false
+	}
+	var next compactHistoryKey
+	if write {
+		next, ok = descriptor.history.afterWrite(current, clock, pc)
+	} else {
+		next, ok = descriptor.history.afterRead(current, clock, pc)
+	}
+	return ok && next == descriptor.history
+}
+
 // tryRange applies one conflict-free ordinary transition to every exact byte
 // in a block-local fragment. Admission and planning happen before publication;
 // a false result never changes compact membership or ordinary history.
@@ -109,6 +165,9 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 			defaultState.LockAccess()
 		}
 		return finishCompactRange(defaultState, palette.tryRangeLocked(c, offset, size, defaultState, current, clock, pc, write))
+	}
+	if c.compactRangeUniformNoop(offset, size, current, clock, pc, write) {
+		return true
 	}
 
 	var sources [compactRangeSourceCapacity]compactRangeSource

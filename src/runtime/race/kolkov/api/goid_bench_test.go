@@ -13,6 +13,9 @@ import (
 //
 // Uses getg().goid via linkname — expected ~0ns per operation.
 func BenchmarkGetGoroutineID_Fast(b *testing.B) {
+	if !goroutineIDUsesRuntimeBridge {
+		b.Skip("runtime bridge is race-only")
+	}
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
@@ -45,6 +48,9 @@ func BenchmarkGetGoroutineID_Current(b *testing.B) {
 // Shows the speedup from runtime bridge vs runtime.Stack parsing.
 func BenchmarkGetGoroutineID_Comparison(b *testing.B) {
 	b.Run("Fast", func(b *testing.B) {
+		if !goroutineIDUsesRuntimeBridge {
+			b.Skip("runtime bridge is race-only")
+		}
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			_ = getGoroutineIDFast()
@@ -73,6 +79,9 @@ func BenchmarkGetGoroutineID_Parallel(b *testing.B) {
 // BenchmarkGetGoroutineID_FastVsSlow_Concurrent compares performance under load.
 func BenchmarkGetGoroutineID_FastVsSlow_Concurrent(b *testing.B) {
 	b.Run("Fast", func(b *testing.B) {
+		if !goroutineIDUsesRuntimeBridge {
+			b.Skip("runtime bridge is race-only")
+		}
 		b.ReportAllocs()
 		b.RunParallel(func(pb *testing.PB) {
 			for pb.Next() {
@@ -93,6 +102,9 @@ func BenchmarkGetGoroutineID_FastVsSlow_Concurrent(b *testing.B) {
 
 // BenchmarkGetCurrentContext_WithFastGID benchmarks context lookup with fast GID.
 func BenchmarkGetCurrentContext_WithFastGID(b *testing.B) {
+	if !goroutineIDUsesRuntimeBridge {
+		b.Skip("runtime bridge is race-only")
+	}
 	Reset()
 	Enable()
 
@@ -109,6 +121,9 @@ func BenchmarkGetCurrentContext_WithFastGID(b *testing.B) {
 
 // BenchmarkGetCurrentContext_FirstCall_WithFastGID measures initial allocation cost.
 func BenchmarkGetCurrentContext_FirstCall_WithFastGID(b *testing.B) {
+	if !goroutineIDUsesRuntimeBridge {
+		b.Skip("runtime bridge is race-only")
+	}
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
@@ -122,6 +137,9 @@ func BenchmarkGetCurrentContext_FirstCall_WithFastGID(b *testing.B) {
 
 // BenchmarkRaceRead_WithFastGID measures raceread with runtime bridge GID.
 func BenchmarkRaceRead_WithFastGID(b *testing.B) {
+	if !goroutineIDUsesRuntimeBridge {
+		b.Skip("runtime bridge is race-only")
+	}
 	Reset()
 	Enable()
 
@@ -139,6 +157,9 @@ func BenchmarkRaceRead_WithFastGID(b *testing.B) {
 
 // BenchmarkRaceWrite_WithFastGID measures racewrite with runtime bridge GID.
 func BenchmarkRaceWrite_WithFastGID(b *testing.B) {
+	if !goroutineIDUsesRuntimeBridge {
+		b.Skip("runtime bridge is race-only")
+	}
 	Reset()
 	Enable()
 

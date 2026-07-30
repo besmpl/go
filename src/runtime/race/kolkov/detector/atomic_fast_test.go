@@ -205,6 +205,77 @@ func TestAtomicRMWReusesExactCapability(t *testing.T) {
 	}
 }
 
+func TestAtomicRMWCooperativeContentionIsClean(t *testing.T) {
+	d := NewDetector()
+	seed := goroutine.Alloc(206)
+	contender := goroutine.Alloc(207)
+	defer seed.C.Release()
+	defer contender.C.Release()
+	const addr = uintptr(0x31240)
+	enrollPlainAtomicForTest(t, d, addr, 8, seed)
+	capability := plainAtomicCapabilityForTest(t, d, addr, 8)
+	state := atomicHistoryForTest(t, d, addr)
+
+	state.mu.lock()
+	beforeRevision := state.writerRevision.Load()
+	beforePinned := state.arena.pinned.Load()
+	beforeReads := atomicHistoryCardinality(state.reads)
+	beforeWrites := atomicHistoryCardinality(state.writes)
+	beforeEpoch := contender.GetEpoch()
+	beforeSeedClock := contender.C.Get(seed.TID)
+	var token AtomicToken
+	token[0] = unsafe.Pointer(new(byte))
+	retry := d.AtomicBeginRMWCooperative(addr, 8, contender, true, &token)
+	if !retry {
+		state.mu.unlock()
+		t.Fatal("cooperative RMW contention did not request a retry")
+	}
+	for i, retained := range token {
+		if retained != nil {
+			state.mu.unlock()
+			t.Fatalf("contention retained token[%d] = %p", i, retained)
+		}
+	}
+	if state.transactionActive {
+		state.mu.unlock()
+		t.Fatal("contention began an atomic transaction")
+	}
+	if got := state.writerRevision.Load(); got != beforeRevision {
+		state.mu.unlock()
+		t.Fatalf("contention changed writer revision from %d to %d", beforeRevision, got)
+	}
+	if got := state.arena.pinned.Load(); got != beforePinned {
+		state.mu.unlock()
+		t.Fatalf("contention changed arena pins from %d to %d", beforePinned, got)
+	}
+	if got := atomicHistoryCardinality(state.reads); got != beforeReads {
+		state.mu.unlock()
+		t.Fatalf("contention changed read history cardinality from %d to %d", beforeReads, got)
+	}
+	if got := atomicHistoryCardinality(state.writes); got != beforeWrites {
+		state.mu.unlock()
+		t.Fatalf("contention changed write history cardinality from %d to %d", beforeWrites, got)
+	}
+	state.mu.unlock()
+	if got := contender.GetEpoch(); got != beforeEpoch {
+		t.Fatalf("contention changed contender epoch from %v to %v", beforeEpoch, got)
+	}
+	if got := contender.C.Get(seed.TID); got != beforeSeedClock {
+		t.Fatalf("contention imported release clock %d, want %d", got, beforeSeedClock)
+	}
+	if fresh := plainAtomicCapabilityForTest(t, d, addr, 8); fresh != capability {
+		t.Fatalf("contention replaced capability %p with %p", capability, fresh)
+	}
+
+	if retry := d.AtomicBeginRMWCooperative(addr, 8, contender, true, &token); retry {
+		t.Fatal("uncontended cooperative RMW requested a retry")
+	}
+	if fast := atomicFastToken(&token); fast != capability {
+		t.Fatalf("uncontended cooperative token capability = %p, want %p", fast, capability)
+	}
+	d.AtomicEnd(addr, 8, contender, &token, 0x5122, true)
+}
+
 func TestAtomicAcquireOnlyFastCompletionKeepsClockAndWeakensReadCache(t *testing.T) {
 	d := NewDetector()
 	seed := goroutine.Alloc(209)
@@ -430,14 +501,12 @@ type atomicReleaseSnapshot struct {
 	retired []vectorclock.RetiredRange
 }
 
-func cloneAtomicFrontier(frontier map[uint32]atomicAccess) map[uint32]atomicAccess {
+func cloneAtomicFrontier(frontier *atomicHistoryClass) map[uint32]atomicAccess {
 	if frontier == nil {
 		return nil
 	}
-	clone := make(map[uint32]atomicAccess, len(frontier))
-	for tid, access := range frontier {
-		clone[tid] = access
-	}
+	clone := make(map[uint32]atomicAccess)
+	frontier.visit(func(entry *atomicHistoryEntry) bool { clone[entry.tid] = entry.access; return true })
 	return clone
 }
 
@@ -447,10 +516,10 @@ func snapshotAtomicSemantics(t *testing.T, d *Detector, addr uintptr) atomicSema
 	state.mu.lock()
 	defer state.mu.unlock()
 	snapshot := atomicSemanticSnapshot{
-		writesUser:     cloneAtomicFrontier(state.writes.user),
-		writesInternal: cloneAtomicFrontier(state.writes.internal),
-		readsUser:      cloneAtomicFrontier(state.reads.user),
-		readsInternal:  cloneAtomicFrontier(state.reads.internal),
+		writesUser:     cloneAtomicFrontier(&state.writes.user),
+		writesInternal: cloneAtomicFrontier(&state.writes.internal),
+		readsUser:      cloneAtomicFrontier(&state.reads.user),
+		readsInternal:  cloneAtomicFrontier(&state.reads.internal),
 	}
 	for lane, release := range state.releases {
 		if release == nil {
@@ -458,8 +527,8 @@ func snapshotAtomicSemantics(t *testing.T, d *Detector, addr uintptr) atomicSema
 		}
 		snapshot.releases[lane] = atomicReleaseSnapshot{
 			present: true,
-			runs:    append([]vectorclock.FiniteRange(nil), release.runs...),
-			retired: append([]vectorclock.RetiredRange(nil), release.retired...),
+			runs:    atomicReleaseRunsForTest(release),
+			retired: atomicReleaseRetiredForTest(release),
 		}
 	}
 	return snapshot

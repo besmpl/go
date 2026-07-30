@@ -75,6 +75,53 @@ func TestFinalizerHandoffMergesLiveDetachedAndRetiresFinishedIDs(t *testing.T) {
 	}
 }
 
+func TestFinalizerHandoffOrdersNewlyFinishedLiveHole(t *testing.T) {
+	resetLifecycleRegistryForTest()
+	target := allocRegisteredContext(1)
+	d := detector.NewDetector()
+	const addr = uintptr(0xF2000)
+
+	// Three live holes split the first retirement snapshot into disjoint
+	// intervals. Ending the first two before the next handoff makes one broad
+	// incoming interval subsume several intervals retained by the target.
+	var sources [15]*goroutine.RaceContext
+	t.Cleanup(func() {
+		resetLifecycleRegistryForTest()
+		if target.C != nil {
+			target.C.Release()
+			target.C = nil
+		}
+		for _, source := range sources {
+			if source != nil && source.C != nil {
+				source.C.Release()
+				source.C = nil
+			}
+		}
+	})
+	for i := range sources {
+		gid := int64(10_000 + i)
+		sources[i] = allocRegisteredContext(gid)
+		if i == 11 {
+			d.OnWrite(addr, sources[i], 0x100)
+		}
+		if i != 2 && i != 11 && i != 14 {
+			raceGoEndFromRuntime(gid)
+		}
+	}
+	raceFinalizerGoFromRuntime(uintptr(unsafe.Pointer(target)))
+
+	raceGoEndFromRuntime(10_002)
+	raceGoEndFromRuntime(10_011)
+	raceFinalizerGoFromRuntime(uintptr(unsafe.Pointer(target)))
+	if !target.C.IsRetired(sources[11].TID) {
+		t.Fatalf("newly finished live-hole TID %d was not retired", sources[11].TID)
+	}
+	d.OnRead(addr, target, 0x200)
+	if got := d.RacesDetected(); got != 0 {
+		t.Fatalf("finalizer read raced with newly finished source: got %d races", got)
+	}
+}
+
 func TestFinalizerHandoffInvalidatesObservedSourceReadCache(t *testing.T) {
 	resetLifecycleRegistryForTest()
 	target := allocRegisteredContext(50)

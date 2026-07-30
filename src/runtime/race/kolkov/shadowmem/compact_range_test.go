@@ -18,6 +18,66 @@ func compactRangeTestClock(entries ...epoch.Epoch) *vectorclock.VectorClock {
 	return clock
 }
 
+func TestCompactRangeUniformNoopPreflight(t *testing.T) {
+	groups := newCompactGroups()
+	current := epoch.NewEpoch(7, 11)
+	clock := compactRangeTestClock(current)
+	const (
+		start = uintptr(62)
+		size  = uintptr(4)
+		pc    = uintptr(0x1001)
+	)
+	if !groups.tryRange(start, size, nil, current, clock, pc, false) {
+		t.Fatal("uniform cross-word setup failed")
+	}
+	if !groups.compactRangeUniformNoop(start, size, current, clock, pc, false) {
+		t.Fatal("exact cross-word read no-op was not proven")
+	}
+	if !groups.compactRangeUniformNoop(start, 2, current, clock, pc, false) {
+		t.Fatal("selected subset of one equivalence class was not proven")
+	}
+	if groups.compactRangeUniformNoop(start, size, current, clock, pc+1, false) {
+		t.Fatal("actual read transition was classified as a no-op")
+	}
+	if groups.compactRangeUniformNoop(start-1, size, current, clock, pc, false) {
+		t.Fatal("default/group mixture was classified as uniform")
+	}
+
+	if !groups.tryRange(start+size, size, nil, current, clock, pc+2, false) {
+		t.Fatal("mixed-group setup failed")
+	}
+	if groups.compactRangeUniformNoop(start, 2*size, current, clock, pc, false) {
+		t.Fatal("mixed compact groups were classified as uniform")
+	}
+
+	conflicting := epoch.NewEpoch(8, 1)
+	if groups.compactRangeUniformNoop(start, size, conflicting, compactRangeTestClock(conflicting), pc, false) {
+		t.Fatal("concurrent read was classified as a no-op")
+	}
+
+	compactTestClearRange(groups, start, size)
+	if groups.compactRangeUniformNoop(start, size, current, clock, pc, false) {
+		t.Fatal("tombstone range was classified as an ordinary no-op")
+	}
+}
+
+func TestCompactRangeUniformNoopRejectsUnsupportedState(t *testing.T) {
+	groups := newCompactGroups()
+	current := epoch.NewEpoch(9, 1)
+	clock := compactRangeTestClock(current)
+	if !groups.tryRange(128, 8, nil, current, clock, 0x1010, false) {
+		t.Fatal("setup failed")
+	}
+	group, overlap := groups.lookupGroup(128)
+	if group == nil || overlap {
+		t.Fatalf("setup group=%p overlap=%v", group, overlap)
+	}
+	group.state.Load().atomicState.Store(&AtomicFastPath{})
+	if groups.compactRangeUniformNoop(128, 8, current, clock, 0x1010, false) {
+		t.Fatal("atomic-overlay state was classified as an ordinary no-op")
+	}
+}
+
 func TestCompactRangeVirginExactMembershipAndNeighbors(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -390,6 +450,27 @@ func TestCompactRangeRepeatedAccessDoesNotAllocate(t *testing.T) {
 		}
 	}); allocs != 0 {
 		t.Fatalf("repeated compact range allocated %.2f objects", allocs)
+	}
+}
+
+func BenchmarkCompactRangeUniformNoop(b *testing.B) {
+	groups := newCompactGroups()
+	current := epoch.NewEpoch(14, 1)
+	clock := compactRangeTestClock(current)
+	const (
+		start = uintptr(62)
+		size  = uintptr(8)
+		pc    = uintptr(0x6020)
+	)
+	if !groups.tryRange(start, size, nil, current, clock, pc, false) {
+		b.Fatal("setup failed")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !groups.tryRange(start, size, nil, current, clock, pc, false) {
+			b.Fatal("uniform no-op fell back")
+		}
 	}
 }
 

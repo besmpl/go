@@ -57,10 +57,13 @@ func BenchmarkOnWrite_NoRace_NewAddress(b *testing.B) {
 func BenchmarkOnWrite_SameEpoch(b *testing.B) {
 	d := NewDetector()
 	ctx := goroutine.Alloc(1)
-	addr := uintptr(0x2000)
+	const (
+		addr = uintptr(0x2000)
+		pc   = uintptr(0x2001)
+	)
 
 	// Setup: Write once to create shadow cell.
-	d.OnWrite(addr, ctx, 0)
+	d.OnWrite(addr, ctx, pc)
 
 	// Get shadow cell and manually set it to current epoch.
 	vs := d.shadowMemory.Get(addr)
@@ -75,7 +78,7 @@ func BenchmarkOnWrite_SameEpoch(b *testing.B) {
 		// because IncrementClock advances the epoch.
 		currentEpoch := ctx.GetEpoch()
 		vs.SetW(currentEpoch)
-		d.OnWrite(addr, ctx, 0)
+		d.OnWrite(addr, ctx, pc)
 	}
 }
 

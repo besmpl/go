@@ -133,16 +133,18 @@ func BenchmarkGetCallerPC(b *testing.B) {
 	}
 }
 
-// BenchmarkEnableDisable measures enable/disable toggle performance.
-func BenchmarkEnableDisable(b *testing.B) {
+// BenchmarkDisableIdempotent measures the global disabled-state fast control
+// path. Dirty state cannot be re-enabled without an explicit quiescent Reset,
+// so alternating Enable/Disable is not a valid lifecycle benchmark.
+func BenchmarkDisableIdempotent(b *testing.B) {
+	Reset()
+	Disable()
+	b.Cleanup(Reset)
 	b.ReportAllocs()
+	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if i%2 == 0 {
-			Enable()
-		} else {
-			Disable()
-		}
+		Disable()
 	}
 }
 

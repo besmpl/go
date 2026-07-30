@@ -474,27 +474,27 @@ func (pt *PageTableShadow) TryCompactWrite(addr uintptr, current epoch.Epoch, cl
 	return ok
 }
 
-// TryCompactRead is the read counterpart of TryCompactWrite. The first result
-// reports an exact semantic no-op, for which Detector may seed its address-only
-// redundant-read cache. Changed compact histories deliberately return false so
-// their unexposed state remains eligible for allocation-free in-place reuse.
-func (pt *PageTableShadow) TryCompactRead(addr uintptr, current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr) (cacheableNoop, ok bool) {
+// TryCompactRead is the read counterpart of TryCompactWrite. Only
+// CompactReadExactNoop may seed Detector's redundant-read cache. Handled
+// transitions stay uncached so their unexposed state remains eligible for
+// allocation-free in-place reuse; unstable or unsupported probes return Miss.
+func (pt *PageTableShadow) TryCompactRead(addr uintptr, current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr) CompactReadResult {
 	view, _ := pt.blockFor(addr, true)
 	wordIdx := (addr >> 3) & rangeBlockWordMask
 	if view.loadSlot(wordIdx) != nil {
-		return false, false
+		return CompactReadMiss
 	}
 
 	view.history.mu.lock()
 	defer view.history.mu.unlock()
 	if view.loadSlot(wordIdx) != nil {
-		return false, false
+		return CompactReadMiss
 	}
 
 	compact := view.history.compact.Load()
 	if compact == nil {
 		if view.history.state.Load() != nil {
-			return false, false
+			return CompactReadMiss
 		}
 		compact = newCompactGroups()
 		view.history.compact.Store(compact)
@@ -506,17 +506,17 @@ func (pt *PageTableShadow) TryCompactRead(addr uintptr, current epoch.Epoch, clo
 	if palette == nil {
 		source, overlap := compact.lookupGroup(addr)
 		if overlap {
-			return false, false
+			return CompactReadMiss
 		}
 		if source == nil && !compact.isTombstone(addr) && view.history.state.Load() != nil {
-			return false, false
+			return CompactReadMiss
 		}
 		if source != nil {
 			sourceState = source.state.Load()
 		}
 	} else {
 		if palette.owner(addr) == compactPaletteDefault && view.history.state.Load() != nil {
-			return false, false
+			return CompactReadMiss
 		}
 		// Dense histories have no per-address VarState pointer to compare. The
 		// descriptor is their complete immutable semantic key, including the
@@ -526,13 +526,19 @@ func (pt *PageTableShadow) TryCompactRead(addr uintptr, current epoch.Epoch, clo
 	}
 	state, ok := compact.tryRead(addr, current, clock, pc)
 	if !ok {
-		return false, false
+		return CompactReadMiss
 	}
 	if denseSource {
 		destinationDescriptor, represented := palette.descriptor(addr)
-		return represented && destinationDescriptor == sourceDescriptor, true
+		if represented && destinationDescriptor == sourceDescriptor {
+			return CompactReadExactNoop
+		}
+		return CompactReadHandled
 	}
-	return sourceState != nil && state == sourceState, true
+	if sourceState != nil && state == sourceState {
+		return CompactReadExactNoop
+	}
+	return CompactReadHandled
 }
 
 // AccessRange visits every distinct ordinary-history group intersecting the
@@ -695,9 +701,9 @@ func accessBlockDefaultLocked(history *rangeBlock, compact *compactGroups, word 
 }
 
 // ClearRange forgets exact histories in [addr, addr+size). A full block drops
-// its default and clears materialized overrides in place. A partial clear first
-// materializes a word from the default so cleared lanes remain exact zero while
-// adjacent lanes retain the previous block history.
+// its default and clears materialized overrides in place. A partial clear of a
+// compact/default-only block records exact zero directly in its compact
+// metadata; blocks with materialized words retain the exact per-word fallback.
 func (pt *PageTableShadow) ClearRange(addr, size uintptr) {
 	if size == 0 || size-1 > ^uintptr(0)-addr {
 		return
@@ -726,6 +732,24 @@ func (pt *PageTableShadow) ClearRange(addr, size uintptr) {
 }
 
 func (pt *PageTableShadow) clearExactRange(addr, size uintptr) {
+	// The ordinary allocator shape is one sub-block object backed only by a
+	// compact/default history. Its absent slot table is permanent while the
+	// block lock is held, so drain the default transaction and mutate compact
+	// metadata once instead of repeating both operations for every aligned word.
+	// Once any word has materialized, keep the established per-word path below:
+	// published slots remain authoritative for the lifetime of the block.
+	if size != 0 && size <= rangeBlockSize-(addr&(rangeBlockSize-1)) {
+		if view, ok := pt.blockFor(addr, false); ok && view.slotTable(false) == nil {
+			view.history.mu.lock()
+			if view.slotTable(false) == nil {
+				clearUnmaterializedRangeBlockLocked(view, addr, size)
+				view.history.mu.unlock()
+				return
+			}
+			view.history.mu.unlock()
+		}
+	}
+
 	for current, remaining := addr, size; remaining != 0; {
 		lane := current & 7
 		count := uintptr(8) - lane
@@ -741,36 +765,42 @@ func (pt *PageTableShadow) clearExactRange(addr, size uintptr) {
 			if slot != nil {
 				slot.clearMaskBlockLocked(mask)
 			} else {
-				compact := view.history.compact.Load()
-				defaultState := view.history.state.Load()
-				if compact == nil {
-					if defaultState != nil {
-						runtimeThrow("race detector block default missing compact clear metadata")
-					}
-				} else {
-					// Allocator clears can run from GC sweep, where heap allocation is
-					// forbidden. Drain the inherited default while the embedded compact
-					// tombstone becomes authoritative, then retire exact memberships and
-					// advance the block generation without materializing a slot.
-					if defaultState != nil {
-						if binding := defaultState.atomicState.Load(); binding != nil {
-							binding.escapeIncompatible()
-						}
-						defaultState.LockAccess()
-						if binding := defaultState.atomicState.Load(); binding != nil {
-							binding.escapeIncompatible()
-						}
-					}
-					compact.clearRangeKnownDefault(current, count, defaultState != nil)
-					if defaultState != nil {
-						defaultState.UnlockAccess()
-					}
-				}
+				clearUnmaterializedRangeBlockLocked(view, current, count)
 			}
 			view.history.mu.unlock()
 		}
 		current += count
 		remaining -= count
+	}
+}
+
+// clearUnmaterializedRangeBlockLocked clears one exact in-block range whose
+// selected words have no published slot. The caller holds the block lock.
+func clearUnmaterializedRangeBlockLocked(view blockView, addr, size uintptr) {
+	compact := view.history.compact.Load()
+	defaultState := view.history.state.Load()
+	if compact == nil {
+		if defaultState != nil {
+			runtimeThrow("race detector block default missing compact clear metadata")
+		}
+		return
+	}
+
+	// Allocator clears can run from GC sweep, where heap allocation is
+	// forbidden. Drain the inherited default while compact tombstones become
+	// authoritative, then retire exact memberships and advance the generation.
+	if defaultState != nil {
+		if binding := defaultState.atomicState.Load(); binding != nil {
+			binding.escapeIncompatible()
+		}
+		defaultState.LockAccess()
+		if binding := defaultState.atomicState.Load(); binding != nil {
+			binding.escapeIncompatible()
+		}
+	}
+	compact.clearRangeKnownDefault(addr, size, defaultState != nil)
+	if defaultState != nil {
+		defaultState.UnlockAccess()
 	}
 }
 

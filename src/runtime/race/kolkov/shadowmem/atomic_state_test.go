@@ -31,7 +31,7 @@ func TestAtomicStateUsesExistingVarStatePadding(t *testing.T) {
 	if got, want := unsafe.Sizeof(ShadowSlot{}), uintptr(72); got != want {
 		t.Fatalf("ShadowSlot size = %d, want %d; atomic fast metadata must remain out-of-line", got, want)
 	}
-	if got, want := unsafe.Sizeof(AtomicFastPath{}), uintptr(40); got != want {
+	if got, want := unsafe.Sizeof(AtomicFastPath{}), uintptr(56); got != want {
 		t.Fatalf("atomic-only sidecar size = %d, want %d", got, want)
 	}
 }
@@ -46,6 +46,40 @@ func TestAtomicStateResetDropsOpaqueHistory(t *testing.T) {
 	state.Reset()
 	if got := state.GetAtomicState(); got != nil {
 		t.Fatalf("atomic history after Reset = %p, want nil", got)
+	}
+}
+
+func TestAtomicStateCloneBalancesSidecarOwnership(t *testing.T) {
+	state := NewVarState()
+	overlay := unsafe.Pointer(new(byte))
+	retains, releases := 0, 0
+	retain := func(p unsafe.Pointer) {
+		if p != overlay {
+			t.Fatalf("retained overlay %p, want %p", p, overlay)
+		}
+		retains++
+	}
+	release := func(p unsafe.Pointer) {
+		if p != overlay {
+			t.Fatalf("released overlay %p, want %p", p, overlay)
+		}
+		releases++
+	}
+	state.LockAccess()
+	state.SetAtomicStateOwned(overlay, retain, release)
+	clone := state.CloneOrdinaryLocked()
+	state.UnlockAccess()
+	if retains != 2 || releases != 0 {
+		t.Fatalf("sidecar ownership after clone = retains %d releases %d, want 2/0", retains, releases)
+	}
+
+	state.Reset()
+	if clone.GetAtomicState() != overlay || releases != 1 {
+		t.Fatalf("first detach changed surviving clone: overlay=%p releases=%d", clone.GetAtomicState(), releases)
+	}
+	clone.Reset()
+	if retains != 2 || releases != 2 {
+		t.Fatalf("balanced sidecar ownership = retains %d releases %d, want 2/2", retains, releases)
 	}
 }
 

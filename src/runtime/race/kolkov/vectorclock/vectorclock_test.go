@@ -795,6 +795,80 @@ func TestVectorClockSparseCloneCopyResetAndPoolReuse(t *testing.T) {
 	}
 }
 
+func TestVectorClockReusesRetainedMetadataForStructuralGrowth(t *testing.T) {
+	base := New()
+	base.JoinRange(DenseThreads+10_000, DenseThreads+10_010, 1)
+	incoming := New()
+	incoming.JoinRange(DenseThreads+20_000, DenseThreads+20_010, 2)
+	dst := New()
+	dst.sparseRuns = make([]finiteRun, 0, 8)
+
+	if allocs := testing.AllocsPerRun(1000, func() {
+		dst.CopyFrom(base)
+		dst.Join(incoming)
+	}); allocs != 0 {
+		t.Fatalf("disjoint sparse append allocated %.2f objects per join with retained capacity", allocs)
+	}
+	if got := dst.Get(DenseThreads + 10_005); got != 1 {
+		t.Fatalf("destination base coordinate = %d, want 1", got)
+	}
+	if got := dst.Get(DenseThreads + 20_005); got != 2 {
+		t.Fatalf("destination appended coordinate = %d, want 2", got)
+	}
+	if got := incoming.Get(DenseThreads + 20_005); got != 2 {
+		t.Fatalf("join mutated source coordinate to %d, want 2", got)
+	}
+
+	retiredBase := New()
+	retiredBase.RetireRange(10, 20)
+	retiredIncoming := []RetiredRange{{First: 30, Last: 40}, {First: ^uint32(0) - 2, Last: ^uint32(0)}}
+	dst.retired = make([]RetiredRange, 0, 8)
+	if allocs := testing.AllocsPerRun(1000, func() {
+		dst.CopyFrom(retiredBase)
+		dst.RetireRanges(retiredIncoming)
+	}); allocs != 0 {
+		t.Fatalf("retirement merge allocated %.2f objects with retained capacity", allocs)
+	}
+	wantRetired := []RetiredRange{{First: 10, Last: 20}, {First: 30, Last: 40}, {First: ^uint32(0) - 2, Last: ^uint32(0)}}
+	if len(dst.retired) != len(wantRetired) {
+		t.Fatalf("retirement merge = %+v, want %+v", dst.retired, wantRetired)
+	}
+	for i := range wantRetired {
+		if dst.retired[i] != wantRetired[i] {
+			t.Fatalf("retirement merge = %+v, want %+v", dst.retired, wantRetired)
+		}
+	}
+	if retiredIncoming[0] != (RetiredRange{First: 30, Last: 40}) ||
+		retiredIncoming[1] != (RetiredRange{First: ^uint32(0) - 2, Last: ^uint32(0)}) {
+		t.Fatalf("retirement merge mutated input: %+v", retiredIncoming)
+	}
+}
+
+func TestVectorClockRetireRangesRetainedCapacityDropsSubsumedIntervals(t *testing.T) {
+	vc := New()
+	vc.retired = append(make([]RetiredRange, 0, 8),
+		RetiredRange{First: 17, Last: 18},
+		RetiredRange{First: 20, Last: 27},
+		RetiredRange{First: 29, Last: 30},
+	)
+	incoming := []RetiredRange{
+		{First: 17, Last: 42},
+		{First: 47, Last: 48},
+		{First: 60, Last: 60},
+		{First: 62, Last: 63},
+	}
+
+	vc.RetireRanges(incoming)
+	if len(vc.retired) != len(incoming) {
+		t.Fatalf("retirement merge retained subsumed intervals: got %+v, want %+v", vc.retired, incoming)
+	}
+	for i := range incoming {
+		if vc.retired[i] != incoming[i] {
+			t.Fatalf("retirement merge[%d] = %+v, want %+v", i, vc.retired[i], incoming[i])
+		}
+	}
+}
+
 func TestVectorClockRangeStopsAndAllocatesNothing(t *testing.T) {
 	vc := New()
 	vc.Set(1, 1)
@@ -1536,6 +1610,36 @@ func BenchmarkVectorClockJoin(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			dst.JoinCanonicalRanges(ranges)
+		}
+	})
+}
+
+func BenchmarkVectorClockStructuralReuse(b *testing.B) {
+	b.Run("DisjointSparseAppend", func(b *testing.B) {
+		base := New()
+		base.JoinRange(DenseThreads+10_000, DenseThreads+10_010, 1)
+		incoming := New()
+		incoming.JoinRange(DenseThreads+20_000, DenseThreads+20_010, 2)
+		dst := New()
+		dst.sparseRuns = make([]finiteRun, 0, 8)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			dst.CopyFrom(base)
+			dst.Join(incoming)
+		}
+	})
+	b.Run("RetirementMerge", func(b *testing.B) {
+		base := New()
+		base.RetireRange(10, 20)
+		incoming := []RetiredRange{{First: 30, Last: 40}, {First: 50, Last: 60}}
+		dst := New()
+		dst.retired = make([]RetiredRange, 0, 8)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			dst.CopyFrom(base)
+			dst.RetireRanges(incoming)
 		}
 	})
 }

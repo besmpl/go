@@ -3,24 +3,7 @@ package detector
 import (
 	"runtime/race/kolkov/epoch"
 	"runtime/race/kolkov/stackdepot"
-	"unsafe"
 )
-
-// Ensure unsafe is imported for go:linkname.
-var _ = unsafe.Sizeof(0)
-
-// Runtime functions via linkname (for report formatting).
-
-//go:linkname runtimeCallersReport runtime.Callers
-func runtimeCallersReport(skip int, pc []uintptr) int
-
-//go:linkname runtimeCallersFramesReport runtime.CallersFrames
-func runtimeCallersFramesReport(callers []uintptr) *runtimeFramesReport
-
-type runtimeFramesReport struct{}
-
-//go:linkname runtimeFramesNextReport runtime.kolkovFramesNext
-func runtimeFramesNextReport(f *runtimeFramesReport) (pc uintptr, function, file string, line int, more bool)
 
 type runtimeFrameReport struct {
 	PC       uintptr
@@ -28,18 +11,6 @@ type runtimeFrameReport struct {
 	File     string
 	Line     int
 }
-
-// kolkovIncrementErrors increments the runtime's race error counter.
-// The runtime uses this counter in RaceErrors() to determine exit code 66.
-//
-//go:linkname kolkovIncrementErrors runtime.kolkovIncrementErrors
-func kolkovIncrementErrors()
-
-// kolkovReportDone applies report-time runtime policy only after the complete
-// warning has been emitted (for example, GORACE=halt_on_error=1).
-//
-//go:linkname kolkovReportDone runtime.kolkovReportDone
-func kolkovReportDone()
 
 // Note: printstring and printuint are declared in detector.go via linkname.
 

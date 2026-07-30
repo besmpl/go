@@ -41,7 +41,15 @@
 // Performance:
 //   - Existing-address GetOrCreate: lock-free page/segment chain lookup
 //   - First access: one sharded writer lock and lazy state allocation
+//   - Writer locks: immediate CAS, then TTAS polling in budgets 1, 2, 4, 8,
+//     16, and 32 before the runtime's yielding fallback; the schedule repeats
 //   - ClearRange: indexed by touched pages, with a sparse scan for huge spans
 //   - Memory: state and vector clocks are allocated lazily and retain sparse
 //     storage capacity for reuse
+//
+// Writer locking bounds active polling between runtime fallbacks, but is not
+// FIFO and does not promise unconditional starvation freedom. Published address
+// owners keep immutable identity fields and removed nodes are reclaimed only
+// after Go's garbage collector proves no lock-free reader still retains them.
+// SyncShadow.Stats reports exact live cardinality only at a quiescent point.
 package syncshadow

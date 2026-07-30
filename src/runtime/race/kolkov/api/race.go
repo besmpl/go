@@ -123,6 +123,11 @@ var (
 	lifecycleMu spinlockAPI
 	pendingTIDs map[uint32]struct{}
 
+	// lifecycleState separates global recording policy from the per-goroutine
+	// suppression implemented by runtime.RaceDisable. DirtyDisabled cannot be
+	// published Enabled again without a quiescent drain through Reset or Init.
+	lifecycleState atomic.Uint32
+
 	// detachedContexts roots temporary logical contexts used when one runtime
 	// goroutine executes independent cleanup callbacks. Those contexts live
 	// outside contextsMap because the goroutine's ordinary context must remain
@@ -131,7 +136,7 @@ var (
 
 	// nextTID allocates process-lifetime monotonic logical IDs. Reusing a
 	// vector-clock coordinate for an unrelated goroutine lifetime is unsound.
-	nextTID atomic.Uint32
+	nextTID tidHighWater
 
 	// det is the global detector instance.
 	// All race detection flows through this single instance.
@@ -163,6 +168,43 @@ var (
 	// 100ms = 100_000_000 ns
 	spawnContextTTLNs int64 = 100_000_000
 )
+
+type detectorLifecycle uint32
+
+const (
+	lifecycleVirgin detectorLifecycle = iota
+	lifecycleEnabled
+	lifecycleDirtyDisabled
+	lifecycleResetting
+)
+
+const exhaustedTIDHighWater = uint64(1) << epoch.TIDBits
+
+// tidHighWater keeps the process-lifetime allocator in an atomic uint64 while
+// retaining the uint32 diagnostic seam used by older package tests. Production
+// allocation and exhaustion checks always use the full-width methods.
+type tidHighWater struct {
+	value atomic.Uint64
+}
+
+func (h *tidHighWater) Load() uint32 { return uint32(h.value.Load()) }
+func (h *tidHighWater) CompareAndSwap(old, new uint32) bool {
+	return h.value.CompareAndSwap(uint64(old), uint64(new))
+}
+func (h *tidHighWater) load64() uint64       { return h.value.Load() }
+func (h *tidHighWater) store64(value uint64) { h.value.Store(value) }
+func (h *tidHighWater) reserve() (uint32, bool) {
+	for {
+		current := h.value.Load()
+		if current >= exhaustedTIDHighWater-1 {
+			return 0, false
+		}
+		next := current + 1
+		if h.value.CompareAndSwap(current, next) {
+			return uint32(next), true
+		}
+	}
+}
 
 // Kept as an alias for package tests and diagnostics that inspect detached
 // roots. It is the same lifecycle registry lock, not an independent lock.
@@ -325,13 +367,13 @@ func ensureInitialized() {
 	// Type-assert once here to avoid interface dispatch on every access.
 	shadow = det.GetShadow().(*shadowmem.PageTableShadow)
 
-	// TID 0 is the uninitialized ownership sentinel. The first allocated
-	// context (main) receives 1.
-	nextTID.Store(0)
+	// Static zero is the only initialization of the process-lifetime high-water.
+	// No later lifecycle transition may rewind it.
 
 	// Publish fully initialized lifecycle state before enabling user events.
 	apiInitCalled.Store(2)
-	enabled.Store(1) // 1 = enabled
+	lifecycleState.Store(uint32(lifecycleEnabled))
+	enabled.Store(1) // publish readiness last
 }
 
 // raceread is called by compiler instrumentation on every read access.
@@ -469,8 +511,9 @@ func racegostart(pc uintptr) uintptr {
 func enqueueSpawn(pc uintptr, parentGID int64, parentCtx *goroutine.RaceContext) uintptr {
 	var spawnClock *vectorclock.VectorClock
 	if parentCtx != nil && parentCtx.C != nil {
+		next := parentCtx.PreflightClockAdvance()
 		spawnClock = parentCtx.C.Clone()
-		parentCtx.IncrementClock()
+		parentCtx.CommitClockAdvance(next)
 	}
 	info := &spawnInfo{
 		id:          nextSpawnID.Add(1),
@@ -550,15 +593,22 @@ func raceContextStartFromRuntime(creationPC uintptr, spawnctx uintptr) uintptr {
 		return 0
 	}
 
+	var parent *goroutine.RaceContext
+	var parentNext uint64
+	if spawnctx > 1 {
+		parent = (*goroutine.RaceContext)(unsafe.Pointer(spawnctx))
+		if parent.C != nil {
+			parentNext = parent.PreflightClockAdvance()
+		}
+	}
 	tid, startClock := allocTID()
 	var ctx *goroutine.RaceContext
-	if spawnctx > 1 {
-		parent := (*goroutine.RaceContext)(unsafe.Pointer(spawnctx))
-		if parent.C != nil {
+	if parent != nil {
+		if parentNext != 0 {
 			// Copy before advancing: the child observes everything before the
 			// fork, while later parent operations remain unordered with it.
 			ctx = goroutine.AllocWithParentClock(tid, parent.C, startClock)
-			parent.IncrementClock()
+			parent.CommitClockAdvance(parentNext)
 		}
 	}
 	if ctx == nil {
@@ -672,9 +722,13 @@ func consumeSpawnContextByIDLocked(contexts *[]*spawnInfo, spawnID uintptr, chil
 //
 //go:linkname raceGoSetChildIDWithCtx
 func raceGoSetChildIDWithCtx(childGoid int64, spawnID uintptr) uintptr {
-	if apiInitCalled.Load() != 2 {
+	if apiInitCalled.Load() != 2 || detectorLifecycle(lifecycleState.Load()) == lifecycleResetting {
 		return 0
 	}
+
+	// Reserve the identity before consuming the spawn record. Exhaustion must
+	// fail without removing or releasing a pending parent clock.
+	tid, startClock := allocTID()
 
 	// Step 1: Consume the exact context returned by racegostart. Creation can
 	// proceed concurrently on multiple Ps, so "most recent" is not a stable
@@ -685,8 +739,6 @@ func raceGoSetChildIDWithCtx(childGoid int64, spawnID uintptr) uintptr {
 	parentClock := claimed.parentClock
 
 	// Step 2: Eagerly create the child's RaceContext.
-	tid, startClock := allocTID()
-
 	var ctx *goroutine.RaceContext
 	if parentClock != nil {
 		ctx = goroutine.AllocWithParentClock(tid, parentClock, startClock)
@@ -787,27 +839,25 @@ func raceFinalizerGoFromRuntime(racectx uintptr) {
 	if target.C == nil {
 		return
 	}
+	targetNext := target.PreflightClockAdvance()
 
 	lifecycleMu.lock()
-	highwater := nextTID.Load()
-	liveEpochs := make([]epoch.Epoch, 0, len(pendingTIDs)+1)
+	highwater := nextTID.load64()
+	type liveEpochSnapshot struct {
+		ctx *goroutine.RaceContext
+		e   epoch.Epoch
+	}
+	liveEpochs := make([]liveEpochSnapshot, 0, len(pendingTIDs)+1)
 	snapshotEpoch := func(ctx *goroutine.RaceContext) {
 		e := contextEpochSnapshot(ctx)
 		if e == 0 {
 			return
 		}
 		tid, _ := e.Decode()
-		if tid == 0 || tid > highwater {
+		if tid == 0 || uint64(tid) > highwater {
 			return
 		}
-		// Joining this epoch into the finalizer orders its next write after
-		// accesses already represented by the source cache. Invalidate cache
-		// hits at that epoch before publishing the joined clock; otherwise the
-		// finalizer can replace read history and a later unsynchronized source
-		// read can incorrectly reuse the stale cache entry. The atomic marker
-		// leaves the cache fields themselves source-owned.
-		ctx.InvalidateReadCacheAt(e)
-		liveEpochs = append(liveEpochs, e)
+		liveEpochs = append(liveEpochs, liveEpochSnapshot{ctx: ctx, e: e})
 	}
 	contextsMap.rangeLocked(func(_ int64, ctx *goroutine.RaceContext) bool {
 		snapshotEpoch(ctx)
@@ -820,39 +870,53 @@ func raceFinalizerGoFromRuntime(racectx uintptr) {
 	}
 	liveTIDs := make([]uint32, 0, len(liveEpochs)+len(pendingTIDs))
 	for tid := range pendingTIDs {
-		if tid != 0 && tid <= highwater {
+		if tid != 0 && uint64(tid) <= highwater {
 			liveTIDs = append(liveTIDs, tid)
 		}
 	}
-	lifecycleMu.unlock()
-
-	// The copied epochs and TIDs define the snapshot's linearization point.
-	// Expensive sorting, interval construction, and vector-clock mutation do not
-	// hold the lifecycle spinlock or retain pointers that an end may release.
 	foreignImport := false
-	for _, e := range liveEpochs {
-		tid, clock := e.Decode()
+	for _, snapshot := range liveEpochs {
+		tid, clock := snapshot.e.Decode()
 		liveTIDs = append(liveTIDs, tid)
-		if uint32(clock) > target.C.Get(tid) {
-			target.C.Set(tid, uint32(clock))
-			if tid != target.TID {
-				foreignImport = true
-			}
+		if uint32(clock) > target.C.Get(tid) && tid != target.TID {
+			foreignImport = true
 		}
 	}
 	sortUint32s(liveTIDs)
-	retired := retiredComplement(highwater, liveTIDs)
-	target.C.RetireRanges(retired)
+	retired := retiredComplement(uint32(highwater), liveTIDs)
 	if len(retired) != 0 {
 		// Retirement is a foreign +infinity import even when every finite live
 		// epoch was already dominated by target.
 		foreignImport = true
 	}
+	if foreignImport && target.ForeignGeneration == ^uint64(0) {
+		runtimeThrow("race detector foreign-clock generation overflow")
+	}
+	// Joining these epochs into the finalizer orders its next write after source
+	// reads already represented by their caches. Invalidate each source while the
+	// lifecycle lock still pins its context; no source pointer escapes the
+	// snapshot critical section.
+	for i := range liveEpochs {
+		liveEpochs[i].ctx.InvalidateReadCacheAt(liveEpochs[i].e)
+		liveEpochs[i].ctx = nil
+	}
+	lifecycleMu.unlock()
+
+	// The copied epochs and retired ranges define the snapshot's linearization
+	// point. Vector-clock mutation occurs after all fallible preflight checks and
+	// without retaining pointers that an end callback may release.
+	for _, snapshot := range liveEpochs {
+		tid, clock := snapshot.e.Decode()
+		if uint32(clock) > target.C.Get(tid) {
+			target.C.Set(tid, uint32(clock))
+		}
+	}
+	target.C.RetireRanges(retired)
 	if foreignImport {
 		target.NoteForeignImport()
 	}
 
-	target.IncrementClock()
+	target.CommitClockAdvance(targetNext)
 }
 
 // sortUint32s is an in-place heap sort. This package is part of runtime and
@@ -1481,13 +1545,14 @@ func getCurrentContext() *goroutine.RaceContext {
 	// Step 3: Slow path - allocate new context for this goroutine.
 	// This happens once per goroutine at first access.
 
+	// Reserve a never-reused logical ID before consuming a spawn record. TID
+	// exhaustion must leave the pending fork clock published and claimable.
+	tid, startClock := allocTID()
+
 	// Step 3a: Try to find spawn context from parent (GoStart inheritance).
 	// If parent called racegostart() before spawning us, we inherit their clock.
 	claimed := findAndClaimSpawnContext()
 	parentClock := claimed.parentClock
-
-	// Allocate a never-reused logical ID.
-	tid, startClock := allocTID()
 
 	// Create new RaceContext for this goroutine.
 	var ctx *goroutine.RaceContext
@@ -1515,8 +1580,9 @@ func getCurrentContext() *goroutine.RaceContext {
 // coordinate. The uint32 space is intentionally a hard correctness boundary.
 func allocTID() (tid uint32, startClock uint32) {
 	lifecycleMu.lock()
-	tid = nextTID.Add(1)
-	if tid == 0 {
+	var ok bool
+	tid, ok = nextTID.reserve()
+	if !ok {
 		lifecycleMu.unlock()
 		runtimeThrow("race detector exhausted logical goroutine IDs")
 	}
@@ -1582,10 +1648,16 @@ func raceClearShadow(addr, size uintptr) {
 // Enable is not a sound resume boundary after tracked program execution was
 // globally disabled: intervening accesses were intentionally unobserved and
 // may have superseded shadow or synchronization history. Call Init to begin a
-// fresh detection lifetime. Enable is safe only before tracked work or after a
-// quiescent Reset.
+// fresh detection lifetime. Enable cannot prove global quiescence and therefore
+// fails closed for DirtyDisabled or Resetting state; callers must invoke Reset
+// explicitly at a proven-quiescent boundary.
 func Enable() {
-	enabled.Store(1)
+	switch detectorLifecycle(lifecycleState.Load()) {
+	case lifecycleEnabled:
+		enabled.Store(1)
+	case lifecycleDirtyDisabled, lifecycleResetting:
+		runtimeThrow("race detector dirty state requires quiescent Reset before Enable")
+	}
 }
 
 // Disable turns off race detection for package tests and benchmarks.
@@ -1598,7 +1670,14 @@ func Enable() {
 // The flag update is atomic, but callers must quiesce detector users before a
 // later Reset or Init.
 func Disable() {
+	lifecycleMu.lock()
+	// Stop new event entry even if a diagnostic test directly changed the fast
+	// flag. DirtyDisabled remains idempotent across repeated Fini calls.
 	enabled.Store(0)
+	if detectorLifecycle(lifecycleState.Load()) != lifecycleResetting {
+		lifecycleState.Store(uint32(lifecycleDirtyDisabled))
+	}
+	lifecycleMu.unlock()
 }
 
 // RacesDetected returns the total number of races detected.
@@ -1683,19 +1762,7 @@ func RaceReleaseMerge(addr uintptr) {
 // Thread Safety: NOT safe for concurrent access.
 // The caller must ensure no other goroutines are using the detector.
 func Reset() {
-	deactivateAllAtomicLoadCaches()
-	det.Reset()
-	// Clear goroutine contexts.
-	contextsMap.Reset()
-	detachedContextsMu.lock()
-	detachedContexts = nil
-	pendingTIDs = nil
-	detachedContextsMu.unlock()
-	// Clear spawn context tracking.
-	spawnContextsMu.lock()
-	spawnContextsSlice = nil
-	spawnContextsMu.unlock()
-	nextSpawnID.Store(0)
+	resetLifecycle(false, false)
 }
 
 // Init initializes the race detector for use.
@@ -1730,49 +1797,94 @@ func Reset() {
 //	    // Your program code here...
 //	}
 func Init() {
-	deactivateAllAtomicLoadCaches()
-	// Enable race detection.
-	enabled.Store(1)
-
-	// Create a fresh detector instance.
-	// Note: Sampling configuration is disabled in runtime context (no os.Getenv).
-	det = detector.NewDetector()
-	shadow = det.GetShadow().(*shadowmem.PageTableShadow)
-
-	// Clear any existing goroutine contexts.
-	contextsMap.Reset()
-	detachedContextsMu.lock()
-	detachedContexts = nil
-	pendingTIDs = nil
-	detachedContextsMu.unlock()
-
-	// Clear spawn context tracking (GoStart).
-	spawnContextsMu.lock()
-	spawnContextsSlice = nil
-	spawnContextsMu.unlock()
-	nextSpawnID.Store(0)
-
-	// Allocate RaceContext for the main goroutine.
-	// CRITICAL: Main goroutine gets a non-zero monotonic TID.
-	// TID=0 is reserved as sentinel value meaning "no exclusive writer" in SmartTrack.
-	// Using TID=0 would cause SmartTrack to incorrectly treat main's writes
-	// as "no writer present", missing races when child goroutines write.
-	gid := getGoroutineID()
-	mainTID, startClock := allocTID()
-	mainCtx := goroutine.AllocWithStartClock(mainTID, startClock)
-	contextsMap.Store(gid, mainCtx)
+	resetLifecycle(true, true)
 }
 
-func deactivateAllAtomicLoadCaches() {
-	contextsMap.Range(func(_ int64, ctx *goroutine.RaceContext) bool {
-		detector.DeactivateAtomicLoadCache(ctx)
+// resetLifecycle is called only at caller-proven quiescent boundaries. It
+// detaches every API-owned root while holding lifecycleMu, releases detached
+// ownership after unlocking, resets detector state, and publishes readiness
+// and Enabled last. Process-lifetime TIDs are deliberately not touched.
+func resetLifecycle(freshDetector, createCallerContext bool) {
+	if createCallerContext {
+		// Init must fail for identity exhaustion before disabling, detaching, or
+		// resetting any published detector state. Init is a caller-proven
+		// quiescent boundary, so this check remains valid until allocTID below.
+		lifecycleMu.lock()
+		exhausted := nextTID.load64() >= exhaustedTIDHighWater-1
+		lifecycleMu.unlock()
+		if exhausted {
+			runtimeThrow("race detector exhausted logical goroutine IDs")
+		}
+	}
+	enabled.Store(0)
+	apiInitCalled.Store(1)
+
+	lifecycleMu.lock()
+	lifecycleState.Store(uint32(lifecycleResetting))
+	var contexts []*goroutine.RaceContext
+	contextsMap.rangeLocked(func(_ int64, ctx *goroutine.RaceContext) bool {
+		contexts = append(contexts, ctx)
 		return true
 	})
-	detachedContextsMu.lock()
+	contextsMap.resetLocked()
 	for _, ctx := range detachedContexts {
-		detector.DeactivateAtomicLoadCache(ctx)
+		contexts = append(contexts, ctx)
 	}
-	detachedContextsMu.unlock()
+	detachedContexts = nil
+	pendingTIDs = nil
+
+	// Structural child binding checks Resetting before reserving a TID. Holding
+	// the spawn lock here transfers every pending clock into this reset exactly
+	// once before new recording is published.
+	spawnContextsMu.lock()
+	spawns := spawnContextsSlice
+	spawnContextsSlice = nil
+	spawnContextsMu.unlock()
+	lifecycleMu.unlock()
+
+	seen := make(map[*goroutine.RaceContext]struct{}, len(contexts))
+	for _, ctx := range contexts {
+		if ctx == nil {
+			continue
+		}
+		if _, duplicate := seen[ctx]; duplicate {
+			continue
+		}
+		seen[ctx] = struct{}{}
+		detector.DeactivateAtomicLoadCache(ctx)
+		if ctx.C != nil {
+			ctx.C.Release()
+			ctx.C = nil
+		}
+	}
+	for _, info := range spawns {
+		if info != nil && info.parentClock != nil {
+			info.parentClock.Release()
+			info.parentClock = nil
+		}
+	}
+	if det != nil {
+		det.Reset()
+	}
+	if freshDetector || det == nil {
+		det = detector.NewDetector()
+	}
+	shadow = det.GetShadow().(*shadowmem.PageTableShadow)
+	nextSpawnID.Store(0)
+	if createCallerContext {
+		// Create and root the caller before publishing Enabled. TID zero remains
+		// reserved by current FastTrack ownership encodings.
+		gid := getGoroutineID()
+		tid, startClock := allocTID()
+		ctx := goroutine.AllocWithStartClock(tid, startClock)
+		contextsMap.Store(gid, ctx)
+	}
+
+	lifecycleMu.lock()
+	lifecycleState.Store(uint32(lifecycleEnabled))
+	apiInitCalled.Store(2)
+	enabled.Store(1)
+	lifecycleMu.unlock()
 }
 
 // Fini finalizes the race detector and prints a summary report.
@@ -1825,7 +1937,7 @@ func Fini() {
 //
 //go:linkname runtimeFini
 func runtimeFini() {
-	enabled.Store(0)
+	Disable()
 }
 
 func formatFiniSummary(racesDetected int) string {
