@@ -78,14 +78,17 @@ func TestGoNoRace_ChanSyncRev(t *testing.T) {
 	var v int
 	addr := addrOf(&v)
 	c := make(chan int)
+	done := make(chan struct{})
 
 	go func() {
 		c <- 0
 		simulateAccess(addr, true) // v = 2
+		close(done)
 	}()
 
 	simulateAccess(addr, true) // v = 1
 	<-c
+	<-done
 
 	// Note: This pattern relies on channel send completing after receive.
 	// Without channel instrumentation, this may show as race.
