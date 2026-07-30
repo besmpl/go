@@ -43,17 +43,20 @@ type AtomicReleaseCacheEntry struct {
 // AtomicLoadCacheEntry is detector-owned metadata for one exact enrolled load
 // path. Every pointer is a GC root: Fast retains the immutable lifecycle
 // capability identity, State the atomic overlay identity, and Frontier the
-// registered per-TID read witness. The detector is the only package which
-// interprets these opaque pointers.
+// registered per-TID read witness. StateGeneration validates State across a
+// quiescent direct Detector.Reset, which can invalidate arena ownership without
+// visiting external contexts. The detector is the only package which interprets
+// these opaque fields.
 type AtomicLoadCacheEntry struct {
-	Fast       unsafe.Pointer
-	State      unsafe.Pointer
-	Frontier   unsafe.Pointer
-	Revision   uint64
-	Generation uint64
-	PC         uintptr
-	Mask       uint8
-	Internal   bool
+	Fast            unsafe.Pointer
+	State           unsafe.Pointer
+	Frontier        unsafe.Pointer
+	Revision        uint64
+	Generation      uint64
+	PC              uintptr
+	StateGeneration uint32
+	Mask            uint8
+	Internal        bool
 }
 
 // RaceContext represents the race detection state for a single goroutine.

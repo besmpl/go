@@ -40,6 +40,7 @@ func TestRaceContextLayoutOffsets(t *testing.T) {
 	if got := unsafe.Offsetof(ctx.ReadCacheWidths); got != readWidthOffset {
 		t.Fatalf("ReadCacheWidths offset = %d, want %d", got, readWidthOffset)
 	}
+	var loadEntry AtomicLoadCacheEntry
 	if ptrSize == 8 {
 		const (
 			atomicCacheOffset = uintptr(96)
@@ -51,8 +52,33 @@ func TestRaceContextLayoutOffsets(t *testing.T) {
 		if got := unsafe.Offsetof(ctx.ForeignGeneration); got != 344 {
 			t.Fatalf("ForeignGeneration offset = %d, want 344", got)
 		}
+		if got := unsafe.Offsetof(loadEntry.StateGeneration); got != 48 {
+			t.Fatalf("AtomicLoadCacheEntry.StateGeneration offset = %d, want 48", got)
+		}
+		if got := unsafe.Sizeof(loadEntry); got != 56 {
+			t.Fatalf("AtomicLoadCacheEntry size = %d, want 56", got)
+		}
 		if got := unsafe.Sizeof(ctx); got != wantSize {
 			t.Fatalf("RaceContext size = %d, want %d", got, wantSize)
+		}
+	} else {
+		if got := unsafe.Offsetof(ctx.AtomicReleaseCache); got != 56 {
+			t.Fatalf("AtomicReleaseCache offset = %d, want 56", got)
+		}
+		if got := unsafe.Offsetof(ctx.AtomicLoadCache); got != 120 {
+			t.Fatalf("AtomicLoadCache offset = %d, want 120", got)
+		}
+		if got := unsafe.Offsetof(ctx.ForeignGeneration); got != 240 {
+			t.Fatalf("ForeignGeneration offset = %d, want 240", got)
+		}
+		if got := unsafe.Offsetof(loadEntry.StateGeneration); got != 32 {
+			t.Fatalf("AtomicLoadCacheEntry.StateGeneration offset = %d, want 32", got)
+		}
+		if got := unsafe.Sizeof(loadEntry); got != 40 {
+			t.Fatalf("AtomicLoadCacheEntry size = %d, want 40", got)
+		}
+		if got := unsafe.Sizeof(ctx); got != 252 {
+			t.Fatalf("RaceContext size = %d, want 252", got)
 		}
 	}
 }

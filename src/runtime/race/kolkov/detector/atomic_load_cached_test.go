@@ -299,6 +299,180 @@ func TestAtomicCachedLoadFrontierPrunesAfterHBWriter(t *testing.T) {
 	if _, _, ok := d.AtomicBeginLoadFast(addr, 8, reader, pc, &token); ok {
 		t.Fatal("writer revision accepted a pruned cached frontier")
 	}
+	DeactivateAtomicLoadCache(reader)
+	if stats := d.atomicArena.Stats(); stats.Frontiers != 0 {
+		t.Fatalf("cache teardown retained %d fully pruned frontiers, want 0", stats.Frontiers)
+	}
+}
+
+func TestAtomicCachedLoadPrunedFrontierRecycleAdvancesGeneration(t *testing.T) {
+	d := NewDetector()
+	reader := goroutine.Alloc(70_033)
+	const (
+		addr = uintptr(0x51340)
+		pc   = uintptr(0x8132)
+	)
+	warmCachedLoadForTest(t, d, addr, reader, pc)
+	stale := ctxCacheEntryForTest(t, d, reader, addr, pc)
+
+	writer := goroutine.AllocWithParentClock(70_034, reader.C, 1)
+	var token AtomicToken
+	d.AtomicBeginPlain(addr, 8, writer, false, true, &token)
+	d.AtomicEnd(addr, 8, writer, &token, pc+1, true)
+	DeactivateAtomicLoadCache(reader)
+
+	freshReader := goroutine.Alloc(70_035)
+	const freshAddr = uintptr(0x51380)
+	warmCachedLoadForTest(t, d, freshAddr, freshReader, pc+2)
+	fresh := ctxCacheEntryForTest(t, d, freshReader, freshAddr, pc+2)
+	if fresh.Frontier != stale.Frontier {
+		t.Fatalf("freed frontier was not recycled: stale=%p fresh=%p", stale.Frontier, fresh.Frontier)
+	}
+	if fresh.Generation <= stale.Generation {
+		t.Fatalf("recycled frontier generation = %d, want greater than stale %d", fresh.Generation, stale.Generation)
+	}
+	DeactivateAtomicLoadCache(freshReader)
+}
+
+func TestAtomicCachedLoadPrunedFrontierStateSurvivesConcurrentClear(t *testing.T) {
+	d := NewDetector()
+	reader := goroutine.Alloc(70_036)
+	const (
+		addr = uintptr(0x513a0)
+		pc   = uintptr(0x8134)
+	)
+	warmCachedLoadForTest(t, d, addr, reader, pc)
+	oldState := atomicHistoryForTest(t, d, addr)
+
+	// Hold the exact capability across the hardware window. Clear closes that
+	// capability first and waits; completing the HB writer then fully prunes the
+	// cached frontier before clear drops the shadow binding's state ownership.
+	writer := goroutine.AllocWithParentClock(70_037, reader.C, 1)
+	var token AtomicToken
+	d.AtomicBeginPlain(addr, 8, writer, false, true, &token)
+	done := make(chan struct{})
+	go func() {
+		d.ClearShadowRange(addr, 8)
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("clear completed before the retained writer capability drained")
+	case <-time.After(10 * time.Millisecond):
+	}
+	d.AtomicEnd(addr, 8, writer, &token, pc+1, true)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("clear did not finish after the writer released its capability")
+	}
+	if stats := d.atomicArena.Stats(); stats.States != 1 || stats.Frontiers != 1 {
+		t.Fatalf("cache ownership did not retain the pruned state after clear: %+v", stats)
+	}
+
+	// The cleared address now receives a distinct sidecar. Tearing down the old
+	// cache entry must lock and retire only oldState, never the fresh generation.
+	freshReader := goroutine.Alloc(70_038)
+	warmCachedLoadForTest(t, d, addr, freshReader, pc+2)
+	freshState := atomicHistoryForTest(t, d, addr)
+	if freshState == oldState {
+		t.Fatal("clear reused a state still owned by the old cache entry")
+	}
+	freshEntry := ctxCacheEntryForTest(t, d, freshReader, addr, pc+2)
+	DeactivateAtomicLoadCache(reader)
+	freshState.mu.lock()
+	freshHead := freshState.readFrontiers
+	freshState.mu.unlock()
+	if freshHead == nil || unsafe.Pointer(freshHead) != freshEntry.Frontier {
+		t.Fatalf("old cache teardown detached fresh frontier: head=%p want=%p", freshHead, freshEntry.Frontier)
+	}
+	if stats := d.atomicArena.Stats(); stats.States != 1 || stats.Frontiers != 1 {
+		t.Fatalf("old cache teardown disturbed fresh state ownership: %+v", stats)
+	}
+	DeactivateAtomicLoadCache(freshReader)
+	d.ClearShadowRange(addr, 8)
+	if stats := d.atomicArena.Stats(); stats.States != 0 || stats.Frontiers != 0 {
+		t.Fatalf("clear lifecycle retained state or frontier ownership: %+v", stats)
+	}
+}
+
+func TestAtomicCachedLoadResetDropsStaleStateOwnership(t *testing.T) {
+	d := NewDetector()
+	oldReader := goroutine.Alloc(70_039)
+	const (
+		addr = uintptr(0x513b0)
+		pc   = uintptr(0x8138)
+	)
+	warmCachedLoadForTest(t, d, addr, oldReader, pc)
+	oldEntry := ctxCacheEntryForTest(t, d, oldReader, addr, pc)
+
+	// Direct detector users may reset without visiting external contexts. Arena
+	// reset invalidates the old cache ownership and may immediately reuse both
+	// physical slots for a fresh generation.
+	d.Reset()
+	freshReader := goroutine.Alloc(70_040)
+	warmCachedLoadForTest(t, d, addr, freshReader, pc+1)
+	freshEntry := ctxCacheEntryForTest(t, d, freshReader, addr, pc+1)
+	if freshEntry.State != oldEntry.State || freshEntry.Frontier != oldEntry.Frontier {
+		t.Fatalf("reset did not exercise physical state/frontier reuse: old=%p/%p fresh=%p/%p",
+			oldEntry.State, oldEntry.Frontier, freshEntry.State, freshEntry.Frontier)
+	}
+	if freshEntry.StateGeneration == oldEntry.StateGeneration {
+		t.Fatalf("reset reused state generation %d", freshEntry.StateGeneration)
+	}
+
+	DeactivateAtomicLoadCache(oldReader)
+	freshState := atomicHistoryForTest(t, d, addr)
+	freshState.mu.lock()
+	freshHead := freshState.readFrontiers
+	freshState.mu.unlock()
+	if freshHead == nil || unsafe.Pointer(freshHead) != freshEntry.Frontier {
+		t.Fatalf("stale reset cache detached fresh frontier: head=%p want=%p", freshHead, freshEntry.Frontier)
+	}
+	if stats := d.atomicArena.Stats(); stats.States != 1 || stats.Frontiers != 1 {
+		t.Fatalf("stale reset cache released fresh arena ownership: %+v", stats)
+	}
+	DeactivateAtomicLoadCache(freshReader)
+	d.ClearShadowRange(addr, 8)
+	if stats := d.atomicArena.Stats(); stats.States != 0 || stats.Frontiers != 0 {
+		t.Fatalf("reset lifecycle retained state or frontier ownership: %+v", stats)
+	}
+}
+
+func TestAtomicCachedLoadPrunedFrontierArenaPlateaus(t *testing.T) {
+	d := NewDetector()
+	const (
+		addr   = uintptr(0x513c0)
+		pc     = uintptr(0x8135)
+		cycles = atomicFrontierSlabSize*2 + 1
+	)
+
+	for i := 0; i < cycles; i++ {
+		reader := goroutine.Alloc(uint32(71_100 + i*2))
+		warmCachedLoadForTest(t, d, addr, reader, pc)
+		writer := goroutine.AllocWithParentClock(uint32(71_101+i*2), reader.C, 1)
+		var token AtomicToken
+		d.AtomicBeginPlain(addr, 8, writer, false, true, &token)
+		d.AtomicEnd(addr, 8, writer, &token, pc+1, true)
+		d.ClearShadowRange(addr, 8)
+		if stats := d.atomicArena.Stats(); stats.States != 1 || stats.Frontiers != 1 {
+			t.Fatalf("cycle %d lost cache-owned pruned state during clear: %+v", i, stats)
+		}
+		DeactivateAtomicLoadCache(reader)
+		stats := d.atomicArena.Stats()
+		if stats.States != 0 || stats.History != 0 || stats.Releases != 0 || stats.Ranges != 0 || stats.Frontiers != 0 {
+			t.Fatalf("cycle %d retained live arena objects: %+v", i, stats)
+		}
+	}
+	if got := len(d.atomicArena.states); got != 1 {
+		t.Fatalf("pruned state churn allocated %d slabs, want 1", got)
+	}
+	if got := len(d.atomicArena.frontiers); got != 1 {
+		t.Fatalf("pruned frontier churn allocated %d slabs, want 1", got)
+	}
+	if peak := d.atomicArena.Stats().PeakFrontiers; peak != 1 {
+		t.Fatalf("pruned frontier churn peak = %d, want 1", peak)
+	}
 }
 
 func TestAtomicCachedLoadEvictionFoldsLatestFrontier(t *testing.T) {
@@ -506,6 +680,31 @@ func TestAtomicCachedLoadReusesContextOwnedNode(t *testing.T) {
 	}
 }
 
+func TestAtomicCachedLoadRefreshBalancesStateOwnership(t *testing.T) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(70_063)
+	const addr = uintptr(0x51840)
+	for i := 0; i < goroutine.AtomicLoadCacheSlots; i++ {
+		warmCachedLoadForTest(t, d, addr, ctx, uintptr(0x8171+i))
+	}
+	for cycle := 0; cycle < 32; cycle++ {
+		for i := 0; i < goroutine.AtomicLoadCacheSlots; i++ {
+			// Locked refreshes update an existing same-state entry. They must keep
+			// its one ownership reference rather than retaining on every refresh.
+			completeCachedLoadSlowForTest(d, addr, ctx, uintptr(0x8171+i))
+		}
+	}
+	d.ClearShadowRange(addr, 8)
+	if stats := d.atomicArena.Stats(); stats.States != 1 || stats.Frontiers != goroutine.AtomicLoadCacheSlots {
+		t.Fatalf("cache did not retain one cleared state with %d frontiers: %+v", goroutine.AtomicLoadCacheSlots, stats)
+	}
+	DeactivateAtomicLoadCache(ctx)
+	stats := d.atomicArena.Stats()
+	if stats.States != 0 || stats.History != 0 || stats.Releases != 0 || stats.Ranges != 0 || stats.Frontiers != 0 {
+		t.Fatalf("cache teardown retained arena ownership after refresh churn: %+v", stats)
+	}
+}
+
 func TestAtomicCachedLoadDescriptorRegenerationDoesNotAliasFrontier(t *testing.T) {
 	d := NewDetector()
 	reader := goroutine.Alloc(70_065)
@@ -584,14 +783,20 @@ func TestAtomicCachedLoadDescriptorRegenerationDoesNotAliasFrontier(t *testing.T
 }
 
 func TestAtomicCachedLoadStaleGenerationCannotDonateActiveSpare(t *testing.T) {
-	var oldState, liveState atomicState
-	node := &atomicReadFrontier{tid: 70_067, pc: 0x8177}
-	node.generation.Store(2)
+	a := newAtomicHistoryArena()
+	oldState := a.newState(0x51a80)
+	liveState := a.newState(0x51ac0)
+	a.retainState(oldState)
+	a.retainState(liveState)
+	node := a.allocFrontier()
+	node.tid = 70_067
+	node.pc = 0x8177
 	node.mask.Store(0xff)
 	node.clock.Store(1)
 	liveState.readFrontiers = node
 	entry := goroutine.AtomicLoadCacheEntry{
-		State: unsafe.Pointer(&oldState), Frontier: unsafe.Pointer(node), Generation: 1,
+		State: unsafe.Pointer(oldState), Frontier: unsafe.Pointer(node), Generation: node.generation.Load() - 1,
+		StateGeneration: oldState.handle.generation,
 	}
 	ctx := goroutine.Alloc(70_067)
 	ctx.AtomicLoadCache[0] = entry
@@ -599,8 +804,23 @@ func TestAtomicCachedLoadStaleGenerationCannotDonateActiveSpare(t *testing.T) {
 	if spare := ctx.AtomicLoadCache[0].Frontier; spare != nil {
 		t.Fatalf("stale generation donated active node %p as a spare", spare)
 	}
-	if liveState.readFrontiers != node || node.mask.Load() != 0xff || node.generation.Load() != 2 {
+	if liveState.readFrontiers != node || node.mask.Load() != 0xff {
 		t.Fatal("stale detach mutated node owned by another state")
+	}
+	if stats := a.Stats(); stats.States != 1 || stats.Frontiers != 1 {
+		t.Fatalf("stale cache eviction ownership balance = %+v, want one live state/frontier", stats)
+	}
+	liveEntry := goroutine.AtomicLoadCacheEntry{
+		State: unsafe.Pointer(liveState), Frontier: unsafe.Pointer(node), Generation: node.generation.Load(),
+		StateGeneration: liveState.handle.generation,
+	}
+	spare := deactivateAtomicLoadEntry(liveEntry)
+	if spare != node {
+		t.Fatalf("live cache owner detached %p, want %p", spare, node)
+	}
+	a.freeFrontierNode(spare)
+	if stats := a.Stats(); stats.States != 0 || stats.Frontiers != 0 {
+		t.Fatalf("stale-generation test retained arena ownership: %+v", stats)
 	}
 }
 

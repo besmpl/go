@@ -460,6 +460,59 @@ func (release *atomicRelease) replay(ctx *goroutine.RaceContext, seenVersion uin
 	return expected == release.version+1, foreign
 }
 
+const atomicReleaseImportInlineRanges = 32
+
+// joinAtomicReleaseRanges imports one canonical release checkpoint in one
+// structural merge. Splitting a long linked checkpoint into fixed-size calls
+// makes each call re-merge the destination built by the preceding call, which
+// turns a fragmented release into quadratic allocation and copying. The
+// temporary slice owns only scalar range values; it never exposes arena-node
+// pointers beyond the transaction which keeps release alive.
+func joinAtomicReleaseRanges(clock *vectorclock.VectorClock, head *atomicReleaseRange) {
+	count := 0
+	for run := head; run != nil; run = run.next {
+		count++
+	}
+	if count == 0 {
+		return
+	}
+	var inline [atomicReleaseImportInlineRanges]vectorclock.FiniteRange
+	var ranges []vectorclock.FiniteRange
+	if count <= len(inline) {
+		ranges = inline[:count]
+	} else {
+		ranges = make([]vectorclock.FiniteRange, count)
+	}
+	for i, run := 0, head; run != nil; i, run = i+1, run.next {
+		ranges[i] = vectorclock.FiniteRange{First: run.first, Last: run.last, Clock: run.clock}
+	}
+	clock.JoinCanonicalRanges(ranges)
+}
+
+// retireAtomicReleaseRanges applies every +infinity interval in one merge for
+// the same reason as joinAtomicReleaseRanges. Retirement follows the finite
+// join so it remains immutable and removes every covered finite coordinate.
+func retireAtomicReleaseRanges(clock *vectorclock.VectorClock, head *atomicReleaseRange) {
+	count := 0
+	for run := head; run != nil; run = run.next {
+		count++
+	}
+	if count == 0 {
+		return
+	}
+	var inline [atomicReleaseImportInlineRanges]vectorclock.RetiredRange
+	var ranges []vectorclock.RetiredRange
+	if count <= len(inline) {
+		ranges = inline[:count]
+	} else {
+		ranges = make([]vectorclock.RetiredRange, count)
+	}
+	for i, run := 0, head; run != nil; i, run = i+1, run.next {
+		ranges[i] = vectorclock.RetiredRange{First: run.first, Last: run.last}
+	}
+	clock.RetireRanges(ranges)
+}
+
 // acquire imports each unique current release once. Exact current-version
 // cache hits are O(1); older hits replay a complete bounded delta suffix, and
 // every other case joins the exact canonical checkpoint.
@@ -503,35 +556,8 @@ func (s *atomicState) acquire(ctx *goroutine.RaceContext, mask uint8) {
 			}
 		}
 
-		var finite [32]vectorclock.FiniteRange
-		n := 0
-		for run := release.runs; run != nil; run = run.next {
-			finite[n] = vectorclock.FiniteRange{First: run.first, Last: run.last, Clock: run.clock}
-			n++
-			if n == len(finite) {
-				ctx.C.JoinCanonicalRanges(finite[:])
-				n = 0
-			}
-		}
-		if n != 0 {
-			ctx.C.JoinCanonicalRanges(finite[:n])
-		}
-		// Retirement is +infinity causal metadata, not a finite MaxUint32
-		// clock. Apply it after finite joins so it remains immutable and drops
-		// any covered finite coordinates in the destination.
-		var retired [32]vectorclock.RetiredRange
-		n = 0
-		for run := release.retired; run != nil; run = run.next {
-			retired[n] = vectorclock.RetiredRange{First: run.first, Last: run.last}
-			n++
-			if n == len(retired) {
-				ctx.C.RetireRanges(retired[:])
-				n = 0
-			}
-		}
-		if n != 0 {
-			ctx.C.RetireRanges(retired[:n])
-		}
+		joinAtomicReleaseRanges(ctx.C, release.runs)
+		retireAtomicReleaseRanges(ctx.C, release.retired)
 		if releaseHasForeignMetadata(release, ctx.TID) {
 			ctx.NoteForeignImport()
 		}
@@ -1084,20 +1110,40 @@ func (d *Detector) AtomicBeginStoreCooperative(addr, size uintptr, ctx *goroutin
 }
 
 func deactivateAtomicLoadEntry(entry goroutine.AtomicLoadCacheEntry) *atomicReadFrontier {
-	if entry.State == nil || entry.Frontier == nil {
-		return nil
-	}
-	frontier := (*atomicReadFrontier)(entry.Frontier)
-	// Sidecar retirement invalidates and recycles registered frontier nodes
-	// before reusing their owning state. Reject that stale cache entry without
-	// locking through its now-recyclable State pointer.
-	if frontier.generation.Load() != entry.Generation {
+	if entry.State == nil {
 		return nil
 	}
 	state := (*atomicState)(entry.State)
+	// Direct Detector.Reset is quiescent but cannot visit external contexts. It
+	// resets the arena and invalidates their former ownership references. Never
+	// lock or release a state slot which the new arena generation may have reused.
+	if entry.StateGeneration == 0 || state.handle.generation != entry.StateGeneration {
+		return nil
+	}
 	state.mu.lock()
-	spare := state.deactivateReadFrontier(frontier, entry.Generation)
+	if state.handle.generation != entry.StateGeneration {
+		state.mu.unlock()
+		return nil
+	}
+	var spare *atomicReadFrontier
+	if entry.Frontier != nil {
+		frontier := (*atomicReadFrontier)(entry.Frontier)
+		spare = state.deactivateReadFrontier(frontier, entry.Generation)
+		// A writer can fully prune and unlink a cached frontier while its owning
+		// context still roots the node. Once that context evicts or tears down the
+		// entry, recover the detached node as its spare so the caller can either
+		// reuse or free it. The cache's state ownership makes this lock target
+		// stable; generation, mask, and linkage then prove the node is the exact
+		// detached cache-owned generation rather than a live or recycled node.
+		if spare == nil && frontier.generation.Load() == entry.Generation && frontier.mask.Load() == 0 && frontier.next == nil {
+			spare = frontier
+		}
+	}
 	state.mu.unlock()
+	// Every populated cache entry owns one state reference. Drop it only after
+	// deactivation has finished under state.mu; the returned detached node is no
+	// longer reachable from state and therefore survives final state retirement.
+	state.arena.releaseState(state)
 	return spare
 }
 
@@ -1173,9 +1219,16 @@ func recordAtomicLoadCache(ctx *goroutine.RaceContext, fast *shadowmem.AtomicFas
 		// Remaining locked is sound; simply decline to seed a cache entry.
 		return
 	}
+	// State!=nil is the ownership bit for a populated cache entry. A refresh of
+	// the same entry keeps its existing reference; filling an empty or spare-only
+	// slot acquires exactly one reference before publishing the state pointer.
+	if ctx.AtomicLoadCache[index].State == nil {
+		state.arena.retainState(state)
+	}
 	ctx.AtomicLoadCache[index] = goroutine.AtomicLoadCacheEntry{
 		Fast: unsafe.Pointer(fast), State: unsafe.Pointer(state), Frontier: unsafe.Pointer(frontier),
-		Revision: revision, Generation: frontier.generation.Load(), PC: pc, Mask: mask, Internal: internal,
+		Revision: revision, Generation: frontier.generation.Load(), PC: pc, StateGeneration: state.handle.generation,
+		Mask: mask, Internal: internal,
 	}
 }
 

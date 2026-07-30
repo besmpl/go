@@ -1281,6 +1281,88 @@ func TestAtomicAcquireBulkJoinsFragmentedRelease(t *testing.T) {
 	}
 }
 
+func TestAtomicReleaseOnePassImportMatchesCanonicalVectorClockJoin(t *testing.T) {
+	finite := []vectorclock.FiniteRange{
+		{First: 1, Last: 4, Clock: 3},
+		{First: vectorclock.DenseThreads - 2, Last: vectorclock.DenseThreads + 2, Clock: 5},
+		{First: vectorclock.DenseThreads + 3, Last: vectorclock.DenseThreads + 40, Clock: 7},
+		{First: ^uint32(0) - 5, Last: ^uint32(0), Clock: 9},
+	}
+	retired := []vectorclock.RetiredRange{
+		{First: 2, Last: 2},
+		{First: vectorclock.DenseThreads, Last: vectorclock.DenseThreads + 4},
+		{First: ^uint32(0) - 2, Last: ^uint32(0) - 1},
+	}
+	_, release := atomicReleaseForTestWithRetired(finite, retired)
+
+	actual := vectorclock.New()
+	reference := vectorclock.New()
+	seed := []vectorclock.FiniteRange{
+		{First: 3, Last: 6, Clock: 11},
+		{First: vectorclock.DenseThreads + 20, Last: vectorclock.DenseThreads + 50, Clock: 2},
+		{First: ^uint32(0) - 8, Last: ^uint32(0) - 7, Clock: 13},
+	}
+	actual.JoinCanonicalRanges(seed)
+	reference.JoinCanonicalRanges(seed)
+	actual.RetireRange(vectorclock.DenseThreads+10, vectorclock.DenseThreads+11)
+	reference.RetireRange(vectorclock.DenseThreads+10, vectorclock.DenseThreads+11)
+
+	joinAtomicReleaseRanges(actual, release.runs)
+	retireAtomicReleaseRanges(actual, release.retired)
+	reference.JoinCanonicalRanges(finite)
+	reference.RetireRanges(retired)
+
+	if !actual.HappensBefore(reference) || !reference.HappensBefore(actual) {
+		t.Fatal("one-pass atomic-release import differs from canonical vector-clock join")
+	}
+	for _, tid := range []uint32{
+		1, 2, 4, 5,
+		vectorclock.DenseThreads - 2, vectorclock.DenseThreads, vectorclock.DenseThreads + 4,
+		vectorclock.DenseThreads + 10, vectorclock.DenseThreads + 40, vectorclock.DenseThreads + 50,
+		^uint32(0) - 8, ^uint32(0) - 2, ^uint32(0),
+	} {
+		if got, want := actual.Get(tid), reference.Get(tid); got != want {
+			t.Fatalf("one-pass atomic-release clock[%d] = %d, want %d", tid, got, want)
+		}
+	}
+}
+
+func TestAtomicReleaseOnePassImportAllocationsStayBoundedWhenFragmented(t *testing.T) {
+	measure := func(runCount int) float64 {
+		const first = uint32(50_000)
+		finite := make([]vectorclock.FiniteRange, runCount)
+		retired := make([]vectorclock.RetiredRange, runCount)
+		for i := 0; i < runCount; i++ {
+			tid := first + uint32(i)
+			finite[i] = vectorclock.FiniteRange{First: tid, Last: tid, Clock: uint32(i&1) + 1}
+			retiredTID := first + uint32(runCount) + 1 + uint32(i*2)
+			retired[i] = vectorclock.RetiredRange{First: retiredTID, Last: retiredTID}
+		}
+		_, release := atomicReleaseForTestWithRetired(finite, retired)
+		var sink uint32
+		allocs := testing.AllocsPerRun(10, func() {
+			clock := vectorclock.New()
+			joinAtomicReleaseRanges(clock, release.runs)
+			retireAtomicReleaseRanges(clock, release.retired)
+			sink = clock.Get(first)
+		})
+		if sink != 1 {
+			t.Fatalf("fragmented one-pass import clock[%d] = %d, want 1", first, sink)
+		}
+		return allocs
+	}
+
+	medium := measure(256)
+	large := measure(4096)
+	t.Logf("one-pass fragmented import allocations: 256 runs %.2f, 4096 runs %.2f", medium, large)
+	// One exact-size finite buffer and one exact-size retirement buffer make
+	// source-side allocation constant in the number of linked ranges. Allow a
+	// small fixed difference for destination representation thresholds.
+	if large > medium+3 {
+		t.Fatalf("one-pass import allocations grew with fragmentation: 256 runs %.2f, 4096 runs %.2f", medium, large)
+	}
+}
+
 func TestAtomicAcquireJoinsCompleteReleaseSnapshot(t *testing.T) {
 	state := atomicState{}
 	publisher := goroutine.Alloc(94)
@@ -2192,12 +2274,23 @@ func atomicReleaseRetiredForTest(release *atomicRelease) []vectorclock.RetiredRa
 }
 
 func atomicReleaseForTest(runs []vectorclock.FiniteRange) (*AtomicHistoryArena, *atomicRelease) {
+	return atomicReleaseForTestWithRetired(runs, nil)
+}
+
+func atomicReleaseForTestWithRetired(runs []vectorclock.FiniteRange, retired []vectorclock.RetiredRange) (*AtomicHistoryArena, *atomicRelease) {
 	a := newAtomicHistoryArena()
 	r := a.allocRelease()
 	var tail **atomicReleaseRange = &r.runs
 	for _, run := range runs {
 		n := a.allocRange()
 		n.first, n.last, n.clock = run.First, run.Last, run.Clock
+		*tail = n
+		tail = &n.next
+	}
+	tail = &r.retired
+	for _, run := range retired {
+		n := a.allocRange()
+		n.first, n.last = run.First, run.Last
 		*tail = n
 		tail = &n.next
 	}

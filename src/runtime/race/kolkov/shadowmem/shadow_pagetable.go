@@ -732,6 +732,19 @@ func (pt *PageTableShadow) ClearRange(addr, size uintptr) {
 }
 
 func (pt *PageTableShadow) clearExactRange(addr, size uintptr) {
+	// Allocator clearing overwhelmingly targets freshly allocated sub-block
+	// objects. Avoid joining the block-lock convoy when the selected bytes have
+	// no history to retire. The optimistic proof is exact: compact mutation is
+	// bracketed by its even/odd revision, materialization publishes its complete
+	// slot before retiring compact membership, and selected lane pointers are
+	// collected twice. A publication which wins before validation is observed;
+	// one which starts afterward linearizes after this no-op clear.
+	if size != 0 && size <= rangeBlockSize-(addr&(rangeBlockSize-1)) {
+		if view, ok := pt.blockFor(addr, false); ok && clearRangeUnrepresented(view, addr, size) {
+			return
+		}
+	}
+
 	// The ordinary allocator shape is one sub-block object backed only by a
 	// compact/default history. Its absent slot table is permanent while the
 	// block lock is held, so drain the default transaction and mutate compact
@@ -772,6 +785,89 @@ func (pt *PageTableShadow) clearExactRange(addr, size uintptr) {
 		current += count
 		remaining -= count
 	}
+}
+
+// clearRangeUnrepresented proves, without taking the block lock or allocating,
+// that [addr, addr+size) has no ordinary history. The range must stay within
+// one block. A false result is only a request for the authoritative locked path.
+//
+// The two slot collections cover publication outside compact.revision. Slot
+// objects are permanent once published; a selected lane can return to nil only
+// through an exact clear. Therefore a transient lane between the collections
+// either makes one collection fail or was itself cleared, leaving a valid
+// no-op linearization point. Default history follows the same publication/
+// clear discipline. Compact membership, tombstones, and dense owners are
+// covered by the stable even revision captured around their scan.
+func clearRangeUnrepresented(view blockView, addr, size uintptr) bool {
+	if size == 0 || size > rangeBlockSize-(addr&(rangeBlockSize-1)) {
+		return false
+	}
+
+	compact := view.history.compact.Load()
+	revision := uint64(0)
+	if compact != nil {
+		revision = compact.revision.Load()
+		if revision&1 != 0 {
+			return false
+		}
+	}
+	if view.history.state.Load() != nil ||
+		clearRangeHasMaterializedHistory(view, addr, size) ||
+		compactRangeRepresented(compact, addr, size) {
+		return false
+	}
+
+	// Recollect publications not governed by compact.revision before accepting
+	// the compact snapshot. Identity closes initial-header publication; the final
+	// revision load validates every bitmap/tombstone/palette owner load above.
+	if clearRangeHasMaterializedHistory(view, addr, size) ||
+		view.history.state.Load() != nil ||
+		view.history.compact.Load() != compact {
+		return false
+	}
+	return compact == nil || compact.revision.Load() == revision
+}
+
+func clearRangeHasMaterializedHistory(view blockView, addr, size uintptr) bool {
+	for current, remaining := addr, size; remaining != 0; {
+		lane := current & 7
+		count := uintptr(8) - lane
+		if count > remaining {
+			count = remaining
+		}
+		if slot := view.loadSlot((current >> 3) & rangeBlockWordMask); slot != nil {
+			for selected := lane; selected < lane+count; selected++ {
+				if slot.states[selected].Load() != nil {
+					return true
+				}
+			}
+		}
+		current += count
+		remaining -= count
+	}
+	return false
+}
+
+func compactRangeRepresented(compact *compactGroups, addr, size uintptr) bool {
+	if compact == nil {
+		return false
+	}
+	start, end := compactRange(addr, size)
+	if palette := compact.palette.Load(); palette != nil {
+		return !palette.rangeOwnerEqual(start, end, compactPaletteDefault)
+	}
+	overflow := compact.overflow.Load()
+	for i := 0; i < compactGroupCapacity; i++ {
+		if group := compact.groupLoadCached(i, overflow); group != nil && group.intersects(start, end) {
+			return true
+		}
+	}
+	for word := int(start >> 6); word <= int((end-1)>>6); word++ {
+		if compact.tombstoneWord(word)&compactRangeWordMask(start, end-start, word) != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // clearUnmaterializedRangeBlockLocked clears one exact in-block range whose
