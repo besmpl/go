@@ -16,6 +16,17 @@ func runtimeThrow(s string)
 // of the fields through ReadCacheWidths remaining stable.
 const ReadCacheSlots = 4
 
+// ReadCacheIndex returns the direct-mapped slot for an exact address. Folding
+// the next two word-index bits preserves distinct slots for naturally aligned
+// four-word groups while avoiding systematic aliases between fields 32 bytes
+// apart.
+//
+//go:nosplit
+func ReadCacheIndex(addr uintptr) uintptr {
+	word := addr >> 3
+	return (word ^ (word >> 2)) & (ReadCacheSlots - 1)
+}
+
 // AtomicReleaseCacheSlots bounds the fully-associative release working set.
 // Collisions only force a canonical join/checkpoint; they never weaken the
 // happens-before relation.
@@ -427,7 +438,7 @@ func (rc *RaceContext) RecordReadSized(addr, size uintptr, state unsafe.Pointer)
 	if size == 0 || size >= uintptr(ReadCacheWeakWidth) || size-1 > ^uintptr(0)-addr {
 		return
 	}
-	slot := (addr >> 3) & (ReadCacheSlots - 1)
+	slot := ReadCacheIndex(addr)
 	// Publish the GC root before the address discriminator. The context has one
 	// logical owner, but this order also keeps raw runtime readers from ever
 	// accepting an address paired with the previous slot's state.
@@ -455,7 +466,7 @@ func (rc *RaceContext) RecordAddressOnlyReadRange(addr, size uintptr) {
 	if size == 0 || size >= uintptr(ReadCacheWeakWidth) || size-1 > ^uintptr(0)-addr {
 		return
 	}
-	slot := (addr >> 3) & (ReadCacheSlots - 1)
+	slot := ReadCacheIndex(addr)
 	rc.ReadCacheStates[slot] = nil
 	rc.ReadCacheWidths[slot] = uint8(size)
 	rc.ReadCache[slot] = addr
@@ -502,7 +513,7 @@ func (rc *RaceContext) HasReadHintSized(addr, size uintptr) bool {
 	if size == 0 || size >= uintptr(ReadCacheWeakWidth) {
 		return false
 	}
-	slot := (addr >> 3) & (ReadCacheSlots - 1)
+	slot := ReadCacheIndex(addr)
 	return rc.ReadCache[slot] == addr &&
 		uintptr(rc.ReadCacheWidths[slot]&^ReadCacheWeakWidth) == size
 }
@@ -515,7 +526,7 @@ func (rc *RaceContext) HasWeakReadHintSized(addr, size uintptr) bool {
 	if !rc.HasReadHintSized(addr, size) {
 		return false
 	}
-	slot := (addr >> 3) & (ReadCacheSlots - 1)
+	slot := ReadCacheIndex(addr)
 	return rc.ReadCacheWidths[slot]&ReadCacheWeakWidth != 0
 }
 

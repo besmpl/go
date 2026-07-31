@@ -1080,7 +1080,7 @@ func TestSlowAtomicClearDrainsThroughEndBookkeeping(t *testing.T) {
 			if afterTID != beforeTID || afterClock != wantClock {
 				t.Fatalf("post-End epoch = (%d,%d), want (%d,%d)", afterTID, afterClock, beforeTID, wantClock)
 			}
-			cacheSlot := (base >> 3) & (goroutine.ReadCacheSlots - 1)
+			cacheSlot := goroutine.ReadCacheIndex(base)
 			if ctx.ReadCache[cacheSlot] != 0 || ctx.ReadCacheStates[cacheSlot] != nil {
 				t.Fatalf("post-End cache entry = (%#x,%p), want invalid", ctx.ReadCache[cacheSlot], ctx.ReadCacheStates[cacheSlot])
 			}
@@ -1173,7 +1173,7 @@ func TestSlowAtomicClearDrainsUnalignedCrossWordToken(t *testing.T) {
 	if afterTID != beforeTID || afterClock != beforeClock+1 {
 		t.Fatalf("spanning post-End epoch = (%d,%d), want (%d,%d)", afterTID, afterClock, beforeTID, beforeClock+1)
 	}
-	cacheSlot := (addr >> 3) & (goroutine.ReadCacheSlots - 1)
+	cacheSlot := goroutine.ReadCacheIndex(addr)
 	if ctx.ReadCache[cacheSlot] != 0 || ctx.ReadCacheStates[cacheSlot] != nil {
 		t.Fatalf("spanning post-End cache entry = (%#x,%p), want invalid", ctx.ReadCache[cacheSlot], ctx.ReadCacheStates[cacheSlot])
 	}

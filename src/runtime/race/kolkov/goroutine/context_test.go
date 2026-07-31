@@ -336,7 +336,7 @@ func TestClockAdvancePreflightAndCommit(t *testing.T) {
 	if next != 2 || ctx.C.Get(ctx.TID) != 1 || ctx.Epoch != epoch.NewEpoch(ctx.TID, 1) {
 		t.Fatalf("preflight mutated clock state: next=%d C=%d epoch=%s", next, ctx.C.Get(ctx.TID), ctx.Epoch)
 	}
-	slot := (addr >> 3) & (ReadCacheSlots - 1)
+	slot := ReadCacheIndex(addr)
 	if ctx.ReadCache[slot] != addr || ctx.ReadCacheStates[slot] != state || ctx.ReadCacheWidths[slot] != 1 {
 		t.Fatal("preflight weakened the read cache")
 	}
@@ -387,6 +387,28 @@ func TestClockAdvanceOverflowFailsBeforeCacheMutation(t *testing.T) {
 	}
 }
 
+func TestReadCacheIndexDispersesFourWordAliases(t *testing.T) {
+	for word := uintptr(0); word < 64; word++ {
+		addr := word * 8
+		index := ReadCacheIndex(addr)
+		if index >= ReadCacheSlots {
+			t.Fatalf("ReadCacheIndex(%#x) = %d, want below %d", addr, index, ReadCacheSlots)
+		}
+		if other := ReadCacheIndex(addr + 32); other == index {
+			t.Fatalf("32-byte-separated addresses %#x and %#x both map to slot %d", addr, addr+32, index)
+		}
+	}
+
+	ctx := Alloc(5)
+	const first = uintptr(0x1000)
+	const second = first + 32
+	ctx.RecordAddressOnlyRead(first)
+	ctx.RecordAddressOnlyRead(second)
+	if !ctx.HasReadHintSized(first, 1) || !ctx.HasReadHintSized(second, 1) {
+		t.Fatalf("32-byte-separated reads were not retained: cache=%#v", ctx.ReadCache)
+	}
+}
+
 func TestReadCacheLifecycle(t *testing.T) {
 	ctx := Alloc(5)
 	if ctx.ReadCache != [ReadCacheSlots]uintptr{} {
@@ -396,39 +418,39 @@ func TestReadCacheLifecycle(t *testing.T) {
 	const addr = uintptr(0x1000)
 	state := unsafe.Pointer(new(byte))
 	ctx.RecordRead(addr, state)
-	if got := ctx.ReadCache[(addr>>3)&(ReadCacheSlots-1)]; got != addr {
+	if got := ctx.ReadCache[ReadCacheIndex(addr)]; got != addr {
 		t.Fatalf("RecordRead cache = %#x, want %#x", got, addr)
 	}
-	if got := ctx.ReadCacheStates[(addr>>3)&(ReadCacheSlots-1)]; got != state {
+	if got := ctx.ReadCacheStates[ReadCacheIndex(addr)]; got != state {
 		t.Fatalf("RecordRead state = %p, want %p", got, state)
 	}
-	if got := ctx.ReadCacheWidths[(addr>>3)&(ReadCacheSlots-1)]; got != 1 {
+	if got := ctx.ReadCacheWidths[ReadCacheIndex(addr)]; got != 1 {
 		t.Fatalf("RecordRead width = %d, want 1", got)
 	}
 	addr2 := addr + 8
 	state2 := unsafe.Pointer(new(byte))
 	ctx.RecordRead(addr2, state2)
-	if got := ctx.ReadCache[(addr2>>3)&(ReadCacheSlots-1)]; got != addr2 {
+	if got := ctx.ReadCache[ReadCacheIndex(addr2)]; got != addr2 {
 		t.Fatalf("second RecordRead cache = %#x, want %#x", got, addr2)
 	}
 
 	ctx.InvalidateRead(addr)
-	if got := ctx.ReadCache[(addr>>3)&(ReadCacheSlots-1)]; got != 0 {
+	if got := ctx.ReadCache[ReadCacheIndex(addr)]; got != 0 {
 		t.Fatalf("InvalidateRead retained %#x", got)
 	}
-	if got := ctx.ReadCacheStates[(addr>>3)&(ReadCacheSlots-1)]; got != nil {
+	if got := ctx.ReadCacheStates[ReadCacheIndex(addr)]; got != nil {
 		t.Fatalf("InvalidateRead retained state %p", got)
 	}
-	if got := ctx.ReadCacheWidths[(addr>>3)&(ReadCacheSlots-1)]; got != 0 {
+	if got := ctx.ReadCacheWidths[ReadCacheIndex(addr)]; got != 0 {
 		t.Fatalf("InvalidateRead retained width %d", got)
 	}
-	if got := ctx.ReadCache[(addr2>>3)&(ReadCacheSlots-1)]; got != addr2 {
+	if got := ctx.ReadCache[ReadCacheIndex(addr2)]; got != addr2 {
 		t.Fatalf("InvalidateRead removed unrelated cache entry %#x", got)
 	}
 
 	ctx.IncrementClock()
 	wantWeakCache := [ReadCacheSlots]uintptr{}
-	wantWeakCache[(addr2>>3)&(ReadCacheSlots-1)] = addr2
+	wantWeakCache[ReadCacheIndex(addr2)] = addr2
 	if ctx.ReadCache != wantWeakCache {
 		t.Fatalf("IncrementClock cache = %#v, want weak hint %#v", ctx.ReadCache, wantWeakCache)
 	}
@@ -436,7 +458,7 @@ func TestReadCacheLifecycle(t *testing.T) {
 		t.Fatalf("IncrementClock retained strong read cache states %#v", ctx.ReadCacheStates)
 	}
 	wantWeakWidths := [ReadCacheSlots]uint8{}
-	wantWeakWidths[(addr2>>3)&(ReadCacheSlots-1)] = ReadCacheWeakWidth | 1
+	wantWeakWidths[ReadCacheIndex(addr2)] = ReadCacheWeakWidth | 1
 	if ctx.ReadCacheWidths != wantWeakWidths {
 		t.Fatalf("IncrementClock widths = %#v, want weak hint %#v", ctx.ReadCacheWidths, wantWeakWidths)
 	}
@@ -467,7 +489,7 @@ func TestReadCacheExternalInvalidationFollowsObservedEpoch(t *testing.T) {
 	if got := ctx.ReadCacheInvalidatedClock.Load(); got != 1 {
 		t.Fatalf("invalidated clock = %d, want 1", got)
 	}
-	if got := ctx.ReadCache[(addr>>3)&(ReadCacheSlots-1)]; got != addr {
+	if got := ctx.ReadCache[ReadCacheIndex(addr)]; got != addr {
 		t.Fatalf("external invalidation mutated owner cache: got %#x, want %#x", got, addr)
 	}
 

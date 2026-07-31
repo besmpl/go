@@ -1324,6 +1324,15 @@ func racereadSlowPath(addr, pc uintptr) {
 	gp.raceguard--
 }
 
+// raceReadCacheIndex mirrors goroutine.ReadCacheIndex without importing the
+// detector implementation into the runtime hot path.
+//
+//go:nosplit
+func raceReadCacheIndex(addr uintptr) uintptr {
+	word := addr >> 3
+	return (word ^ (word >> 2)) & ctxReadCacheMask
+}
+
 // raceread records a read of the given address.
 // Called from compiler-generated instrumentation.
 // sys.GetCallerPC() is evaluated only on a cache miss and before the first
@@ -1349,7 +1358,7 @@ func raceread(addr uintptr) {
 	// the hook's linearization point, and a replacement pointer forces the sound
 	// slow path. Cache collisions only reduce optimization coverage.
 	if racectx > 1 {
-		index := (addr >> 3) & ctxReadCacheMask
+		index := raceReadCacheIndex(addr)
 		slot := (*uintptr)(unsafe.Pointer(racectx + ctxReadCacheOffset + index*goarch.PtrSize))
 		cachedWidth := *(*uint8)(unsafe.Pointer(racectx + ctxReadWidthOffset + index))
 		if *slot == addr && cachedWidth == 1 {
@@ -1390,7 +1399,7 @@ func racereadn(addr, size uintptr) {
 	}
 	racectx := gp.racectx
 	if racectx > 1 {
-		index := (addr >> 3) & ctxReadCacheMask
+		index := raceReadCacheIndex(addr)
 		cachedAddr := *(*uintptr)(unsafe.Pointer(racectx + ctxReadCacheOffset + index*goarch.PtrSize))
 		cachedWidth := *(*uint8)(unsafe.Pointer(racectx + ctxReadWidthOffset + index))
 		if cachedAddr == addr && cachedWidth == uint8(size) {

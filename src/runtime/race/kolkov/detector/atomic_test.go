@@ -549,7 +549,7 @@ func TestAtomicAcquireOnlySlowCompletionKeepsClockAndWeakensReadCache(t *testing
 			if !ctx.HasWeakReadHintSized(cacheAddr, 4) {
 				t.Fatal("acquire-only completion did not weaken the ordinary read cache")
 			}
-			slot := (cacheAddr >> 3) & (goroutine.ReadCacheSlots - 1)
+			slot := goroutine.ReadCacheIndex(cacheAddr)
 			if got := ctx.ReadCacheStates[slot]; got != nil {
 				t.Fatalf("acquire-only completion retained read-cache state %p", got)
 			}
@@ -1945,7 +1945,7 @@ func TestRWMutexMarkerReadDoesNotSeedUserReadCache(t *testing.T) {
 		d := NewDetector()
 		reader := goroutine.Alloc(65)
 		d.OnRead(addr, reader, markerPC)
-		cacheSlot := (addr >> 3) & (goroutine.ReadCacheSlots - 1)
+		cacheSlot := goroutine.ReadCacheIndex(addr)
 		if reader.ReadCache[cacheSlot] == addr || reader.ReadCacheStates[cacheSlot] != nil {
 			t.Fatalf("marker published redundant-read cache entry (%#x,%p)", reader.ReadCache[cacheSlot], reader.ReadCacheStates[cacheSlot])
 		}
@@ -1966,7 +1966,7 @@ func TestRWMutexMarkerReadDoesNotSeedUserReadCache(t *testing.T) {
 		d := NewDetector()
 		reader := goroutine.Alloc(67)
 		d.OnRead(addr, reader, markerPC)
-		cacheSlot := (addr >> 3) & (goroutine.ReadCacheSlots - 1)
+		cacheSlot := goroutine.ReadCacheIndex(addr)
 		if reader.ReadCache[cacheSlot] == addr || reader.ReadCacheStates[cacheSlot] != nil {
 			t.Fatalf("marker-only read published cache entry (%#x,%p)", reader.ReadCache[cacheSlot], reader.ReadCacheStates[cacheSlot])
 		}
@@ -1979,12 +1979,15 @@ func TestRWMutexMarkerReadDoesNotSeedUserReadCache(t *testing.T) {
 	t.Run("marker preserves colliding user cache entry", func(t *testing.T) {
 		d := NewDetector()
 		ctx := goroutine.Alloc(69)
-		const markerAddr = addr + goroutine.ReadCacheSlots*8
+		markerAddr := addr + 8
+		for goroutine.ReadCacheIndex(markerAddr) != goroutine.ReadCacheIndex(addr) {
+			markerAddr += 8
+		}
 		// A cold user read stays compact; repeat it to promote the address and
 		// establish the colliding cache entry whose preservation is under test.
 		d.OnRead(addr, ctx, 0x8321)
 		d.OnRead(addr, ctx, 0x8321)
-		cacheSlot := (addr >> 3) & (goroutine.ReadCacheSlots - 1)
+		cacheSlot := goroutine.ReadCacheIndex(addr)
 		cachedState := ctx.ReadCacheStates[cacheSlot]
 		if ctx.ReadCache[cacheSlot] != addr || cachedState != nil {
 			t.Fatalf("user no-op cache entry = (%#x,%p), want (%#x,nil)", ctx.ReadCache[cacheSlot], cachedState, addr)

@@ -137,7 +137,7 @@ func TestFinalizerHandoffInvalidatesObservedSourceReadCache(t *testing.T) {
 	// redundant-read cache.
 	d.OnRead(addr, source, readPC)
 	d.OnRead(addr, source, readPC)
-	slot := (addr >> 3) & (goroutine.ReadCacheSlots - 1)
+	slot := goroutine.ReadCacheIndex(addr)
 	if got := source.ReadCache[slot]; got != addr {
 		t.Fatalf("source read cache = %#x, want %#x", got, addr)
 	}

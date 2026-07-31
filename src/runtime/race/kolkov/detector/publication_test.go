@@ -71,7 +71,7 @@ func TestScalarReadNoopSeedsAddressOnlyCacheAfterPublication(t *testing.T) {
 	// its unexposed state, preserving allocation-free reuse eligibility.
 	d.OnRead(addr, reader, 0x9241)
 
-	slot := (addr >> 3) & (goroutine.ReadCacheSlots - 1)
+	slot := goroutine.ReadCacheIndex(addr)
 	if got := reader.ReadCache[slot]; got != 0 || reader.ReadCacheStates[slot] != nil {
 		t.Fatalf("changed read cache = (%#x,%p), want empty", got, reader.ReadCacheStates[slot])
 	}
@@ -100,7 +100,7 @@ func TestSampledCompactReadSeedsCacheOnlyWhenRepresented(t *testing.T) {
 	d := NewDetectorWithOptions(DetectorOptions{SamplingEnabled: true, SampleRate: 2})
 	reader := goroutine.Alloc(121)
 	const addr = uintptr(0x19260)
-	cacheSlot := (addr >> 3) & (goroutine.ReadCacheSlots - 1)
+	cacheSlot := goroutine.ReadCacheIndex(addr)
 	const prior = uintptr(0x7777)
 	priorState := unsafe.Pointer(reader)
 	reader.ReadCache[cacheSlot] = prior
@@ -156,7 +156,7 @@ func TestConflictingReadSeedsCacheBeforeReport(t *testing.T) {
 	var observed bool
 	d.reportObserver = func(*RaceReport) {
 		observed = true
-		slot := (addr >> 3) & (goroutine.ReadCacheSlots - 1)
+		slot := goroutine.ReadCacheIndex(addr)
 		if got := reader.ReadCache[slot]; got != addr {
 			t.Errorf("report observed cache address %#x, want published read %#x", got, addr)
 		}
@@ -189,7 +189,7 @@ func TestPromotedReadSeedsCacheAfterPublication(t *testing.T) {
 	d.OnRead(addr, first, 0x92c1)
 	d.OnRead(addr, second, 0x92c2)
 
-	slot := (addr >> 3) & (goroutine.ReadCacheSlots - 1)
+	slot := goroutine.ReadCacheIndex(addr)
 	if got := second.ReadCache[slot]; got != addr {
 		t.Fatalf("promoting read cached address %#x, want %#x", got, addr)
 	}
@@ -213,7 +213,7 @@ func TestScalarReadCacheGenerationChangesAcrossClear(t *testing.T) {
 	// A changed compact read remains uncached. Its exact no-op seeds only an
 	// address entry, never a reusable shadow pointer.
 	d.OnRead(addr, reader, 0x92e1)
-	slot := (addr >> 3) & (goroutine.ReadCacheSlots - 1)
+	slot := goroutine.ReadCacheIndex(addr)
 	oldState := d.ShadowGet(addr)
 	if oldState == nil || reader.ReadCache[slot] != 0 || reader.ReadCacheStates[slot] != nil {
 		t.Fatalf("initial changed read state/cache = (%p,%#x,%p), want state and empty cache",
@@ -263,7 +263,7 @@ func TestScalarReadCacheGenerationSurvivesAdjacentClear(t *testing.T) {
 	// The changed compact read stays uncached; its exact no-op seeds an
 	// address-only entry which an adjacent clear must preserve.
 	d.OnRead(addr, reader, 0x92f1)
-	slot := (addr >> 3) & (goroutine.ReadCacheSlots - 1)
+	slot := goroutine.ReadCacheIndex(addr)
 	state := d.ShadowGet(addr)
 	if reader.ReadCache[slot] != 0 || reader.ReadCacheStates[slot] != nil {
 		t.Fatal("changed read unexpectedly seeded cache")

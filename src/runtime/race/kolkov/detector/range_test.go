@@ -10,7 +10,7 @@ import (
 )
 
 func readCacheEntryForTest(ctx *goroutine.RaceContext, addr uintptr) (uintptr, unsafe.Pointer, uint8) {
-	index := (addr >> 3) & (goroutine.ReadCacheSlots - 1)
+	index := goroutine.ReadCacheIndex(addr)
 	return ctx.ReadCache[index], ctx.ReadCacheStates[index], ctx.ReadCacheWidths[index]
 }
 

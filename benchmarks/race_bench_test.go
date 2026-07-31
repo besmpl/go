@@ -58,9 +58,8 @@ func BenchmarkRaceReadAlternating(b *testing.B) {
 	runtime.KeepAlive(sum)
 }
 
-// BenchmarkRaceReadCollision alternates exact addresses 32 bytes apart. They
-// deterministically map to the same four-slot cache entry, forcing its miss
-// path without relying on linker placement of independent globals.
+// BenchmarkRaceReadCollision alternates exact addresses 32 bytes apart. This
+// is the alias pattern produced by a low-bit-only four-slot cache index.
 func BenchmarkRaceReadCollision(b *testing.B) {
 	b.ReportAllocs()
 	n := b.N

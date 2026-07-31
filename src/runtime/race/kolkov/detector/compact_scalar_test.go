@@ -96,7 +96,7 @@ func TestCompactScalarWeakHintMaterializesOnlyOnMatchingSecondRead(t *testing.T)
 	if d.rangeMemory.GetSlot(addr) != nil {
 		t.Fatal("colliding one-shot read was materialized")
 	}
-	index := (oneShot >> 3) & (goroutine.ReadCacheSlots - 1)
+	index := goroutine.ReadCacheIndex(oneShot)
 	state := d.ShadowGet(oneShot)
 	if state == nil || ctx.ReadCache[index] != oneShot ||
 		ctx.ReadCacheStates[index] != unsafe.Pointer(state) || ctx.ReadCacheWidths[index] != 4 {
@@ -181,7 +181,7 @@ func TestCompactScalarBlockingWeakHintPublishesAccessCacheAndReport(t *testing.T
 	if state.GetReadEpoch() != reader.GetEpoch() || state.GetReadPC() != 0xc097 {
 		t.Fatalf("blocking weak-hint read was not published: state=%s", state)
 	}
-	index := (addr >> 3) & (goroutine.ReadCacheSlots - 1)
+	index := goroutine.ReadCacheIndex(addr)
 	if reader.ReadCache[index] != addr ||
 		reader.ReadCacheStates[index] != unsafe.Pointer(state) ||
 		reader.ReadCacheWidths[index] != 4 {
@@ -194,10 +194,11 @@ func TestCompactScalarCollidingHintDoesNotMaterialize(t *testing.T) {
 	d := NewDetector()
 	ctx := goroutine.Alloc(207)
 	defer ctx.C.Release()
-	const (
-		addr     = uintptr(0x40a001)
-		collider = addr + 32
-	)
+	const addr = uintptr(0x40a001)
+	collider := addr + 8
+	for goroutine.ReadCacheIndex(collider) != goroutine.ReadCacheIndex(addr) {
+		collider += 8
+	}
 
 	d.OnRead(addr, ctx, 0xc0a1)
 	d.OnRead(addr, ctx, 0xc0a1)
@@ -205,7 +206,7 @@ func TestCompactScalarCollidingHintDoesNotMaterialize(t *testing.T) {
 	d.OnRead(collider, ctx, 0xc0a2)
 	ctx.IncrementClock()
 	if ctx.HasReadHintSized(addr, 1) || !ctx.HasReadHintSized(collider, 1) {
-		index := (addr >> 3) & (goroutine.ReadCacheSlots - 1)
+		index := goroutine.ReadCacheIndex(addr)
 		t.Fatalf("direct-mapped collision entry = (%#x,%d), want (%#x,weak 1)",
 			ctx.ReadCache[index], ctx.ReadCacheWidths[index], collider)
 	}
@@ -476,7 +477,7 @@ func TestCompactScalarRepeatedIdenticalAccessPolicy(t *testing.T) {
 			t.Fatal("first compact read did not publish history")
 		}
 		lifecycle := before.GetLifecycleID()
-		cacheSlot := (addr >> 3) & (goroutine.ReadCacheSlots - 1)
+		cacheSlot := goroutine.ReadCacheIndex(addr)
 		if slot := d.rangeMemory.GetSlot(addr); slot != nil {
 			t.Fatalf("first compact read materialized slot %p", slot)
 		}
@@ -677,7 +678,7 @@ func TestCompactScalarRWMutexMarkerMaterializesSidecarWithoutCaching(t *testing.
 	if slot := d.rangeMemory.GetSlot(addr); slot != nil {
 		t.Fatalf("ordinary compact read materialized slot %p", slot)
 	}
-	cacheSlot := (addr >> 3) & (goroutine.ReadCacheSlots - 1)
+	cacheSlot := goroutine.ReadCacheIndex(addr)
 	cachedState := ctx.ReadCacheStates[cacheSlot]
 	if ctx.ReadCache[cacheSlot] != 0 || cachedState != nil {
 		t.Fatalf("changed ordinary compact read cache = (%#x,%p), want empty",
