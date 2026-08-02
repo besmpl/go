@@ -126,7 +126,8 @@ type VectorClock struct {
 const CausalRootCapacity = 4
 
 // causalRootSet is packed so all operations over it are bounded and require no
-// allocation. Each entry owns one independently releasable segment reference.
+// allocation. Each valid entry owns one independently releasable segment
+// reference, and at most one entry belongs to any lineage family.
 type causalRootSet struct {
 	roots [CausalRootCapacity]CausalView
 	count uint8
@@ -184,6 +185,41 @@ func (s *causalRootSet) tryJoin(view CausalView) bool {
 	}
 	s.roots[s.count] = root
 	s.count++
+	return true
+}
+
+func (s *causalRootSet) canJoinSet(other *causalRootSet) bool {
+	if s == nil || other == nil {
+		return false
+	}
+	families := int(s.count)
+	for i := 0; i < int(other.count); i++ {
+		known := false
+		for j := 0; j < int(s.count); j++ {
+			if s.roots[j].SameFamily(other.roots[i]) {
+				known = true
+				break
+			}
+		}
+		if !known {
+			families++
+			if families > CausalRootCapacity {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (s *causalRootSet) tryJoinSet(other *causalRootSet) bool {
+	if !s.canJoinSet(other) {
+		return false
+	}
+	for i := 0; i < int(other.count); i++ {
+		if !s.tryJoin(other.roots[i]) {
+			runtimeThrow("race detector joined a released causal clock root")
+		}
+	}
 	return true
 }
 
@@ -535,13 +571,14 @@ func (vc *VectorClock) TryJoin(other *VectorClock) bool {
 	if vc == other || other == nil || other.ownedEmpty() && other.base == nil && !other.causal.Valid() {
 		return true
 	}
-	var otherRoots [CausalRootCapacity]CausalView
-	otherRootCount := other.BorrowCausalRoots(&otherRoots)
-	if !vc.CanJoinCausalSet(&otherRoots, otherRootCount) {
+	if vc == nil {
+		return false
+	}
+	if !vc.causal.canJoinSet(&other.causal) {
 		return false
 	}
 	if other.base == nil && other.ownedEmpty() {
-		return vc.TryJoinCausalSet(&otherRoots, otherRootCount)
+		return vc.causal.tryJoinSet(&other.causal)
 	}
 	if !vc.causal.Valid() && !other.causal.Valid() && clockLessOrEqualClock(other, vc) {
 		return true
@@ -588,7 +625,7 @@ func (vc *VectorClock) TryJoin(other *VectorClock) bool {
 		}
 	}
 	vc.sparseRuns = coalesceFiniteRuns(vc.sparseRuns)
-	return vc.TryJoinCausalSet(&otherRoots, otherRootCount)
+	return vc.causal.tryJoinSet(&other.causal)
 }
 
 // TryJoinCausal pointwise joins one pinned immutable lineage view without

@@ -117,6 +117,109 @@ func TestCausalRootSetOverflowIsAllOrNothingThenMaterializesExactly(t *testing.T
 	}
 }
 
+func TestVectorClockTryJoinCausalRootSetDirectly(t *testing.T) {
+	firstLineage, first := causalTestView(t, 7, 11)
+	secondLineage, second := causalTestView(t, 9, 13)
+	defer firstLineage.Release()
+	defer secondLineage.Release()
+	defer first.Release()
+	defer second.Release()
+
+	source := New()
+	defer source.Release()
+	if !source.TryJoinCausal(first) || !source.TryJoinCausal(second) {
+		t.Fatal("failed to build causal source")
+	}
+	var nilDestination *VectorClock
+	if nilDestination.TryJoin(source) {
+		t.Fatal("nil destination joined a nonempty causal source")
+	}
+	destination := New()
+	if !destination.TryJoin(source) {
+		t.Fatal("direct causal-root-set join failed")
+	}
+	if destination.causal.count != 2 || destination.Get(7) != 11 || destination.Get(9) != 13 {
+		t.Fatal("direct causal-root-set join lost a source family")
+	}
+	destination.Release()
+
+	if allocs := testing.AllocsPerRun(1000, func() {
+		var clock VectorClock
+		if !clock.TryJoin(source) {
+			panic("direct causal-root-set join failed")
+		}
+		clock.Reset()
+	}); allocs != 0 {
+		t.Fatalf("direct causal-root-set join allocated: %.2f objects", allocs)
+	}
+}
+
+func TestVectorClockTryJoinCausalRootSetAdvancesFamilyLifecycle(t *testing.T) {
+	anchor := New()
+	lineage := NewClockLineage(anchor)
+	old := lineage.Pin()
+	anchor.Release()
+	if !lineage.Rotate() {
+		t.Fatal("failed to rotate lineage")
+	}
+	newer, appended := lineage.AppendPinned(17, 3)
+	if !appended || newer.segment == old.segment {
+		t.Fatal("failed to build a newer cross-segment view")
+	}
+	defer lineage.Release()
+	defer old.Release()
+	defer newer.Release()
+
+	destination := New()
+	defer destination.Release()
+	source := New()
+	defer source.Release()
+	if !destination.TryJoinCausal(old) || !source.TryJoinCausal(newer) {
+		t.Fatal("failed to build same-family clocks")
+	}
+	oldRefs := old.segment.refs.Load()
+	newRefs := newer.segment.refs.Load()
+	if !destination.TryJoin(source) {
+		t.Fatal("direct root-set join did not advance the family")
+	}
+	if destination.causal.count != 1 || destination.causal.roots[0].segment != newer.segment ||
+		old.segment.refs.Load() != oldRefs-1 || newer.segment.refs.Load() != newRefs+1 {
+		t.Fatal("direct root-set family advance broke reference ownership")
+	}
+}
+
+func TestVectorClockTryJoinCausalRootSetOverflowIsAllOrNothing(t *testing.T) {
+	var lineages [CausalRootCapacity + 1]*ClockLineage
+	var views [CausalRootCapacity + 1]CausalView
+	for i := range views {
+		lineages[i], views[i] = causalTestView(t, uint32(200+i), uint32(30+i))
+		defer lineages[i].Release()
+		defer views[i].Release()
+	}
+
+	destination := New()
+	defer destination.Release()
+	for i := 0; i < CausalRootCapacity; i++ {
+		if !destination.TryJoinCausal(views[i]) {
+			t.Fatalf("failed to fill destination root %d", i)
+		}
+	}
+	source := New()
+	defer source.Release()
+	if !source.TryJoinCausal(views[CausalRootCapacity]) {
+		t.Fatal("failed to build overflowing source")
+	}
+	refs := views[CausalRootCapacity].segment.refs.Load()
+	if destination.TryJoin(source) {
+		t.Fatal("overflowing direct root-set join unexpectedly succeeded")
+	}
+	if destination.causal.count != CausalRootCapacity ||
+		destination.Get(uint32(200+CausalRootCapacity)) != 0 ||
+		views[CausalRootCapacity].segment.refs.Load() != refs {
+		t.Fatal("failed direct root-set join mutated state or ownership")
+	}
+}
+
 func TestCausalRootSetCloneResetReferenceLifecycle(t *testing.T) {
 	lineage, view := causalTestView(t, 7, 70)
 	defer lineage.Release()
