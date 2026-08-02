@@ -13,15 +13,20 @@ import (
 
 const Enabled = true
 
-// Functions below pushed from runtime.
+// Functions below pushed from runtime. Synchronization hooks use addr as an
+// identity; neither detector backend retains it as a Go pointer or liveness
+// reference, although address-keyed detector metadata may outlive the call.
 
 //go:linkname Acquire
+//go:noescape
 func Acquire(addr unsafe.Pointer)
 
 //go:linkname Release
+//go:noescape
 func Release(addr unsafe.Pointer)
 
 //go:linkname ReleaseMerge
+//go:noescape
 func ReleaseMerge(addr unsafe.Pointer)
 
 //go:linkname Disable

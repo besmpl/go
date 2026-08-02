@@ -16,8 +16,12 @@ import _ "unsafe"
 // The different forms of this function just tell the runtime how to present
 // the reason for waiting in a backtrace, and is used to compute some metrics.
 // Otherwise they're functionally identical.
+// The runtime may retain s while this call is blocked, but never after it
+// returns. Cross-goroutine uses independently make the synchronization object
+// escape through the sharing path.
 //
 //go:linkname runtime_SemacquireMutex
+//go:noescape
 func runtime_SemacquireMutex(s *uint32, lifo bool, skipframes int)
 
 // Semrelease atomically increments *s and notifies a waiting goroutine
@@ -27,8 +31,10 @@ func runtime_SemacquireMutex(s *uint32, lifo bool, skipframes int)
 // If handoff is true, pass count directly to the first waiter.
 // skipframes is the number of frames to omit during tracing, counting from
 // runtime_Semrelease's caller.
+// The runtime does not retain s after this call returns.
 //
 //go:linkname runtime_Semrelease
+//go:noescape
 func runtime_Semrelease(s *uint32, handoff bool, skipframes int)
 
 // Active spinning runtime support.

@@ -723,6 +723,18 @@ func raceFastSyncAddressAllowed(gp *g, addr uintptr) bool {
 	return raceFastPathAllowed(gp) && addr != 0
 }
 
+// Memory which still resides on the current goroutine's stack cannot be
+// concurrently reachable from another goroutine in valid Go; any such pointer
+// flow makes the object escape to the heap. Atomics there have no foreign
+// release or cross-goroutine access history, and synchronization events there
+// cannot import or publish a foreign happens-before edge. Same-goroutine
+// program order already orders every surrounding access.
+//
+//go:nosplit
+func raceCurrentStackRange(gp *g, addr, size uintptr) bool {
+	return size != 0 && addr >= gp.stack.lo && size <= gp.stack.hi-gp.stack.lo && addr <= gp.stack.hi-size
+}
+
 // The optimistic detector transactions use non-blocking internal locks on the
 // user goroutine. Pinning the current M makes the whole transaction an unsafe
 // point: the goroutine cannot be stopped while it owns a detector lock and
@@ -1410,6 +1422,9 @@ func raceacquire(addr unsafe.Pointer) {
 	if gp.raceguard != 0 || gp.raceignore != 0 {
 		return
 	}
+	if raceCurrentStackRange(gp, uintptr(addr), 1) {
+		return
+	}
 	racectx := gp.racectx
 	if racectx > 1 && raceFastSyncAddressAllowed(gp, uintptr(addr)) && raceTryAcquireDirect(uintptr(addr), racectx) {
 		return
@@ -1505,6 +1520,9 @@ func racerelease(addr unsafe.Pointer) {
 		return
 	}
 	if gp.raceguard != 0 || gp.raceignore != 0 {
+		return
+	}
+	if raceCurrentStackRange(gp, uintptr(addr), 1) {
 		return
 	}
 	racectx := gp.racectx
@@ -1622,6 +1640,9 @@ func racereleasemerge(addr unsafe.Pointer) {
 		return
 	}
 	if gp.raceguard != 0 || gp.raceignore != 0 {
+		return
+	}
+	if raceCurrentStackRange(gp, uintptr(addr), 1) {
 		return
 	}
 	racectx := gp.racectx

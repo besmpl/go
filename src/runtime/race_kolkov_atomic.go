@@ -1256,6 +1256,9 @@ func kolkovAtomicCAS32(addr *uint32, old, new uint32, pc uintptr) (swapped bool)
 	if addr == nil || gp == nil || gp.m == nil || gp.m.curg == nil || gp != gp.m.curg || gp.raceguard != 0 {
 		return atomic.Cas(addr, old, new)
 	}
+	if raceCurrentStackRange(gp, uintptr(unsafe.Pointer(addr)), 4) {
+		return atomic.Cas(addr, old, new)
+	}
 	racectx := gp.racectx
 	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
@@ -1398,6 +1401,9 @@ func kolkovAtomicCASUintptr(addr *uintptr, old, new uintptr, pc uintptr) (swappe
 func kolkovAtomicAdd32(addr *uint32, delta uint32, pc uintptr) (value uint32) {
 	gp := getg()
 	if addr == nil || gp == nil || gp.m == nil || gp.m.curg == nil || gp != gp.m.curg || gp.raceguard != 0 {
+		return atomic.Xadd(addr, int32(delta))
+	}
+	if raceCurrentStackRange(gp, uintptr(unsafe.Pointer(addr)), 4) {
 		return atomic.Xadd(addr, int32(delta))
 	}
 	racectx := gp.racectx

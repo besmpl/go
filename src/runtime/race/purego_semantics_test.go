@@ -13,8 +13,102 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 )
+
+func TestPureGoStackLocalMutexDoesNotEscape(t *testing.T) {
+	if allocs := testing.AllocsPerRun(1000, func() {
+		var mu sync.Mutex
+		mu.Lock()
+		mu.Unlock()
+	}); allocs != 0 {
+		t.Fatalf("stack-local Mutex allocated %v objects per run, want 0", allocs)
+	}
+}
+
+func TestPureGoMutexEscapeBoundary(t *testing.T) {
+	const source = `package main
+
+import (
+	"sync"
+	"sync/atomic"
+)
+
+var globalSink *sync.Mutex
+var atomicSink atomic.Pointer[sync.Mutex]
+
+func local() {
+	var localMu sync.Mutex
+	localMu.Lock()
+	localMu.Unlock()
+}
+
+func goroutineShared(done chan struct{}) {
+	var goroutineMu sync.Mutex
+	go func() {
+		goroutineMu.Lock()
+		goroutineMu.Unlock()
+		close(done)
+	}()
+}
+
+func channelShared(ch chan<- *sync.Mutex) {
+	var channelMu sync.Mutex
+	ch <- &channelMu
+}
+
+func globalShared() {
+	var globalMu sync.Mutex
+	globalSink = &globalMu
+}
+
+func atomicShared() {
+	var atomicMu sync.Mutex
+	atomicSink.Store(&atomicMu)
+}
+
+func main() {}
+`
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(src, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, mode := range []struct {
+		name string
+		race bool
+	}{
+		{name: "non-race"},
+		{name: "pure-go-race", race: true},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			args := []string{"build"}
+			if mode.race {
+				args = append(args, "-race")
+			}
+			args = append(args,
+				"-gcflags=command-line-arguments=-m=1 -l",
+				"-o", filepath.Join(dir, mode.name), src)
+			cmd := testenv.Command(t, testenv.GoToolPath(t), args...)
+			cmd.Env = pureGoRaceEnv(cmd.Environ())
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("compile escape boundary: %v\n%s", err, out)
+			}
+			if bytes.Contains(out, []byte("moved to heap: localMu")) {
+				t.Fatalf("stack-local Mutex escaped:\n%s", out)
+			}
+			for _, name := range []string{"goroutineMu", "channelMu", "globalMu", "atomicMu"} {
+				if !bytes.Contains(out, []byte("moved to heap: "+name)) {
+					t.Errorf("shared Mutex %s did not escape:\n%s", name, out)
+				}
+			}
+		})
+	}
+}
 
 func TestPureGoSemantics(t *testing.T) {
 	tests := []struct {
@@ -505,6 +599,71 @@ func main() {
 	close(start)
 	<-done
 	<-done
+}
+`,
+		},
+		{
+			name: "shared-local-mutex-retains-happens-before",
+			source: `package main
+
+import "sync"
+
+var value int
+
+func main() {
+	var mu sync.Mutex
+	mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		value = 1
+		mu.Unlock()
+		close(done)
+	}()
+	mu.Lock()
+	_ = value
+	mu.Unlock()
+	<-done
+}
+`,
+		},
+		{
+			name:     "shared-mutex-retains-mixed-atomic-plain-race",
+			wantRace: true,
+			source: `package main
+
+import (
+	"runtime"
+	"sync"
+	"unsafe"
+)
+
+var mu sync.Mutex
+var sink int32
+
+func main() {
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		sink += *(*int32)(unsafe.Pointer(&mu))
+		close(started)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				sink += *(*int32)(unsafe.Pointer(&mu))
+			}
+		}
+	}()
+	<-started
+	for i := range 100000 {
+		mu.Lock()
+		mu.Unlock()
+		if i&255 == 0 {
+			runtime.Gosched()
+		}
+	}
+	close(done)
 }
 `,
 		},

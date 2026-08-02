@@ -69,11 +69,14 @@ func growStack(depth int, value uint64) uint64 {
 
 //go:noinline
 func exercise(id uint64) {
+	var localMutex sync.Mutex
 	var word atomic.Uint64
 	var pointer atomic.Pointer[node]
 	src := heapBytes()
 	dst := heapBytes()
 
+	localMutex.Lock()
+	localMutex.Unlock()
 	word.Store(id + 1)
 	for i := range src {
 		src[i] = byte(id + uint64(i))
@@ -84,6 +87,8 @@ func exercise(id uint64) {
 	// Grow the active stack while word and pointer remain live, then use their
 	// potentially relocated addresses in complete atomic transactions.
 	value := growStack(24, id+1)
+	localMutex.Lock()
+	localMutex.Unlock()
 	if got := word.Load(); got != id+1 {
 		panic("atomic load mismatch")
 	}
