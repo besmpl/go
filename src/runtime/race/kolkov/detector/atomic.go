@@ -340,15 +340,24 @@ type atomicState struct {
 const (
 	rmwCohortLimit      = uint16(4096)
 	rmwPatientTIDSpread = uint32(128)
+	// Reuse the finite progress bound instead of introducing an independent
+	// workload-sized threshold. At this population, owner TID locality no
+	// longer describes the runnable exact-address cohort reliably.
+	rmwPatientWaiters = uint32(rmwCohortLimit)
 )
 
-// publicRMWPatientLocked classifies only the retry delay. A wide span between
-// the spinner and the current owner is an allocation-free proxy for a large
-// exact-address cohort. Using only the current owner prevents sequential small
-// cohorts with monotonically increasing TIDs from being misclassified as one
-// large cohort. The marker never changes admission, ownership, modification
-// order, or the existing 64-miss/4096-completion progress bounds.
+// publicRMWPatientLocked classifies only the retry delay. A waiter population
+// which reaches the existing finite progress bound is direct evidence of a
+// massive exact-address cohort. Below it, a wide span between the spinner and
+// the current owner is an allocation-free proxy. Using only the current owner
+// prevents sequential small cohorts with monotonically increasing TIDs from
+// being misclassified as one large cohort. The marker never changes admission,
+// ownership, modification order, or the 64-miss/4096-completion progress
+// bounds.
 func (s *atomicState) publicRMWPatientLocked(tid uint32) bool {
+	if s.rmwWaiters >= rmwPatientWaiters {
+		return true
+	}
 	if s.rmwRecentN == 0 {
 		return false
 	}

@@ -457,6 +457,21 @@ func TestAtomicRMWRecentOwnerSelectsPoliteSpinnerHint(t *testing.T) {
 	d.AtomicEndMode(addr, 8, other, &spinnerToken, 0x512c, true, true)
 }
 
+func TestAtomicRMWMassiveWaiterCohortSelectsPatientSpinnerHint(t *testing.T) {
+	var state atomicState
+	state.rmwQueue.lock()
+	defer state.rmwQueue.unlock()
+
+	state.rmwWaiters = rmwPatientWaiters - 1
+	if state.publicRMWPatientLocked(1) {
+		t.Fatal("sub-threshold waiter cohort selected patient spinner delay")
+	}
+	state.rmwWaiters = rmwPatientWaiters
+	if !state.publicRMWPatientLocked(1) {
+		t.Fatal("massive waiter cohort did not select patient spinner delay")
+	}
+}
+
 func TestAtomicResumeRMWWithoutSynchronizationKeepsHistoryButNotClockOrRelease(t *testing.T) {
 	d := NewDetector()
 	owner := goroutine.Alloc(2090)
