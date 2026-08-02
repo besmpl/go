@@ -928,6 +928,9 @@ func (c *hchan) raceaddr() unsafe.Pointer {
 }
 
 func racesync(c *hchan, sg *sudog) {
+	if racetryrendezvous(sg.g, chanbuf(c, 0)) {
+		return
+	}
 	racerelease(chanbuf(c, 0))
 	raceacquireg(sg.g, chanbuf(c, 0))
 	racereleaseg(sg.g, chanbuf(c, 0))

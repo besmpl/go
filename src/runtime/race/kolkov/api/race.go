@@ -1281,6 +1281,18 @@ func racereleasemergeCtx(addr, racectx uintptr) {
 	det.OnReleaseMerge(addr, ctx)
 }
 
+// raceRendezvousCtx applies the exact synchronization transform for one
+// committed unbuffered-channel handoff. The runtime admits only distinct,
+// cached contexts whose goroutines remain live under the channel lock.
+//
+//go:linkname raceRendezvousCtx
+//go:nosplit
+func raceRendezvousCtx(addr, currentCtx, targetCtx uintptr) {
+	current := (*goroutine.RaceContext)(unsafe.Pointer(currentCtx))
+	target := (*goroutine.RaceContext)(unsafe.Pointer(targetCtx))
+	det.OnRendezvous(addr, current, target)
+}
+
 // === Same-Epoch Fast Path (T22 optimization) ===
 // These functions check if a memory access can skip the full detector path.
 // Called from runtime BEFORE systemstack() to avoid ~60ns closure+stack-switch

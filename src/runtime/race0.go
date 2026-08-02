@@ -34,6 +34,7 @@ func racerelease(addr unsafe.Pointer)                                       { th
 func racereleaseg(gp *g, addr unsafe.Pointer)                               { throw("race") }
 func racereleaseacquire(addr unsafe.Pointer)                                { throw("race") }
 func racereleaseacquireg(gp *g, addr unsafe.Pointer)                        { throw("race") }
+func racetryrendezvous(gp *g, addr unsafe.Pointer) bool                     { return false }
 func racereleasemerge(addr unsafe.Pointer)                                  { throw("race") }
 func racereleasemergeg(gp *g, addr unsafe.Pointer)                          { throw("race") }
 func racefingo()                                                            { throw("race") }

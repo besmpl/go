@@ -895,6 +895,58 @@ func (d *Detector) OnRelease(addr uintptr, ctx *goroutine.RaceContext) {
 	ctx.CommitClockAdvance(next)
 }
 
+// OnRendezvous applies the exact four-event state transition used by an
+// unbuffered channel handoff between current and its parked target:
+//
+//	current release; target acquire; target release; current acquire
+//
+// The runtime calls this only while the channel lock excludes another event
+// on addr and keeps both distinct contexts scheduler-live. That makes the two
+// intermediate release publications unobservable: the target can import the
+// current clock directly, current can import the target clock directly, and
+// only the terminal target release must be published to SyncShadow. Logical
+// clock commits, cache weakening, foreign-import accounting, source proof,
+// event counting, and terminal publication remain identical to the canonical
+// sequence.
+func (d *Detector) OnRendezvous(addr uintptr, current, target *goroutine.RaceContext) {
+	if current == nil || target == nil || current == target {
+		atomicRuntimeThrow("race detector invalid channel rendezvous contexts")
+	}
+
+	// current release: target must observe current's pre-successor clock.
+	currentReleaseNext := current.PreflightClockAdvance()
+	d.checkOverflowPeriodically()
+	targetAcquireNext := target.PreflightClockAdvance()
+	target.C.Join(current.C)
+	target.NoteForeignImport()
+	current.CommitClockAdvance(currentReleaseNext)
+
+	// target acquire: the join above may have changed its owned sparse shape,
+	// so provision the successor again before committing it.
+	d.checkOverflowPeriodically()
+	target.PreflightClockAdvance()
+	target.CommitClockAdvance(targetAcquireNext)
+
+	// target release and current acquire share target's pre-successor clock.
+	// Publish that exact terminal release before either context advances.
+	targetReleaseNext := target.PreflightClockAdvance()
+	d.checkOverflowPeriodically()
+	currentAcquireNext := current.PreflightClockAdvance()
+	current.C.Join(target.C)
+	current.NoteForeignImport()
+	syncVar := d.syncShadow.GetOrCreate(addr)
+	syncVar.SetReleaseClockForContext(target.C, target.TID, target.ForeignGeneration)
+	current.RecordSyncVar(addr, unsafe.Pointer(syncVar))
+	target.RecordSyncVar(addr, unsafe.Pointer(syncVar))
+	target.CommitClockAdvance(targetReleaseNext)
+
+	// current acquire completes after target release. Its direct join may
+	// likewise have changed representation capacity needed by the successor.
+	d.checkOverflowPeriodically()
+	current.PreflightClockAdvance()
+	current.CommitClockAdvance(currentAcquireNext)
+}
+
 // OnReleaseMerge handles RWMutex read unlock operations.
 //
 // This is used for RWMutex.RUnlock where multiple readers may have

@@ -231,6 +231,9 @@ func kolkovOnReleaseCtx(addr, racectx uintptr)
 //go:linkname kolkovOnReleaseMergeCtx runtime/race/kolkov/api.racereleasemergeCtx
 func kolkovOnReleaseMergeCtx(addr, racectx uintptr)
 
+//go:linkname kolkovOnRendezvousCtx runtime/race/kolkov/api.raceRendezvousCtx
+func kolkovOnRendezvousCtx(addr, currentCtx, targetCtx uintptr)
+
 // T26: Shadow pointer getter for inline fast path in runtime.
 // Returns uintptr pointing to the *PageTableShadow struct.
 // Called once during raceinit to cache the value in kolkovShadowPtr (race_kolkov.go).

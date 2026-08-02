@@ -1588,6 +1588,31 @@ func racereleaseacquireg(gp *g, addr unsafe.Pointer) {
 	curg.raceguard--
 }
 
+// racetryrendezvous records the exact four synchronization events of one
+// committed unbuffered-channel handoff in a single detector callback. The
+// channel lock keeps both contexts scheduler-live and excludes another event
+// on this channel cell. Unsupported lifecycle states use the established
+// four-hook sequence without partial detector mutation.
+//
+//go:nosplit
+func racetryrendezvous(gp *g, addr unsafe.Pointer) bool {
+	curg := getg()
+	if curg != curg.m.curg || curg == gp || curg.raceguard != 0 ||
+		curg.raceignore != 0 || gp.raceignore != 0 {
+		return false
+	}
+	currentCtx, targetCtx := curg.racectx, gp.racectx
+	if currentCtx <= 1 || targetCtx <= 1 || currentCtx == targetCtx {
+		return false
+	}
+	curg.raceguard++
+	systemstack(func() {
+		kolkovOnRendezvousCtx(uintptr(addr), currentCtx, targetCtx)
+	})
+	curg.raceguard--
+	return true
+}
+
 // racereleasemerge records a release-merge operation on the given address.
 //
 //go:nosplit

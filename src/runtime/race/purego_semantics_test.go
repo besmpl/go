@@ -288,6 +288,49 @@ func main() {
 `,
 		},
 		{
+			name: "unbuffered-rendezvous-orders-both-sides",
+			source: `package main
+
+var sent, received int
+
+func main() {
+	ch := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		sent = 1
+		ch <- struct{}{}
+		_ = received
+		close(done)
+	}()
+	received = 1
+	<-ch
+	_ = sent
+	<-done
+}
+`,
+		},
+		{
+			name:     "unbuffered-rendezvous-does-not-order-later-writes",
+			wantRace: true,
+			source: `package main
+
+var value int
+
+func main() {
+	ch := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		ch <- struct{}{}
+		value = 1
+		close(done)
+	}()
+	<-ch
+	value = 2
+	<-done
+}
+`,
+		},
+		{
 			name:     "disabled-target-channel-sync",
 			wantRace: true,
 			source: `package main

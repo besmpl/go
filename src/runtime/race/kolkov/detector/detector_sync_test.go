@@ -473,6 +473,54 @@ func TestSynchronizationFastPathsMatchCanonicalEventByEvent(t *testing.T) {
 	requireSyncFastParity(t, "release-merge", snapshotSyncFastEvent(canonical, syncAddr, canonicalCtx), snapshotSyncFastEvent(fast, syncAddr, fastCtx))
 }
 
+func TestRendezvousMatchesCanonicalFourEventSequence(t *testing.T) {
+	const addr = uintptr(0x87c0)
+	tests := []struct {
+		name  string
+		shape func(current, target *goroutine.RaceContext)
+	}{
+		{name: "inline"},
+		{
+			name: "sparse-and-retired",
+			shape: func(current, target *goroutine.RaceContext) {
+				current.C.Set(vectorclock.DenseThreads+257, 19)
+				current.C.RetireRange(vectorclock.DenseThreads+400, vectorclock.DenseThreads+411)
+				target.C.Set(vectorclock.DenseThreads+701, 23)
+				target.C.RetireRange(vectorclock.DenseThreads+900, vectorclock.DenseThreads+917)
+				current.NoteForeignImport()
+				target.NoteForeignImport()
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			canonical := NewDetector()
+			fused := NewDetector()
+			canonicalCurrent, canonicalTarget := goroutine.Alloc(320), goroutine.Alloc(321)
+			fusedCurrent, fusedTarget := goroutine.Alloc(320), goroutine.Alloc(321)
+			if test.shape != nil {
+				test.shape(canonicalCurrent, canonicalTarget)
+				test.shape(fusedCurrent, fusedTarget)
+			}
+			for _, ctx := range []*goroutine.RaceContext{canonicalCurrent, canonicalTarget, fusedCurrent, fusedTarget} {
+				ctx.RecordAddressOnlyReadRange(0x9100, 8)
+			}
+
+			canonical.OnRelease(addr, canonicalCurrent)
+			canonical.OnAcquire(addr, canonicalTarget)
+			canonical.OnRelease(addr, canonicalTarget)
+			canonical.OnAcquire(addr, canonicalCurrent)
+			fused.OnRendezvous(addr, fusedCurrent, fusedTarget)
+
+			requireSyncFastParity(t, "current", snapshotSyncFastEvent(canonical, addr, canonicalCurrent), snapshotSyncFastEvent(fused, addr, fusedCurrent))
+			requireSyncFastParity(t, "target", snapshotSyncFastEvent(canonical, addr, canonicalTarget), snapshotSyncFastEvent(fused, addr, fusedTarget))
+			if fusedCurrent.LookupSyncVar(addr) == nil || fusedTarget.LookupSyncVar(addr) == nil {
+				t.Fatal("fused rendezvous did not cache its terminal synchronization owner")
+			}
+		})
+	}
+}
+
 func TestSynchronizationFastMissesDoNotCommitEvent(t *testing.T) {
 	d := NewDetector()
 	ctx := goroutine.Alloc(311)

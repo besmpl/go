@@ -675,6 +675,14 @@ func racereleaseacquireg(gp *g, addr unsafe.Pointer) {
 	racecall(&__tsan_release_acquire, gp.racectx, uintptr(addr), 0, 0)
 }
 
+// racetryrendezvous is implemented only by the pure-Go detector. TSan keeps
+// the established four-hook channel rendezvous sequence.
+//
+//go:nosplit
+func racetryrendezvous(gp *g, addr unsafe.Pointer) bool {
+	return false
+}
+
 //go:nosplit
 func racereleasemerge(addr unsafe.Pointer) {
 	racereleasemergeg(getg(), addr)
