@@ -257,15 +257,36 @@ jobs:
           }
 
           run_sample() {
-            local label="$1" binary="$2" expected_hash="$3" sample="$4" output actual_hash
+            local label="$1" binary="$2" expected_hash="$3" sample="$4"
+            local output part actual_hash workloads workload pattern parent child
             output="raw/${label}/${sample}.txt"
+            part="${output}.part"
             actual_hash="$(git hash-object "${binary}")"
             [[ "${actual_hash}" == "${expected_hash}" ]] || { echo "${label}: benchmark binary changed before sample ${sample}" >&2; return 1; }
             printf '%s %s\n' "${sample}" "${label}" >> sample-order.txt
-            if ! GOMAXPROCS="${BENCH_GOMAXPROCS}" "${binary}" -test.run='^$' -test.bench='.' -test.benchmem -test.benchtime=1s -test.count=1 -test.timeout=10m > "${output}" 2>&1; then
-              cat "${output}" >&2
-              return 1
-            fi
+            workloads="$(bash pr/benchmarks/run_comparison.sh --print-workload-matrix)"
+            [[ -n "${workloads}" ]]
+            : > "${output}"
+            while IFS= read -r workload; do
+              [[ "${workload}" =~ ^[A-Za-z0-9]+(/[A-Za-z0-9]+)?$ ]] || {
+                echo "invalid benchmark workload: ${workload}" >&2
+                return 1
+              }
+              if [[ "${workload}" == */* ]]; then
+                parent="${workload%%/*}"
+                child="${workload#*/}"
+                pattern="^Benchmark${parent}$/^${child}$"
+              else
+                pattern="^Benchmark${workload}$"
+              fi
+              if ! GOMAXPROCS="${BENCH_GOMAXPROCS}" "${binary}" -test.run='^$' -test.bench="${pattern}" -test.benchmem -test.benchtime=1s -test.count=1 -test.timeout=10m > "${part}" 2>&1; then
+                cat "${part}" >&2
+                cat "${part}" >> "${output}"
+                return 1
+              fi
+              cat "${part}" >> "${output}"
+            done <<< "${workloads}"
+            rm -f "${part}"
             validate_sample "${label} ${sample}" "${output}" "${output}.samples"
             actual_hash="$(git hash-object "${binary}")"
             [[ "${actual_hash}" == "${expected_hash}" ]] || { echo "${label}: benchmark binary changed during sample ${sample}" >&2; return 1; }

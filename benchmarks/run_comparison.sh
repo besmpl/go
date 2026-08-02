@@ -59,6 +59,7 @@ WaitGroupFanOut/g64
 MapReadWrite/g1
 MapReadWrite/g4
 MapReadWrite/g16
+MapReadWrite/g64
 ProducerConsumer/buf1
 ProducerConsumer/buf16
 ProducerConsumer/buf64
@@ -232,6 +233,10 @@ while [[ $# -gt 0 ]]; do
 			ACTION_ARG1="$2"
 			shift 2
 			;;
+		--print-workload-matrix)
+			select_action print-workload-matrix
+			shift
+			;;
         --help|-h)
             cat <<'USAGE'
 Usage: run_comparison.sh [OPTIONS]
@@ -274,6 +279,7 @@ Evidence validation (cannot be combined with run options):
                               bootstrap toolchain.
   --validate-toolchain-build PATH
                               Validate PATH against its recorded build receipt
+  --print-workload-matrix     Print the exact ordered benchmark workload and exit
 USAGE
             exit 0
             ;;
@@ -1016,6 +1022,10 @@ if [[ "${ACTION}" != run && "${RUN_OPTIONS}" == true ]]; then
 fi
 
 case "${ACTION}" in
+	print-workload-matrix)
+		workload_matrix
+		exit 0
+		;;
 	build-toolchain)
 		command -v git >/dev/null 2>&1 || fail "git is required to attest the toolchain"
 		build_and_attest_toolchain "${ACTION_ARG1}"

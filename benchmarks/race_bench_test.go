@@ -219,11 +219,10 @@ func BenchmarkWaitGroupFanOut(b *testing.B) {
 
 // BenchmarkMapReadWrite simulates concurrent map access protected by RWMutex.
 // Its gN sub-benchmark names identify SetParallelism(N), so RunParallel starts
-// N*GOMAXPROCS workers; the exact count is reported as a workers metric. Race
-// builds omit the g64 stress case; non-race diagnostic builds retain it.
+// N*GOMAXPROCS workers; the exact count is reported as a workers metric.
 func BenchmarkMapReadWrite(b *testing.B) {
 	b.ReportAllocs()
-	for _, n := range mapReadWriteParallelisms {
+	for _, n := range []int{1, 4, 16, 64} {
 		b.Run(goroutineLabel(n), func(b *testing.B) {
 			b.ReportAllocs()
 			var mu sync.RWMutex
