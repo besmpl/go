@@ -934,8 +934,19 @@ func (d *Detector) OnRendezvous(addr uintptr, current, target *goroutine.RaceCon
 	currentAcquireNext := current.PreflightClockAdvance()
 	current.C.Join(target.C)
 	current.NoteForeignImport()
-	syncVar := d.syncShadow.GetOrCreate(addr)
-	syncVar.SetReleaseClockForContext(target.C, target.TID, target.ForeignGeneration)
+	// Repeated rendezvous on the same channel already root this exact identity
+	// in both contexts. Reuse the warmed immutable publication machinery before
+	// falling back to the canonical lookup and writer path. TrySet is
+	// all-or-nothing, so a retired identity, contended writer, or insufficient
+	// prepared capacity cannot partially publish the terminal release.
+	syncVar := (*syncshadow.SyncVar)(target.LookupSyncVar(addr))
+	if syncVar == nil {
+		syncVar = (*syncshadow.SyncVar)(current.LookupSyncVar(addr))
+	}
+	if syncVar == nil || !syncVar.TrySetReleaseClockForContext(target.C, target.TID, target.ForeignGeneration) {
+		syncVar = d.syncShadow.GetOrCreate(addr)
+		syncVar.SetReleaseClockForContext(target.C, target.TID, target.ForeignGeneration)
+	}
 	current.RecordSyncVar(addr, unsafe.Pointer(syncVar))
 	target.RecordSyncVar(addr, unsafe.Pointer(syncVar))
 	target.CommitClockAdvance(targetReleaseNext)

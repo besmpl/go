@@ -517,6 +517,16 @@ func TestRendezvousMatchesCanonicalFourEventSequence(t *testing.T) {
 			if fusedCurrent.LookupSyncVar(addr) == nil || fusedTarget.LookupSyncVar(addr) == nil {
 				t.Fatal("fused rendezvous did not cache its terminal synchronization owner")
 			}
+
+			// The next rendezvous must reuse the cached terminal owner without
+			// changing the exact four-event result.
+			canonical.OnRelease(addr, canonicalCurrent)
+			canonical.OnAcquire(addr, canonicalTarget)
+			canonical.OnRelease(addr, canonicalTarget)
+			canonical.OnAcquire(addr, canonicalCurrent)
+			fused.OnRendezvous(addr, fusedCurrent, fusedTarget)
+			requireSyncFastParity(t, "warmed current", snapshotSyncFastEvent(canonical, addr, canonicalCurrent), snapshotSyncFastEvent(fused, addr, fusedCurrent))
+			requireSyncFastParity(t, "warmed target", snapshotSyncFastEvent(canonical, addr, canonicalTarget), snapshotSyncFastEvent(fused, addr, fusedTarget))
 		})
 	}
 }
@@ -694,6 +704,19 @@ func BenchmarkOnAcquireFast(b *testing.B) {
 		if !d.TryAcquire(addr, ctx) {
 			d.OnAcquire(addr, ctx)
 		}
+	}
+}
+
+func BenchmarkOnRendezvousWarmed(b *testing.B) {
+	d := NewDetector()
+	current := goroutine.Alloc(922)
+	target := goroutine.Alloc(923)
+	const addr = uintptr(0x92200)
+	d.OnRendezvous(addr, current, target)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		d.OnRendezvous(addr, current, target)
 	}
 }
 
