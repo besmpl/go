@@ -88,6 +88,27 @@ func TestAtomicOperationsDoNotRaceWithEachOther(t *testing.T) {
 	}
 }
 
+// Every synchronizing atomic access must retain a distinct writer epoch. The
+// first store is acquired by reader, but the second store is not ordered before
+// reader's later plain access. Reusing the first store's epoch for the second
+// would manufacture happens-before and suppress this required mixed-access
+// report.
+func TestAtomicWriterEpochCannotBeCoalescedAcrossAcquire(t *testing.T) {
+	d := NewDetector()
+	writer := goroutine.Alloc(4_001)
+	reader := goroutine.Alloc(4_002)
+	const addr = uintptr(0x3800)
+
+	completeAtomic(d, addr, writer, false, true)
+	completeAtomic(d, addr, reader, true, false)
+	completeAtomic(d, addr, writer, false, true)
+	d.OnRead(addr, reader, 0x1380)
+
+	if got := d.RacesDetected(); got != 1 {
+		t.Fatalf("post-acquire atomic/plain conflict reported %d races, want 1", got)
+	}
+}
+
 func TestFailedCASHistoryIsAtomicRead(t *testing.T) {
 	d := NewDetector()
 	ctx := goroutine.Alloc(5)
@@ -289,6 +310,25 @@ func TestAtomicHistoryPreservesUserWitnessAcrossInternalAccess(t *testing.T) {
 	state = atomicHistoryForTest(t, d, addr)
 	if got := atomicHistoryCardinality(state.reads); got != 1 {
 		t.Fatalf("internal write pruned user read witness: got %d reads, want 1", got)
+	}
+}
+
+func TestAtomicInternalRMWPCClassifiesOnlyInternalMutex(t *testing.T) {
+	mutexPC := reflect.ValueOf((*internalsync.Mutex).Lock).Pointer() + 1
+	if !AtomicInternalRMWPC(mutexPC) {
+		t.Fatalf("internal Mutex PC %#x was not classified", mutexPC)
+	}
+	for _, pc := range []uintptr{
+		reflect.ValueOf((*sync.RWMutex).RLock).Pointer() + 1,
+		reflect.ValueOf((*sync.WaitGroup).Add).Pointer() + 1,
+	} {
+		if AtomicInternalRMWPC(pc) {
+			t.Fatalf("RaceDisable implementation PC %#x was classified", pc)
+		}
+	}
+	userPC := reflect.ValueOf(completeAtomicSize).Pointer() + 1
+	if AtomicInternalRMWPC(userPC) {
+		t.Fatalf("user PC %#x was classified as an implementation atomic", userPC)
 	}
 }
 
@@ -502,10 +542,11 @@ func TestAtomicClockAdvancesExactlyOnceAfterEnd(t *testing.T) {
 	}
 }
 
-func TestAtomicAcquireOnlySlowCompletionKeepsClockAndWeakensReadCache(t *testing.T) {
+func TestAtomicAcquireOnlyCompletionKeepsClockAndWeakensReadCache(t *testing.T) {
 	tests := []struct {
-		name  string
-		begin func(*Detector, uintptr, *goroutine.RaceContext, *AtomicToken)
+		name       string
+		expectFast bool
+		begin      func(*Detector, uintptr, *goroutine.RaceContext, *AtomicToken)
 	}{
 		{
 			name: "load",
@@ -514,7 +555,8 @@ func TestAtomicAcquireOnlySlowCompletionKeepsClockAndWeakensReadCache(t *testing
 			},
 		},
 		{
-			name: "failed CAS",
+			name:       "failed CAS",
+			expectFast: true,
 			begin: func(d *Detector, addr uintptr, ctx *goroutine.RaceContext, token *AtomicToken) {
 				d.AtomicBeginRMW(addr, 8, ctx, true, token)
 			},
@@ -535,8 +577,8 @@ func TestAtomicAcquireOnlySlowCompletionKeepsClockAndWeakensReadCache(t *testing
 
 			var token AtomicToken
 			test.begin(d, addr, ctx, &token)
-			if atomicFastToken(&token) != nil {
-				t.Fatal("general operation unexpectedly used an enrolled fast token")
+			if fast := atomicFastToken(&token) != nil; fast != test.expectFast {
+				t.Fatalf("fast token = %v, want %v", fast, test.expectFast)
 			}
 			d.AtomicEnd(addr, 8, ctx, &token, 0x2010+uintptr(i), false)
 
@@ -1178,7 +1220,7 @@ func TestAtomicReleaseSnapshotSharedAndReusedForWideStore(t *testing.T) {
 	}
 }
 
-func TestAtomicSequentialFreshTIDRMWKeepsBoundedFrontierAndReleaseRuns(t *testing.T) {
+func TestAtomicSequentialFreshTIDRMWKeepsBoundedFrontierAndPromotesLineage(t *testing.T) {
 	d := NewDetector()
 	const addr = uintptr(0xc400)
 	const firstTID = uint32(20_000)
@@ -1200,13 +1242,13 @@ func TestAtomicSequentialFreshTIDRMWKeepsBoundedFrontierAndReleaseRuns(t *testin
 	if release == nil {
 		t.Fatal("sequential RMW chain published no release")
 	}
-	runs := atomicReleaseRunsForTest(release)
-	if len(runs) != 1 {
-		t.Fatalf("%d contiguous equal-clock TIDs encoded as %d runs, want 1", contexts, len(runs))
+	if release.lineage == nil || !release.view.Valid() {
+		t.Fatal("many-owner contiguous release did not promote to a causal lineage")
 	}
-	run := runs[0]
-	if run.First != firstTID || run.Last != firstTID+contexts-1 || run.Clock != 1 {
-		t.Fatalf("release run = [%d,%d]@%d, want [%d,%d]@1", run.First, run.Last, run.Clock, firstTID, firstTID+contexts-1)
+	for _, tid := range []uint32{firstTID, firstTID + contexts/2, firstTID + contexts - 1} {
+		if got := release.view.Get(tid); got != 1 {
+			t.Fatalf("promoted release clock[%d] = %d, want 1", tid, got)
+		}
 	}
 	if retired := atomicReleaseRetiredForTest(release); len(retired) != 0 {
 		t.Fatalf("fresh-TID chain unexpectedly encoded %d retired intervals", len(retired))
@@ -1360,6 +1402,75 @@ func TestAtomicReleaseOnePassImportAllocationsStayBoundedWhenFragmented(t *testi
 	// small fixed difference for destination representation thresholds.
 	if large > medium+3 {
 		t.Fatalf("one-pass import allocations grew with fragmentation: 256 runs %.2f, 4096 runs %.2f", medium, large)
+	}
+}
+
+func TestInitializeAtomicReleaseCompositeSharesRootsExactly(t *testing.T) {
+	upstream := vectorclock.New()
+	upstream.Set(70_001, 17)
+	upstream.Set(70_002, 23)
+	lineage := vectorclock.NewClockLineage(upstream)
+	upstream.Release()
+	defer lineage.Release()
+	root := lineage.Pin()
+	defer root.Release()
+
+	ctx := goroutine.Alloc(70_101)
+	defer ctx.C.Release()
+	ctx.C.JoinCausal(root)
+	expected := ctx.C.Clone()
+	defer expected.Release()
+
+	state := atomicState{}
+	release := state.allocateRelease()
+	if !initializeAtomicReleaseComposite(release, ctx) {
+		t.Fatal("composite release initialization rejected a root-plus-own clock")
+	}
+	defer state.arena.freeReleaseObject(release)
+	if release.lineage == nil || !release.view.Valid() || release.importN != 1 {
+		t.Fatalf("composite shape = lineage %v, view %v, imports %d; want lineage/view/1 import",
+			release.lineage != nil, release.view.Valid(), release.importN)
+	}
+	if release.runs != nil || release.retired != nil || release.snapshot != nil {
+		t.Fatal("composite release retained an eager canonical representation")
+	}
+
+	actual := vectorclock.New()
+	defer actual.Release()
+	joinAtomicReleaseCausalSet(actual, release)
+	if !actual.HappensBefore(expected) || !expected.HappensBefore(actual) {
+		t.Fatal("composite release differs from the complete source clock")
+	}
+	if got := actual.Get(ctx.TID); got != uint32(ctx.GetEpoch()) {
+		t.Fatalf("composite own clock = %d, want %d", got, ctx.GetEpoch())
+	}
+	if got := actual.Get(70_001); got != 17 {
+		t.Fatalf("composite imported clock = %d, want 17", got)
+	}
+}
+
+func TestInitializeAtomicReleaseCompositeFallsBackForUncoveredResidual(t *testing.T) {
+	upstream := vectorclock.New()
+	upstream.Set(71_001, 19)
+	lineage := vectorclock.NewClockLineage(upstream)
+	upstream.Release()
+	defer lineage.Release()
+	root := lineage.Pin()
+	defer root.Release()
+
+	ctx := goroutine.Alloc(71_101)
+	defer ctx.C.Release()
+	ctx.C.JoinCausal(root)
+	ctx.C.Set(71_201, 29)
+
+	state := atomicState{}
+	release := state.allocateRelease()
+	defer state.arena.freeReleaseObject(release)
+	if initializeAtomicReleaseComposite(release, ctx) {
+		t.Fatal("composite release initialization accepted an uncovered residual clock")
+	}
+	if release.lineage != nil || release.view.Valid() || release.importN != 0 {
+		t.Fatal("failed composite initialization mutated the release")
 	}
 }
 
@@ -1562,6 +1673,28 @@ func TestAtomicReleaseDeltaReplayCapacityBoundary(t *testing.T) {
 }
 
 func releaseClockForTest(release *atomicRelease, tid uint32) uint32 {
+	if release.lineage != nil {
+		clock := release.view.Get(tid)
+		for i := uint8(0); i < release.importN; i++ {
+			if imported := release.imports[i].Get(tid); imported > clock {
+				clock = imported
+			}
+		}
+		if release.deferred != nil {
+			deferred := vectorclock.New()
+			release.deferred.JoinInto(deferred)
+			if projected := deferred.Get(tid); projected > clock {
+				clock = projected
+			}
+			deferred.Release()
+		}
+		return clock
+	}
+	if release.snapshot != nil {
+		clock := vectorclock.New()
+		clock.JoinSnapshot(release.snapshot)
+		return clock.Get(tid)
+	}
 	for run := release.runs; run != nil; run = run.next {
 		if run.first <= tid && tid <= run.last {
 			return run.clock
@@ -1603,6 +1736,646 @@ func TestAtomicReleasePointMaxMaintainsCanonicalRanges(t *testing.T) {
 	if pointMaxAtomicRelease(release, 12, 1) {
 		t.Fatal("decreasing point update changed canonical release")
 	}
+}
+
+func TestAtomicReleaseLineagePromotionThreshold(t *testing.T) {
+	ranges := make([]vectorclock.FiniteRange, atomicReleasePromotionCoordinateThreshold)
+	ctx := goroutine.Alloc(139_001)
+	for i := range ranges {
+		tid := uint32(200_000 + i*2)
+		ranges[i] = vectorclock.FiniteRange{First: tid, Last: tid, Clock: uint32(i + 1)}
+		ctx.C.Set(tid, uint32(i+1))
+	}
+	_, release := atomicReleaseForTest(ranges)
+	for _, version := range []uint64{63, 65} {
+		release.version = version
+		maybePromoteAtomicRelease(release, ctx)
+		if release.lineage != nil {
+			t.Fatalf("version %d promoted outside the periodic check", version)
+		}
+	}
+	release.version = 64
+	maybePromoteAtomicRelease(release, ctx)
+	if release.lineage == nil || !release.view.Valid() {
+		t.Fatal("64-range release did not promote at version 64")
+	}
+	root := release.lineage
+	maybePromoteAtomicRelease(release, ctx)
+	if release.lineage != root {
+		t.Fatal("already-promoted release replaced its lineage root")
+	}
+}
+
+func TestAtomicReleaseContiguousCoordinatesPromote(t *testing.T) {
+	_, release := atomicReleaseForTest([]vectorclock.FiniteRange{{
+		First: 400_000,
+		Last:  400_000 + atomicReleasePromotionCoordinateThreshold - 1,
+		Clock: 1,
+	}})
+	release.version = atomicReleaseSnapshotCheckPeriod
+	maybePromoteAtomicRelease(release, goroutine.Alloc(139_049))
+	if release.lineage == nil || !release.view.Valid() {
+		t.Fatal("contiguous many-owner release did not promote")
+	}
+}
+
+func TestAtomicReleasePromotionUsesAuthoritativeCanonicalRanges(t *testing.T) {
+	ranges := make([]vectorclock.FiniteRange, atomicReleasePromotionCoordinateThreshold)
+	ctx := goroutine.Alloc(139_050)
+	for i := range ranges {
+		ranges[i] = vectorclock.FiniteRange{
+			First: uint32(210_000 + i*2),
+			Last:  uint32(210_000 + i*2),
+			Clock: uint32(i%5 + 1),
+		}
+	}
+	// This coordinate is deliberately absent from the release. Promotion must
+	// snapshot the continuously-authoritative arena ranges, not the caller.
+	ctx.C.Set(999_999, 77)
+	_, release := atomicReleaseForTest(ranges)
+	release.version = atomicReleaseSnapshotCheckPeriod
+	maybePromoteAtomicRelease(release, ctx)
+	if release.lineage == nil || !release.view.Valid() {
+		t.Fatal("fragmented release did not promote")
+	}
+	imported := vectorclock.New()
+	imported.JoinCausal(release.view)
+	if got := imported.Get(999_999); got != 0 {
+		t.Fatalf("promotion imported incidental publisher coordinate = %d, want 0", got)
+	}
+	for _, r := range ranges {
+		if got := imported.Get(r.First); got != r.Clock {
+			t.Fatalf("promoted canonical clock[%d] = %d, want %d", r.First, got, r.Clock)
+		}
+	}
+}
+
+func TestAtomicPromotedPointUpdatesStayEqualToCanonical(t *testing.T) {
+	ranges := make([]vectorclock.FiniteRange, atomicReleasePromotionCoordinateThreshold)
+	for i := range ranges {
+		ranges[i] = vectorclock.FiniteRange{
+			First: uint32(220_000 + i*2),
+			Last:  uint32(220_000 + i*2),
+			Clock: 3,
+		}
+	}
+	ctx := goroutine.Alloc(139_060)
+	_, release := atomicReleaseForTest(ranges)
+	release.version = atomicReleaseSnapshotCheckPeriod
+	maybePromoteAtomicRelease(release, ctx)
+	updates := []struct {
+		tid, clock uint32
+	}{
+		{220_001, 3}, // bridge and coalesce two equal canonical runs
+		{220_010, 9}, // split an existing run
+		{^uint32(0), 11},
+	}
+	for _, update := range updates {
+		if !pointMaxAtomicRelease(release, update.tid, update.clock) {
+			t.Fatalf("point update (%d,%d) was unexpectedly dominated", update.tid, update.clock)
+		}
+		if _, appended := release.lineage.AppendOwned(&release.view, update.tid, update.clock); !appended {
+			t.Fatalf("lineage point update (%d,%d) was unexpectedly dominated", update.tid, update.clock)
+		}
+		canonical, promoted := vectorclock.New(), vectorclock.New()
+		joinAtomicReleaseRanges(canonical, release.runs)
+		retireAtomicReleaseRanges(canonical, release.retired)
+		promoted.JoinCausal(release.view)
+		var canonicalRuns, promotedRuns []vectorclock.FiniteRange
+		canonical.RangeRuns(func(first, last, clock uint32) bool {
+			canonicalRuns = append(canonicalRuns, vectorclock.FiniteRange{First: first, Last: last, Clock: clock})
+			return true
+		})
+		promoted.RangeRuns(func(first, last, clock uint32) bool {
+			promotedRuns = append(promotedRuns, vectorclock.FiniteRange{First: first, Last: last, Clock: clock})
+			return true
+		})
+		if !reflect.DeepEqual(promotedRuns, canonicalRuns) {
+			t.Fatalf("point update (%d,%d) diverged\ncanonical: %+v\npromoted:  %+v", update.tid, update.clock, canonicalRuns, promotedRuns)
+		}
+	}
+}
+
+func TestAtomicPromotedAcquireMatchesCanonicalFallback(t *testing.T) {
+	ranges := make([]vectorclock.FiniteRange, 80)
+	checkpoint := vectorclock.New()
+	for i := range ranges {
+		tid := uint32(300_000 + i*2)
+		clock := uint32(i%7 + 1)
+		ranges[i] = vectorclock.FiniteRange{First: tid, Last: tid, Clock: clock}
+		checkpoint.Set(tid, clock)
+	}
+	legacyArena, legacyRelease := atomicReleaseForTest(ranges)
+	promotedArena, promotedRelease := atomicReleaseForTest(ranges)
+	legacyRelease.refs, promotedRelease.refs = 1, 1
+	legacyRelease.stream, promotedRelease.stream = newAtomicReleaseStream(), newAtomicReleaseStream()
+	legacyRelease.version, promotedRelease.version = 64, 64
+	promotedRelease.lineage = vectorclock.NewClockLineage(checkpoint)
+	promotedRelease.view = promotedRelease.lineage.Pin()
+	legacy := atomicState{arena: legacyArena}
+	promoted := atomicState{arena: promotedArena}
+	legacy.releases[0], promoted.releases[0] = legacyRelease, promotedRelease
+	want, got := goroutine.Alloc(139_102), goroutine.Alloc(139_103)
+	legacy.acquire(want, 1)
+	promoted.acquire(got, 1)
+	for _, r := range ranges {
+		if a, b := want.C.Get(r.First), got.C.Get(r.First); a != b || a != r.Clock {
+			t.Fatalf("promoted clock[%d] = %d, canonical = %d, want %d", r.First, b, a, r.Clock)
+		}
+	}
+}
+
+func lineageAtomicStateForTest(anchor *vectorclock.VectorClock) (*AtomicHistoryArena, *atomicState, *atomicRelease) {
+	a := newAtomicHistoryArena()
+	release := a.allocRelease()
+	release.stream = newAtomicReleaseStream()
+	release.version = atomicReleaseSnapshotCheckPeriod
+	release.refs = 1
+	release.lineage = vectorclock.NewClockLineage(anchor)
+	release.view = release.lineage.Pin()
+	state := &atomicState{arena: a}
+	state.releases[0] = release
+	return a, state, release
+}
+
+func TestAtomicPromotedStrongAppendAndAcquire(t *testing.T) {
+	publisher := goroutine.Alloc(139_110)
+	_, state, release := lineageAtomicStateForTest(publisher.C)
+	state.acquire(publisher, 1)
+	before := release.version
+	publisher.IncrementClock()
+	state.publishRelease(publisher, 1)
+	if release.version != before+1 {
+		t.Fatalf("strong append version = %d, want %d", release.version, before+1)
+	}
+	if got, want := release.view.Get(publisher.TID), uint32(publisher.GetEpoch()); got != want {
+		t.Fatalf("strong append clock = %d, want %d", got, want)
+	}
+	receiver := goroutine.Alloc(139_111)
+	state.acquire(receiver, 1)
+	if got, want := receiver.C.Get(publisher.TID), uint32(publisher.GetEpoch()); got != want {
+		t.Fatalf("promoted acquire clock = %d, want %d", got, want)
+	}
+}
+
+func TestAtomicPromotedDominatedResidualRestoresStrongProof(t *testing.T) {
+	anchor := vectorclock.New()
+	const predecessor = uint32(239_115)
+	anchor.Set(predecessor, 9)
+	_, state, release := lineageAtomicStateForTest(anchor)
+	ctx := goroutine.Alloc(139_115)
+	ctx.C.Set(predecessor, 7)
+	state.acquire(ctx, 1)
+	_, strong, ok := ctx.LookupAtomicRelease(unsafe.Pointer(release), release.stream, 1)
+	if !ok || !strong {
+		t.Fatalf("dominated residual acquire proof = present %v strong %v, want true/true", ok, strong)
+	}
+
+	// A later unrelated acquire can invalidate the global generation without
+	// adding anything beyond this release. The exact current-version acquire
+	// must restore the strong proof without a lineage join.
+	ctx.NoteForeignImport()
+	if _, strong, _ := ctx.LookupAtomicRelease(unsafe.Pointer(release), release.stream, 1); strong {
+		t.Fatal("test setup did not weaken promoted release proof")
+	}
+	state.acquire(ctx, 1)
+	if _, strong, _ := ctx.LookupAtomicRelease(unsafe.Pointer(release), release.stream, 1); !strong {
+		t.Fatal("dominated exact-version acquire did not restore strong proof")
+	}
+
+	before := release.version
+	ctx.IncrementClock()
+	state.publishRelease(ctx, 1)
+	if release.version != before+1 || release.view.Get(predecessor) != 9 {
+		t.Fatalf("dominated residual point publish = version %d predecessor %d, want %d/9", release.version, release.view.Get(predecessor), before+1)
+	}
+}
+
+func TestAtomicPromotedStaleContextAcrossRotation(t *testing.T) {
+	publisher := goroutine.Alloc(139_120)
+	_, state, release := lineageAtomicStateForTest(publisher.C)
+	state.acquire(publisher, 1)
+	stale := goroutine.Alloc(139_121)
+	state.acquire(stale, 1)
+	old, ok := release.view.Duplicate()
+	if !ok {
+		t.Fatal("failed to pin stale promoted view")
+	}
+	defer old.Release()
+
+	for i := 0; i < 4200; i++ {
+		publisher.IncrementClock()
+		state.publishRelease(publisher, 1)
+	}
+	if release.view.SameFamily(old) == false {
+		t.Fatal("rotation changed release lineage family")
+	}
+	state.acquire(stale, 1)
+	if got, want := stale.C.Get(publisher.TID), release.view.Get(publisher.TID); got != want {
+		t.Fatalf("stale post-rotation acquire clock = %d, want %d", got, want)
+	}
+}
+
+func TestAtomicPromotedWeakForeignCheckpoint(t *testing.T) {
+	publisher := goroutine.Alloc(139_130)
+	_, state, release := lineageAtomicStateForTest(publisher.C)
+	old, ok := release.view.Duplicate()
+	if !ok {
+		t.Fatal("failed to pin old promoted view")
+	}
+	defer old.Release()
+	before := release.version
+
+	const unrelated = uint32(239_130)
+	inherited := goroutine.Alloc(139_131)
+	inherited.C.Set(unrelated, 17)
+	state.acquire(inherited, 1)
+	if _, strong, ok := inherited.LookupAtomicRelease(unsafe.Pointer(release), release.stream, 1); !ok || strong {
+		t.Fatalf("undominated residual proof = present %v strong %v, want true/false", ok, strong)
+	}
+	state.publishRelease(inherited, 1)
+	if release.version != before+1 {
+		t.Fatalf("weak checkpoint version = %d, want %d", release.version, before+1)
+	}
+	if !release.view.SameFamily(old) || !release.view.Dominates(old) {
+		t.Fatal("weak checkpoint did not advance the existing lineage family")
+	}
+	receiver := goroutine.Alloc(139_132)
+	state.acquire(receiver, 1)
+	if got := receiver.C.Get(unrelated); got != 17 {
+		t.Fatalf("weak checkpoint lost foreign clock = %d, want 17", got)
+	}
+}
+
+func TestAtomicValueStyleTwoAddressOnboardingUsesPointPublicationAfterWarmup(t *testing.T) {
+	const typeTID = uint32(239_135)
+	typeArena, typeRelease := atomicReleaseForTest([]vectorclock.FiniteRange{{First: typeTID, Last: typeTID, Clock: 7}})
+	typeRelease.refs = 1
+	typeRelease.stream = newAtomicReleaseStream()
+	typeRelease.version = 1
+	typeState := atomicState{arena: typeArena}
+	typeState.releases[0] = typeRelease
+
+	dataAnchor := vectorclock.New()
+	_, dataState, dataRelease := lineageAtomicStateForTest(dataAnchor)
+	// The first context imports a genuinely new type coordinate, so its first
+	// data publication must checkpoint that residual into the data lineage.
+	warm := goroutine.Alloc(139_135)
+	typeState.acquire(warm, 1)
+	dataState.acquire(warm, 1)
+	if _, strong, _ := warm.LookupAtomicRelease(unsafe.Pointer(dataRelease), dataRelease.stream, 1); strong {
+		t.Fatal("cold Value-style data acquire unexpectedly had a strong proof")
+	}
+	dataState.publishRelease(warm, 1)
+	if got := releaseClockForTest(dataRelease, typeTID); got != 7 {
+		t.Fatalf("Value-style warmup lost type predecessor = %d, want 7", got)
+	}
+
+	// Every later fresh context first imports the same type release. That import
+	// invalidates global generations, but its residual is already dominated by
+	// the data lineage and must use O(1) point publication rather than reanchor.
+	for i := uint32(0); i < 128; i++ {
+		ctx := goroutine.Alloc(140_000 + i)
+		typeState.acquire(ctx, 1)
+		dataState.acquire(ctx, 1)
+		if _, strong, ok := ctx.LookupAtomicRelease(unsafe.Pointer(dataRelease), dataRelease.stream, 1); !ok || !strong {
+			t.Fatalf("Value-style owner %d proof = present %v strong %v, want true/true", i, ok, strong)
+		}
+		before := dataRelease.version
+		dataState.publishRelease(ctx, 1)
+		if dataRelease.version != before+1 {
+			t.Fatalf("Value-style owner %d publication version = %d, want %d", i, dataRelease.version, before+1)
+		}
+	}
+}
+
+func promotedSourceForTest(predecessor, clock uint32) (*atomicState, *atomicRelease) {
+	anchor := vectorclock.New()
+	anchor.Set(predecessor, clock)
+	_, state, release := lineageAtomicStateForTest(anchor)
+	return state, release
+}
+
+func TestAtomicValueDataCountWaitGroupStyleThreeFamilyOnboarding(t *testing.T) {
+	// Model three independently promoted synchronization words feeding one
+	// long-lived data release: an atomic.Value type word, a public atomic count,
+	// and the release merged by WaitGroup before its synchronizing handoff.
+	const (
+		typeTID  = uint32(239_136)
+		countTID = uint32(239_137)
+		waitTID  = uint32(239_138)
+	)
+	typeState, _ := promotedSourceForTest(typeTID, 7)
+	countState, _ := promotedSourceForTest(countTID, 11)
+	waitState, _ := promotedSourceForTest(waitTID, 13)
+
+	dataAnchor := vectorclock.New()
+	_, dataState, dataRelease := lineageAtomicStateForTest(dataAnchor)
+	primary, ok := dataRelease.view.Duplicate()
+	if !ok {
+		t.Fatal("failed to pin data release primary")
+	}
+	defer primary.Release()
+
+	warm := goroutine.Alloc(139_139)
+	typeState.acquire(warm, 1)
+	countState.acquire(warm, 1)
+	waitState.acquire(warm, 1)
+	dataState.acquire(warm, 1)
+	if _, strong, ok := warm.LookupAtomicRelease(unsafe.Pointer(dataRelease), dataRelease.stream, 1); !ok || strong {
+		t.Fatalf("three-family cold proof = present %v strong %v, want true/false", ok, strong)
+	}
+	warm.IncrementClock()
+	before := dataRelease.version
+	dataState.publishRelease(warm, 1)
+	if dataRelease.version != before+1 || dataRelease.importN != 3 {
+		t.Fatalf("three-family onboarding = version %d imports %d, want %d/3", dataRelease.version, dataRelease.importN, before+1)
+	}
+	if !dataRelease.view.SameFamily(primary) {
+		t.Fatal("three-family onboarding reanchored the primary lineage")
+	}
+	for _, coordinate := range [...]struct {
+		tid, want uint32
+	}{{typeTID, 7}, {countTID, 11}, {waitTID, 13}} {
+		tid, want := coordinate.tid, coordinate.want
+		if got := releaseClockForTest(dataRelease, tid); got != want {
+			t.Fatalf("composite release clock[%d] = %d, want %d", tid, got, want)
+		}
+	}
+	// Weakening the cache without adding a logical coordinate must not create a
+	// synthetic composite release version.
+	before = dataRelease.version
+	warm.NoteForeignImport()
+	dataState.publishRelease(warm, 1)
+	if dataRelease.version != before {
+		t.Fatalf("unchanged composite version = %d, want %d", dataRelease.version, before)
+	}
+
+	// Once all three families are onboarded, a fresh owner gets a strong proof
+	// and publishes by appending only its own point to the primary lineage.
+	next := goroutine.Alloc(139_140)
+	typeState.acquire(next, 1)
+	countState.acquire(next, 1)
+	waitState.acquire(next, 1)
+	dataState.acquire(next, 1)
+	if _, strong, ok := next.LookupAtomicRelease(unsafe.Pointer(dataRelease), dataRelease.stream, 1); !ok || !strong {
+		t.Fatalf("three-family warm proof = present %v strong %v, want true/true", ok, strong)
+	}
+	next.IncrementClock()
+	before = dataRelease.version
+	dataState.publishRelease(next, 1)
+	if dataRelease.version != before+1 || dataRelease.importN != 3 || !dataRelease.view.SameFamily(primary) {
+		t.Fatalf("three-family warm publish = version %d imports %d primary-family %v", dataRelease.version, dataRelease.importN, dataRelease.view.SameFamily(primary))
+	}
+}
+
+func TestAtomicPromotedCompositeStaleVersionAndHistoricalImportPin(t *testing.T) {
+	const predecessor = uint32(239_145)
+	sourceOwner := goroutine.Alloc(139_145)
+	sourceOwner.C.Set(predecessor, 5)
+	_, sourceState, sourceRelease := lineageAtomicStateForTest(sourceOwner.C)
+	_, dataState, dataRelease := lineageAtomicStateForTest(vectorclock.New())
+
+	warm := goroutine.Alloc(139_146)
+	sourceState.acquire(warm, 1)
+	dataState.acquire(warm, 1)
+	warm.IncrementClock()
+	dataState.publishRelease(warm, 1)
+	if dataRelease.importN != 1 {
+		t.Fatalf("initial composite imports = %d, want 1", dataRelease.importN)
+	}
+	historical, ok := dataRelease.imports[0].Duplicate()
+	if !ok {
+		t.Fatal("failed to pin historical composite import")
+	}
+	defer historical.Release()
+
+	stale := goroutine.Alloc(139_147)
+	dataState.acquire(stale, 1)
+	staleVersion, _, _ := stale.LookupAtomicRelease(unsafe.Pointer(dataRelease), dataRelease.stream, 1)
+
+	// Advance the imported family, then weak-publish it into the data release.
+	if _, changed := sourceRelease.lineage.AppendOwned(&sourceRelease.view, predecessor, 17); !changed {
+		t.Fatal("failed to advance source family")
+	}
+	bumpAtomicReleaseVersion(sourceRelease)
+	updater := goroutine.Alloc(139_148)
+	sourceState.acquire(updater, 1)
+	dataState.acquire(updater, 1)
+	updater.IncrementClock()
+	dataState.publishRelease(updater, 1)
+	if dataRelease.version <= staleVersion || dataRelease.imports[0].Get(predecessor) != 17 {
+		t.Fatalf("advanced composite = version %d clock %d, stale version %d", dataRelease.version, dataRelease.imports[0].Get(predecessor), staleVersion)
+	}
+	if got := historical.Get(predecessor); got != 5 {
+		t.Fatalf("historical import pin advanced to %d, want 5", got)
+	}
+
+	dataState.acquire(stale, 1)
+	if got := stale.C.Get(predecessor); got != 17 {
+		t.Fatalf("stale composite acquire clock = %d, want 17", got)
+	}
+	seen, _, _ := stale.LookupAtomicRelease(unsafe.Pointer(dataRelease), dataRelease.stream, 1)
+	if seen != dataRelease.version {
+		t.Fatalf("stale composite cache version = %d, want %d", seen, dataRelease.version)
+	}
+	_ = sourceRelease
+}
+
+func TestAtomicPromotedCompositeOverflowFallsBackToExactDeferredProjection(t *testing.T) {
+	_, dataState, dataRelease := lineageAtomicStateForTest(vectorclock.New())
+	var sources [4]*atomicState
+	for i := range sources {
+		sources[i], _ = promotedSourceForTest(uint32(239_160+i), uint32(20+i))
+	}
+
+	warm := goroutine.Alloc(139_170)
+	for i := 0; i < 3; i++ {
+		sources[i].acquire(warm, 1)
+	}
+	dataState.acquire(warm, 1)
+	warm.IncrementClock()
+	dataState.publishRelease(warm, 1)
+	if dataRelease.importN != 3 {
+		t.Fatalf("overflow setup imports = %d, want 3", dataRelease.importN)
+	}
+	oldPrimary, ok := dataRelease.view.Duplicate()
+	if !ok {
+		t.Fatal("failed to pin pre-overflow primary")
+	}
+	defer oldPrimary.Release()
+
+	overflow := goroutine.Alloc(139_171)
+	dataState.acquire(overflow, 1)
+	sources[3].acquire(overflow, 1)
+	overflow.IncrementClock()
+	before := dataRelease.version
+	dataState.publishRelease(overflow, 1)
+	if dataRelease.version != before+1 || dataRelease.importN != 0 {
+		t.Fatalf("overflow fallback = version %d imports %d, want %d/0", dataRelease.version, dataRelease.importN, before+1)
+	}
+	if dataRelease.deferred == nil {
+		t.Fatal("overflow fallback did not retain deferred exact projection")
+	}
+	if !dataRelease.view.SameFamily(oldPrimary) {
+		t.Fatal("overflow fallback replaced primary family")
+	}
+	for i := range sources {
+		tid, want := uint32(239_160+i), uint32(20+i)
+		if got := releaseClockForTest(dataRelease, tid); got != want {
+			t.Fatalf("overflow fallback clock[%d] = %d, want %d", tid, got, want)
+		}
+	}
+}
+
+func TestAtomicPromotedCompositePublisherRootCapacityFallsBackExactly(t *testing.T) {
+	_, _, release := lineageAtomicStateForTest(vectorclock.New())
+	ctx := goroutine.Alloc(139_172)
+	for i := 0; i < vectorclock.CausalRootCapacity; i++ {
+		source, _ := promotedSourceForTest(uint32(239_180+i), uint32(30+i))
+		source.acquire(ctx, 1)
+	}
+	if got := ctx.C.BorrowCausalRoots(new([vectorclock.CausalRootCapacity]vectorclock.CausalView)); got != vectorclock.CausalRootCapacity {
+		t.Fatalf("publisher roots = %d, want full capacity %d", got, vectorclock.CausalRootCapacity)
+	}
+	projection := vectorclock.PinReleaseProjection(ctx.C)
+	release.deferred = new(vectorclock.ReleaseProjection)
+	*release.deferred = projection
+	ctx.IncrementClock()
+
+	if !publishPromotedComposite(release, ctx) {
+		t.Fatal("deferred projection did not discharge full publisher root set")
+	}
+	if got, want := release.view.Get(ctx.TID), uint32(ctx.GetEpoch()); got != want {
+		t.Fatalf("release owner clock = %d, want %d", got, want)
+	}
+	if got, want := ctx.C.Get(ctx.TID), uint32(ctx.GetEpoch()); got != want {
+		t.Fatalf("publisher owner clock = %d, want %d", got, want)
+	}
+	for i := 0; i < vectorclock.CausalRootCapacity; i++ {
+		tid, want := uint32(239_180+i), uint32(30+i)
+		if got := ctx.C.Get(tid); got != want {
+			t.Fatalf("publisher clock[%d] = %d, want %d", tid, got, want)
+		}
+	}
+}
+
+func TestAtomicPromotedReplacementStartsNewFamily(t *testing.T) {
+	publisher := goroutine.Alloc(139_140)
+	const predecessor = uint32(239_140)
+	publisher.C.Set(predecessor, 23)
+	_, state, oldRelease := lineageAtomicStateForTest(publisher.C)
+	old, ok := oldRelease.view.Duplicate()
+	if !ok {
+		t.Fatal("failed to pin old promoted view")
+	}
+	defer old.Release()
+	oldStream := oldRelease.stream
+
+	replacement := goroutine.Alloc(139_141)
+	const replacementPredecessor = uint32(239_141)
+	replacement.C.Set(replacementPredecessor, 29)
+	state.publishRelease(replacement, 1)
+	current := state.releases[0]
+	if current == nil || current.lineage == nil || !current.view.Valid() {
+		t.Fatal("promoted replacement did not retain scalable representation")
+	}
+	if current.stream == oldStream || current.view.SameFamily(old) {
+		t.Fatal("non-acquiring replacement retained the predecessor family")
+	}
+	if got := current.view.Get(predecessor); got != 0 {
+		t.Fatalf("replacement retained predecessor clock = %d", got)
+	}
+	if got, want := current.view.Get(replacement.TID), uint32(replacement.GetEpoch()); got != want {
+		t.Fatalf("replacement publisher clock = %d, want %d", got, want)
+	}
+	if current.deferred == nil || current.view.Get(replacementPredecessor) != 0 {
+		t.Fatal("replacement did not keep foreign source metadata exclusively deferred")
+	}
+	if got := releaseClockForTest(current, replacementPredecessor); got != 29 {
+		t.Fatalf("replacement exact clock[%d] = %d, want 29", replacementPredecessor, got)
+	}
+	receiver := goroutine.Alloc(139_142)
+	state.acquire(receiver, 1)
+	if got := receiver.C.Get(replacementPredecessor); got != 29 {
+		t.Fatalf("replacement acquire clock[%d] = %d, want 29", replacementPredecessor, got)
+	}
+}
+
+func TestAtomicPromotedSteadyPublishDoesNotAllocate(t *testing.T) {
+	publisher := goroutine.Alloc(139_150)
+	_, state, release := lineageAtomicStateForTest(publisher.C)
+	state.acquire(publisher, 1)
+	if !release.lineage.Reserve(2048) {
+		t.Fatal("failed to reserve promoted steady segment")
+	}
+	allocs := testing.AllocsPerRun(1, func() {
+		for i := 0; i < 512; i++ {
+			publisher.IncrementClock()
+			state.publishRelease(publisher, 1)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("promoted steady append allocated %.2f objects", allocs)
+	}
+}
+
+func TestAtomicRecycledReleaseDropsCausalResources(t *testing.T) {
+	var state atomicState
+	ctx := goroutine.Alloc(139_201)
+	state.publishRelease(ctx, 1)
+	release := state.releases[0]
+	release.lineage = vectorclock.NewClockLineage(ctx.C)
+	release.view = release.lineage.Pin()
+	importLineage := vectorclock.NewClockLineage(ctx.C)
+	release.imports[0] = importLineage.Pin()
+	release.importN = 1
+	deferredClock := vectorclock.New()
+	deferredClock.JoinCausal(release.imports[0])
+	projection := vectorclock.PinReleaseProjection(deferredClock)
+	release.deferred = new(vectorclock.ReleaseProjection)
+	*release.deferred = projection
+	state.retireReleases(1)
+	if release.lineage != nil || release.view.Valid() || release.importN != 0 || release.imports[0].Valid() || release.deferred != nil {
+		t.Fatal("arena recycle retained causal release resources")
+	}
+	deferredClock.Release()
+	importLineage.Release()
+}
+
+func TestAtomicArenaResetDropsReleaseCausalOwnership(t *testing.T) {
+	ctx := goroutine.Alloc(139_202)
+	a, _, release := lineageAtomicStateForTest(ctx.C)
+	importLineage := vectorclock.NewClockLineage(ctx.C)
+	release.imports[0] = importLineage.Pin()
+	release.importN = 1
+	deferredClock := vectorclock.New()
+	deferredClock.JoinCausal(release.imports[0])
+	projection := vectorclock.PinReleaseProjection(deferredClock)
+	release.deferred = new(vectorclock.ReleaseProjection)
+	*release.deferred = projection
+	importPinned, ok := release.imports[0].Duplicate()
+	if !ok {
+		t.Fatal("failed to pin imported release before reset")
+	}
+	pinned, ok := release.view.Duplicate()
+	if !ok {
+		t.Fatal("failed to pin promoted release before reset")
+	}
+	a.reset()
+	if release.lineage != nil || release.view.Valid() || release.importN != 0 || release.imports[0].Valid() || release.deferred != nil {
+		t.Fatal("arena reset retained release causal ownership")
+	}
+	if got, want := pinned.Get(ctx.TID), uint32(ctx.GetEpoch()); got != want {
+		t.Fatalf("independent pin after reset = %d, want %d", got, want)
+	}
+	pinned.Release()
+	if got, want := importPinned.Get(ctx.TID), uint32(ctx.GetEpoch()); got != want {
+		t.Fatalf("independent import pin after reset = %d, want %d", got, want)
+	}
+	importPinned.Release()
+	deferredClock.Release()
+	importLineage.Release()
 }
 
 func TestAtomicStaleCacheBeyondDeltaRingFullJoinsAndPointPublishes(t *testing.T) {
@@ -1770,6 +2543,92 @@ func BenchmarkAtomicAcquireFragmentedRelease(b *testing.B) {
 				state.acquire(ctx, 1)
 			}
 		})
+	}
+}
+
+func BenchmarkAtomicAcquirePromotedFallback(b *testing.B) {
+	const runs = 256
+	input := make([]vectorclock.FiniteRange, runs)
+	for i := range input {
+		tid := uint32(70_000 + i*2)
+		input[i] = vectorclock.FiniteRange{First: tid, Last: tid, Clock: uint32(i%7 + 1)}
+	}
+	for _, promoted := range []bool{false, true} {
+		name := "Canonical"
+		if promoted {
+			name = "Lineage"
+		}
+		b.Run(name, func(b *testing.B) {
+			a, release := atomicReleaseForTest(input)
+			release.version = atomicReleaseSnapshotCheckPeriod
+			if promoted {
+				maybePromoteAtomicRelease(release, goroutine.Alloc(94))
+			}
+			state := atomicState{arena: a}
+			state.releases[0] = release
+			ctx := goroutine.Alloc(95)
+			state.acquire(ctx, 1)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				release.stream = newAtomicReleaseStream()
+				state.acquire(ctx, 1)
+			}
+		})
+	}
+}
+
+func BenchmarkAtomicPromotedAcquirePublish(b *testing.B) {
+	publisher := goroutine.Alloc(96)
+	_, state, release := lineageAtomicStateForTest(publisher.C)
+	state.acquire(publisher, 1)
+	release.lineage.Reserve(4096)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		publisher.IncrementClock()
+		state.acquire(publisher, 1)
+		state.publishRelease(publisher, 1)
+	}
+}
+
+func BenchmarkAtomicPromotedAlternatingOwners(b *testing.B) {
+	const owners = 1024
+	contexts := make([]*goroutine.RaceContext, owners)
+	for i := range contexts {
+		contexts[i] = goroutine.Alloc(uint32(100_000 + i))
+	}
+	_, state, _ := lineageAtomicStateForTest(contexts[0].C)
+	// Exclude first-import setup and seed each exact strong proof.
+	for _, ctx := range contexts {
+		state.acquire(ctx, 1)
+		state.publishRelease(ctx, 1)
+		ctx.IncrementClock()
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ctx := contexts[i&(owners-1)]
+		state.acquire(ctx, 1)
+		state.publishRelease(ctx, 1)
+		ctx.IncrementClock()
+	}
+}
+
+func BenchmarkAtomicPromotedDominatedGenerationRecovery(b *testing.B) {
+	ctx := goroutine.Alloc(97)
+	_, state, release := lineageAtomicStateForTest(ctx.C)
+	state.acquire(ctx, 1)
+	release.lineage.Reserve(4096)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// Model the intervening atomic.Value type-word acquire: it invalidates
+		// generation proofs, but adds metadata already dominated by data view.
+		ctx.NoteForeignImport()
+		state.acquire(ctx, 1)
+		state.publishRelease(ctx, 1)
+		ctx.IncrementClock()
 	}
 }
 

@@ -205,6 +205,18 @@ func semrelease(addr *uint32) {
 }
 
 func semrelease1(addr *uint32, handoff bool, skipframes int) {
+	semrelease1WithWake(addr, handoff, skipframes, true)
+}
+
+// semrelease1Direct is semrelease1 for a caller which will transfer its P to
+// the released waiter. It wakes an idle P only when independent local/global
+// runnable work already exists; waking one for the new runnext alone would make
+// it steal the direct handoff and immediately park after serialized work.
+func semrelease1Direct(addr *uint32, handoff bool, skipframes int) {
+	semrelease1WithWake(addr, handoff, skipframes, false)
+}
+
+func semrelease1WithWake(addr *uint32, handoff bool, skipframes int, alwaysWake bool) {
 	root := semtable.rootFor(addr)
 	atomic.Xadd(addr, 1)
 
@@ -260,8 +272,21 @@ func semrelease1(addr *uint32, handoff bool, skipframes int) {
 		if handoff && cansemacquire(addr) {
 			s.ticket = 1
 		}
-		readyWithTime(s, 5+skipframes)
-		if s.ticket == 1 && getg().m.locks == 0 && getg() != getg().m.g0 {
+		direct := s.ticket == 1 && getg().m.locks == 0 && getg() != getg().m.g0
+		if alwaysWake || !direct {
+			readyWithTime(s, 5+skipframes)
+		} else {
+			if s.releasetime != 0 {
+				s.releasetime = cputicks()
+			}
+			gp := s.g
+			systemstack(func() {
+				pp := getg().m.p.ptr()
+				wake := !runqempty(pp) || !sched.runq.empty()
+				readyWithWake(gp, 5+skipframes, true, wake)
+			})
+		}
+		if direct {
 			// Direct G handoff
 			//
 			// readyWithTime has added the waiter G as runnext in the

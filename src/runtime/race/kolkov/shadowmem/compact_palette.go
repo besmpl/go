@@ -9,16 +9,21 @@ import (
 )
 
 // The dense palette is the second compact representation for one 4 KiB
-// application block. Eight uint8 shape owners share each atomic word. Exact
-// epoch clock lows live in lazy 128-anchor packed chunks; the shape carries
-// presence, TID and the high 16 clock bits. Thus sequential clocks do not
-// manufacture a VarState or descriptor object per byte, while sparse blocks
-// which cross over from six bitmap groups pay only for clock regions they use.
+// application block. Eight uint8 shape owners share each atomic word. An
+// aligned word with one exact descriptor fuses its owner and both clock lows in
+// that word; heterogeneous words expand into lazy 128-anchor packed chunks.
+// The shape carries presence,
+// TID and the high 16 clock bits. Thus sequential clocks do not manufacture a
+// VarState or descriptor object per byte, while sparse blocks which cross over
+// from six bitmap groups pay only for clock regions they use.
 const (
 	compactPaletteDefault    = uint8(0)
 	compactPaletteTombstone  = uint8(1)
 	compactPaletteFirstShape = uint8(2)
-	compactPaletteMaxShapes  = 254
+	// Owners 254 and 255 are reserved as the fast-read and fused-word tags,
+	// leaving IDs 2..253. Reserving the complete top-byte value makes a tagged
+	// word unambiguous even when its other seven bytes contain arbitrary owners.
+	compactPaletteMaxShapes = 252
 
 	compactPaletteOwnerWords        = int(rangeBlockSize / 8)
 	compactPaletteClockChunkShift   = 7
@@ -69,18 +74,24 @@ type compactPaletteShapeChunk struct {
 }
 
 type compactPaletteClockChunk struct {
-	write [compactPaletteClockChunkWords]atomic.Uint64
-	read  [compactPaletteClockChunkWords]atomic.Uint64
+	write   [compactPaletteClockChunkWords]atomic.Uint64
+	read    [compactPaletteClockChunkWords]atomic.Uint64
+	uniform [compactPaletteClockChunkAnchors / 8]atomic.Uint64
 }
 
 type compactPalette struct {
-	owners    [compactPaletteOwnerWords]atomic.Uint64
-	clocks    [compactPaletteClockChunks]atomic.Pointer[compactPaletteClockChunk]
-	shapes    [compactPaletteShapeChunks]atomic.Pointer[compactPaletteShapeChunk]
-	hash      [compactPaletteShapeHashBuckets]uint8
-	plan      uint16
-	nextShape uint8 // first never-installed shape-record index
-	freeHead  uint8 // block-locked list of zero-member candidates
+	owners         [compactPaletteOwnerWords]atomic.Uint64
+	clocks         [compactPaletteClockChunks]atomic.Pointer[compactPaletteClockChunk]
+	shapes         [compactPaletteShapeChunks - 1]atomic.Pointer[compactPaletteShapeChunk]
+	initialShapes  compactPaletteShapeChunk
+	fastReadPC     atomic.Uintptr
+	fastReadActive atomic.Uint32
+	fastReadUsers  atomic.Uint32
+	hash           [compactPaletteShapeHashBuckets]uint8
+	plan           uint16
+	nextShape      uint8 // first never-installed shape-record index
+	freeHead       uint8 // block-locked list of zero-member candidates
+	zeroOwner      uint8 // immutable pinned zero-history lifecycle shape
 }
 
 func paletteShapeFromDescriptor(descriptor compactHistoryDescriptor) (compactPaletteShape, uint16, uint16) {
@@ -149,10 +160,13 @@ func (p *compactPalette) shapeRecord(id uint8, create bool) *compactPaletteShape
 		return nil
 	}
 	chunkIndex := index / compactPaletteShapeChunkRecords
-	chunk := p.shapes[chunkIndex].Load()
+	if chunkIndex == 0 {
+		return &p.initialShapes.records[index%compactPaletteShapeChunkRecords]
+	}
+	chunk := p.shapes[chunkIndex-1].Load()
 	if chunk == nil && create {
 		chunk = new(compactPaletteShapeChunk)
-		p.shapes[chunkIndex].Store(chunk)
+		p.shapes[chunkIndex-1].Store(chunk)
 	}
 	if chunk == nil {
 		return nil
@@ -334,7 +348,102 @@ func (p *compactPalette) ensureShapeForPlan(shape compactPaletteShape, generatio
 func (p *compactPalette) owner(anchor uintptr) uint8 {
 	anchor = compactAnchor(anchor)
 	word := p.owners[anchor>>3].Load()
+	if owner, _, mask, ok := compactPaletteDecodeFastReadWord(word); ok {
+		if mask&(uint8(1)<<(anchor&7)) != 0 {
+			return owner
+		}
+		return compactPaletteTombstone
+	}
+	if owner, _, _, ok := compactPaletteDecodeFusedOwnerWord(word); ok {
+		return owner
+	}
 	return uint8(word >> ((anchor & 7) * 8))
+}
+
+const (
+	compactPaletteFusedOwnerTag        = uint64(0xff) << 56
+	compactPaletteFusedOwnerValidation = uint64(0x5aa5) << 40
+	compactPaletteFastReadTag          = uint64(0xfe) << 56
+)
+
+// compactPaletteFastReadWord is the exact zero-history read form for one
+// aligned application word. The pinned owner supplies allocator lifecycle,
+// while the word carries a complete admitted epoch and the still-live lane
+// mask. The complement becomes authoritative zero after a partial clear.
+func compactPaletteFastReadWord(owner uint8, read epoch.Epoch, mask uint8) (uint64, bool) {
+	tid, clock := read.Decode()
+	if owner < compactPaletteFirstShape || owner == 0xff || read == 0 ||
+		tid > uint32(^uint16(0)) || clock >= 1<<24 || mask == 0 {
+		return 0, false
+	}
+	return compactPaletteFastReadTag | uint64(mask)<<48 | uint64(clock)<<24 |
+		uint64(tid)<<8 | uint64(owner), true
+}
+
+func compactPaletteDecodeFastReadWord(word uint64) (owner uint8, read epoch.Epoch, mask uint8, ok bool) {
+	if word&compactPaletteFusedOwnerTag != compactPaletteFastReadTag {
+		return 0, 0, 0, false
+	}
+	owner = uint8(word)
+	mask = uint8(word >> 48)
+	if owner < compactPaletteFirstShape || owner == 0xff || mask == 0 {
+		return 0, 0, 0, false
+	}
+	tid := uint32(uint16(word >> 8))
+	clock := uint64(word>>24) & (1<<24 - 1)
+	read = epoch.NewEpoch(tid, clock)
+	return owner, read, mask, read != 0
+}
+
+func compactPaletteFusedOwnerWord(owner uint8, writeLow, readLow uint16) uint64 {
+	if owner < compactPaletteFirstShape || owner == 0xff {
+		runtimeThrow("race detector dense palette invalid fused owner")
+	}
+	return compactPaletteFusedOwnerTag | compactPaletteFusedOwnerValidation |
+		uint64(readLow)<<24 | uint64(writeLow)<<8 | uint64(owner)
+}
+
+func compactPaletteDecodeFusedOwnerWord(word uint64) (owner uint8, writeLow, readLow uint16, ok bool) {
+	if word&compactPaletteFusedOwnerTag != compactPaletteFusedOwnerTag ||
+		word&(uint64(0xffff)<<40) != compactPaletteFusedOwnerValidation {
+		return 0, 0, 0, false
+	}
+	owner = uint8(word)
+	if owner < compactPaletteFirstShape || owner == 0xff {
+		return 0, 0, 0, false
+	}
+	return owner, uint16(word >> 8), uint16(word >> 24), true
+}
+
+func (p *compactPalette) storeFusedOwnerWord(anchor uintptr, owner uint8, writeLow, readLow uint16) {
+	anchor = compactAnchor(anchor) &^ uintptr(7)
+	// Any old sidecar is ignored while fused, but clear its uniform tag so a
+	// later expansion cannot observe stale metadata between publications.
+	p.clearUniformLowWord(anchor)
+	p.owners[anchor>>3].Store(compactPaletteFusedOwnerWord(owner, writeLow, readLow))
+}
+
+// expandFusedOwnerWord publishes exact explicit lows for all eight lanes before
+// replacing the fused tag with ordinary owner bytes. Published callers hold the
+// block lock and are inside an odd revision; private migration is unreachable.
+func (p *compactPalette) expandFusedOwnerWord(anchor uintptr) bool {
+	anchor = compactAnchor(anchor) &^ uintptr(7)
+	cell := &p.owners[anchor>>3]
+	owner, writeLow, readLow, ok := compactPaletteDecodeFusedOwnerWord(cell.Load())
+	if !ok {
+		return false
+	}
+	clocks, index := p.clockStorage(anchor, true)
+	base := index &^ uintptr(7)
+	wantWrite := compactPalettePackedLow(writeLow)
+	wantRead := compactPalettePackedLow(readLow)
+	for offset := uintptr(0); offset < 8; offset += 4 {
+		clocks.write[(base+offset)>>2].Store(wantWrite)
+		clocks.read[(base+offset)>>2].Store(wantRead)
+	}
+	clocks.uniform[index>>3].Store(0)
+	cell.Store(uint64(owner) * 0x0101010101010101)
+	return true
 }
 
 func (p *compactPalette) setOwner(anchor uintptr, owner uint8) {
@@ -343,9 +452,21 @@ func (p *compactPalette) setOwner(anchor uintptr, owner uint8) {
 	shift := (anchor & 7) * 8
 	mask := uint64(0xff) << shift
 	for {
+		if p.expandFusedOwnerWord(anchor) {
+			continue
+		}
 		old := cell.Load()
 		next := old&^mask | uint64(owner)<<shift
-		if old == next || cell.CompareAndSwap(old, next) {
+		if old == next {
+			return
+		}
+		// A scalar owner change splits the aligned word. Publish an exact
+		// per-anchor low plane before invalidating its uniform-word metadata.
+		// Semantic callers hold the block lock and bracket this publication with
+		// the block revision; private migration uses the same ordering before the
+		// palette is reachable.
+		p.expandUniformLowWord(anchor)
+		if cell.CompareAndSwap(old, next) {
 			return
 		}
 	}
@@ -367,8 +488,12 @@ func (p *compactPalette) rangeOwnerEqual(start, end uintptr, owner uint8) bool {
 		if count > end-start {
 			count = end - start
 		}
-		mask := compactPaletteLaneMask(lane, count, 8)
-		if p.owners[start>>3].Load()&mask != want&mask {
+		word := p.owners[start>>3].Load()
+		if fusedOwner, _, _, ok := compactPaletteDecodeFusedOwnerWord(word); ok {
+			if fusedOwner != owner {
+				return false
+			}
+		} else if mask := compactPaletteLaneMask(lane, count, 8); word&mask != want&mask {
 			return false
 		}
 		start += count
@@ -387,8 +512,18 @@ func (p *compactPalette) setUniformRangeOwner(start, end uintptr, owner uint8) {
 		cell := &p.owners[start>>3]
 		mask := compactPaletteLaneMask(lane, count, 8)
 		if mask == ^uint64(0) {
+			if owner < compactPaletteFirstShape {
+				p.clearUniformLowWord(start)
+			} else {
+				// This helper changes ownership only. Preserve a fused word's
+				// exact low clocks before replacing its packed descriptor.
+				p.expandFusedOwnerWord(start)
+				p.expandUniformLowWord(start)
+			}
 			cell.Store(want)
 		} else {
+			p.expandFusedOwnerWord(start)
+			p.expandUniformLowWord(start)
 			for {
 				old := cell.Load()
 				next := old&^mask | want&mask
@@ -428,15 +563,75 @@ func (p *compactPalette) clockStorage(anchor uintptr, create bool) (*compactPale
 	return clocks, anchor & (compactPaletteClockChunkAnchors - 1)
 }
 
+const compactPaletteUniformLowValid = uint64(1) << 63
+
+func compactPaletteUniformLows(writeLow, readLow uint16) uint64 {
+	return compactPaletteUniformLowValid | uint64(writeLow) | uint64(readLow)<<16
+}
+
+func compactPaletteDecodeUniformLows(value uint64) (writeLow, readLow uint16, ok bool) {
+	if value&compactPaletteUniformLowValid == 0 {
+		return 0, 0, false
+	}
+	return uint16(value), uint16(value >> 16), true
+}
+
+func (p *compactPalette) uniformLowWord(anchor uintptr, create bool) *atomic.Uint64 {
+	clocks, index := p.clockStorage(anchor, create)
+	if clocks == nil {
+		return nil
+	}
+	return &clocks.uniform[index>>3]
+}
+
+func (p *compactPalette) clearUniformLowWord(anchor uintptr) {
+	if word := p.uniformLowWord(anchor, false); word != nil {
+		word.Store(0)
+	}
+}
+
+// expandUniformLowWord is block-locked for published palettes. Explicit lows
+// are installed first, then the valid bit is cleared, so a racing diagnostic
+// reader sees either the old exact uniform value or the new exact lane values;
+// the surrounding revision still rejects a read concurrent with mutation.
+func (p *compactPalette) expandUniformLowWord(anchor uintptr) {
+	clocks, index := p.clockStorage(anchor, false)
+	if clocks == nil {
+		return
+	}
+	word := &clocks.uniform[index>>3]
+	writeLow, readLow, ok := compactPaletteDecodeUniformLows(word.Load())
+	if !ok {
+		return
+	}
+	base := index &^ uintptr(7)
+	wantWrite := compactPalettePackedLow(writeLow)
+	wantRead := compactPalettePackedLow(readLow)
+	for offset := uintptr(0); offset < 8; offset += 4 {
+		clocks.write[(base+offset)>>2].Store(wantWrite)
+		clocks.read[(base+offset)>>2].Store(wantRead)
+	}
+	word.Store(0)
+}
+
 func (p *compactPalette) lows(anchor uintptr) (uint16, uint16) {
+	anchor = compactAnchor(anchor)
+	if _, writeLow, readLow, ok := compactPaletteDecodeFusedOwnerWord(p.owners[anchor>>3].Load()); ok {
+		return writeLow, readLow
+	}
 	clocks, index := p.clockStorage(anchor, false)
 	if clocks == nil {
 		return 0, 0
+	}
+	if writeLow, readLow, ok := compactPaletteDecodeUniformLows(clocks.uniform[index>>3].Load()); ok {
+		return writeLow, readLow
 	}
 	return compactPaletteLow(&clocks.write[index>>2], index), compactPaletteLow(&clocks.read[index>>2], index)
 }
 
 func (p *compactPalette) setLows(anchor uintptr, writeLow, readLow uint16) {
+	p.expandFusedOwnerWord(anchor)
+	p.expandUniformLowWord(anchor)
 	clocks, index := p.clockStorage(anchor, true)
 	compactPaletteSetLow(&clocks.write[index>>2], index, writeLow)
 	compactPaletteSetLow(&clocks.read[index>>2], index, readLow)
@@ -476,6 +671,32 @@ func (p *compactPalette) rangeLowsEqual(start, end uintptr, writeLow, readLow ui
 			chunkEnd = limit
 		}
 		for start < chunkEnd {
+			if _, fusedWrite, fusedRead, ok := compactPaletteDecodeFusedOwnerWord(p.owners[start>>3].Load()); ok {
+				if fusedWrite != writeLow || fusedRead != readLow {
+					return false
+				}
+				count := uintptr(8) - (start & 7)
+				if count > chunkEnd-start {
+					count = chunkEnd - start
+				}
+				start += count
+				index += count
+				continue
+			}
+			if clocks != nil {
+				if uniformWrite, uniformRead, ok := compactPaletteDecodeUniformLows(clocks.uniform[index>>3].Load()); ok {
+					if uniformWrite != writeLow || uniformRead != readLow {
+						return false
+					}
+					count := uintptr(8) - (index & 7)
+					if count > chunkEnd-start {
+						count = chunkEnd - start
+					}
+					start += count
+					index += count
+					continue
+				}
+			}
 			lane := index & 3
 			count := uintptr(4) - lane
 			if count > chunkEnd-start {
@@ -497,50 +718,117 @@ func (p *compactPalette) rangeLowsEqual(start, end uintptr, writeLow, readLow ui
 }
 
 func (p *compactPalette) setRangeLows(start, end uintptr, writeLow, readLow uint16) {
-	wantWrite := compactPalettePackedLow(writeLow)
-	wantRead := compactPalettePackedLow(readLow)
 	for start < end {
-		clocks, index := p.clockStorage(start, true)
-		chunkEnd := end
-		if limit := start + compactPaletteClockChunkAnchors - index; chunkEnd > limit {
-			chunkEnd = limit
+		lane := start & 7
+		count := uintptr(8) - lane
+		if count > end-start {
+			count = end - start
 		}
-		for start < chunkEnd {
-			lane := index & 3
-			count := uintptr(4) - lane
-			if count > chunkEnd-start {
-				count = chunkEnd - start
+		if lane == 0 && count == 8 {
+			cell := &p.owners[start>>3]
+			if owner, _, _, ok := compactPaletteDecodeFusedOwnerWord(cell.Load()); ok {
+				cell.Store(compactPaletteFusedOwnerWord(owner, writeLow, readLow))
+				start += count
+				continue
 			}
-			compactPaletteSetLowWord(&clocks.write[index>>2], lane, count, wantWrite)
-			compactPaletteSetLowWord(&clocks.read[index>>2], lane, count, wantRead)
+			clocks, index := p.clockStorage(start, true)
+			clocks.uniform[index>>3].Store(compactPaletteUniformLows(writeLow, readLow))
 			start += count
-			index += count
+			continue
 		}
+		p.expandFusedOwnerWord(start)
+		p.expandUniformLowWord(start)
+		clocks, index := p.clockStorage(start, true)
+		for remaining := count; remaining != 0; {
+			lowLane := index & 3
+			lowCount := uintptr(4) - lowLane
+			if lowCount > remaining {
+				lowCount = remaining
+			}
+			compactPaletteSetLowWord(&clocks.write[index>>2], lowLane, lowCount, compactPalettePackedLow(writeLow))
+			compactPaletteSetLowWord(&clocks.read[index>>2], lowLane, lowCount, compactPalettePackedLow(readLow))
+			index += lowCount
+			remaining -= lowCount
+		}
+		start += count
 	}
 }
 
 func (p *compactPalette) setRangeReadLows(start, end uintptr, readLow uint16) {
-	wantRead := compactPalettePackedLow(readLow)
 	for start < end {
-		clocks, index := p.clockStorage(start, true)
-		chunkEnd := end
-		if limit := start + compactPaletteClockChunkAnchors - index; chunkEnd > limit {
-			chunkEnd = limit
+		lane := start & 7
+		count := uintptr(8) - lane
+		if count > end-start {
+			count = end - start
 		}
-		for start < chunkEnd {
-			lane := index & 3
-			count := uintptr(4) - lane
-			if count > chunkEnd-start {
-				count = chunkEnd - start
+		if lane == 0 && count == 8 {
+			cell := &p.owners[start>>3]
+			if owner, writeLow, _, ok := compactPaletteDecodeFusedOwnerWord(cell.Load()); ok {
+				cell.Store(compactPaletteFusedOwnerWord(owner, writeLow, readLow))
+				start += count
+				continue
 			}
-			compactPaletteSetLowWord(&clocks.read[index>>2], lane, count, wantRead)
-			start += count
-			index += count
+			if clocks, index := p.clockStorage(start, false); clocks != nil {
+				uniform := &clocks.uniform[index>>3]
+				if writeLow, _, ok := compactPaletteDecodeUniformLows(uniform.Load()); ok {
+					uniform.Store(compactPaletteUniformLows(writeLow, readLow))
+					start += count
+					continue
+				}
+			}
 		}
+		p.expandFusedOwnerWord(start)
+		p.expandUniformLowWord(start)
+		clocks, index := p.clockStorage(start, true)
+		for remaining := count; remaining != 0; {
+			lowLane := index & 3
+			lowCount := uintptr(4) - lowLane
+			if lowCount > remaining {
+				lowCount = remaining
+			}
+			compactPaletteSetLowWord(&clocks.read[index>>2], lowLane, lowCount, compactPalettePackedLow(readLow))
+			index += lowCount
+			remaining -= lowCount
+		}
+		start += count
+	}
+}
+
+// setUniformDescriptorRange is the combined publication seam for a range with
+// one owner and one exact low pair. Complete aligned words need no clock chunk;
+// partial words expand first and retain ordinary owner bytes.
+func (p *compactPalette) setUniformDescriptorRange(start, end uintptr, owner uint8, writeLow, readLow uint16) {
+	for start < end {
+		lane := start & 7
+		count := uintptr(8) - lane
+		if count > end-start {
+			count = end - start
+		}
+		if lane == 0 && count == 8 {
+			p.storeFusedOwnerWord(start, owner, writeLow, readLow)
+		} else {
+			p.setRangeLows(start, start+count, writeLow, readLow)
+			p.setUniformRangeOwner(start, start+count, owner)
+		}
+		start += count
 	}
 }
 
 func (p *compactPalette) descriptor(anchor uintptr) (compactHistoryDescriptor, bool) {
+	anchor = compactAnchor(anchor)
+	if owner, read, mask, ok := compactPaletteDecodeFastReadWord(p.owners[anchor>>3].Load()); ok {
+		if mask&(uint8(1)<<(anchor&7)) == 0 {
+			return compactHistoryDescriptor{}, false
+		}
+		record := p.shapeRecord(owner, false)
+		if record == nil || !record.used || record.shape.flags != 0 || record.shape.lifecycle == (lifecycleID{}) {
+			return compactHistoryDescriptor{}, false
+		}
+		return compactHistoryDescriptor{
+			history:   compactHistoryKey{read: read, readPC: p.fastReadPC.Load()},
+			lifecycle: record.shape.lifecycle,
+		}, true
+	}
 	owner := p.owner(anchor)
 	if owner < compactPaletteFirstShape {
 		return compactHistoryDescriptor{}, false
@@ -551,6 +839,98 @@ func (p *compactPalette) descriptor(anchor uintptr) (compactHistoryDescriptor, b
 	}
 	w, r := p.lows(anchor)
 	return record.shape.descriptor(w, r), true
+}
+
+func (p *compactPalette) hasFastReadWord(offset uintptr) bool {
+	if p == nil {
+		return false
+	}
+	_, _, _, ok := compactPaletteDecodeFastReadWord(p.owners[compactAnchor(offset)>>3].Load())
+	return ok
+}
+
+// tryFastZeroRead applies one exact aligned read to a palette default word
+// without taking rangeBlock.mu or allocating a per-reader shape. Any competing
+// canonical mutation changes the block revision or owner word and makes the
+// optimistic result retry through the canonical path.
+func (p *compactPalette) tryFastZeroRead(view blockView, compact *compactGroups, addr uintptr, current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr) bool {
+	if p == nil || compact == nil || p.fastReadActive.Load() == 0 || p.zeroOwner < compactPaletteFirstShape ||
+		addr&7 != 0 || view.history.state.Load() != nil || view.loadSlot((addr>>3)&rangeBlockWordMask) != nil {
+		return false
+	}
+	p.fastReadUsers.Add(1)
+	if p.fastReadActive.Load() == 0 {
+		p.fastReadUsers.Add(-1)
+		return false
+	}
+	result := p.tryFastZeroReadEnrolled(view, compact, addr, current, clock, pc)
+	p.fastReadUsers.Add(-1)
+	return result
+}
+
+func (p *compactPalette) tryFastZeroReadEnrolled(view blockView, compact *compactGroups, addr uintptr, current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr) bool {
+	if existing := p.fastReadPC.Load(); existing != pc {
+		if existing != 0 || pc == 0 || !p.fastReadPC.CompareAndSwap(0, pc) {
+			return false
+		}
+	}
+	wordIndex := compactAnchor(addr) >> 3
+	cell := &p.owners[wordIndex]
+	revision := compact.revision.Load()
+	if revision&1 != 0 || compact.palette.Load() != p {
+		return false
+	}
+	for {
+		old := cell.Load()
+		var next uint64
+		if old == 0 {
+			var ok bool
+			next, ok = compactPaletteFastReadWord(p.zeroOwner, current, 0xff)
+			if !ok {
+				return false
+			}
+		} else {
+			owner, prior, mask, ok := compactPaletteDecodeFastReadWord(old)
+			if !ok || owner != p.zeroOwner || mask != 0xff {
+				return false
+			}
+			priorTID, _ := prior.Decode()
+			currentTID, _ := current.Decode()
+			if prior != current && priorTID != currentTID &&
+				(clock == nil || !prior.HappensBefore(clock)) {
+				return false
+			}
+			var representable bool
+			next, representable = compactPaletteFastReadWord(owner, current, mask)
+			if !representable {
+				return false
+			}
+			if next == old {
+				break
+			}
+		}
+		if cell.CompareAndSwap(old, next) {
+			break
+		}
+	}
+	word := cell.Load()
+	_, represented, mask, ok := compactPaletteDecodeFastReadWord(word)
+	return ok && mask == 0xff && represented != 0 && p.fastReadActive.Load() != 0 &&
+		compact.palette.Load() == p && compact.revision.Load() == revision &&
+		view.history.state.Load() == nil && view.loadSlot((addr>>3)&rangeBlockWordMask) == nil
+}
+
+func (p *compactPalette) disableFastReads() {
+	if p == nil {
+		return
+	}
+	p.fastReadActive.Store(0)
+	for delay := uint32(1); p.fastReadUsers.Load() != 0; {
+		runtimeKolkovSpinWait(delay, delay == spinlockMaxBackoff)
+		if delay < spinlockMaxBackoff {
+			delay <<= 1
+		}
+	}
 }
 
 // lookup deliberately returns a conservative authoritative miss for a dense
@@ -764,8 +1144,7 @@ func (p *compactPalette) tryUniformRangeLocked(c *compactGroups, start, end uint
 			}
 			c.activate()
 			c.beginMutation()
-			p.setRangeLows(start, end, writeLow, readLow)
-			p.setUniformRangeOwner(start, end, target)
+			p.setUniformDescriptorRange(start, end, target, writeLow, readLow)
 			p.shapeRecord(target, false).members += count
 			c.endMutation()
 			return true, true
@@ -779,16 +1158,15 @@ func (p *compactPalette) tryUniformRangeLocked(c *compactGroups, start, end uint
 		source.shape = targetShape
 		source.hashNext = p.hash[targetBucket]
 		p.hash[targetBucket] = owner
-		p.setRangeLows(start, end, writeLow, readLow)
+		p.setUniformDescriptorRange(start, end, owner, writeLow, readLow)
 		c.endMutation()
 		return true, true
 	}
 
 	c.activate()
 	c.beginMutation()
-	p.setRangeLows(start, end, writeLow, readLow)
+	p.setUniformDescriptorRange(start, end, target, writeLow, readLow)
 	if target != owner {
-		p.setUniformRangeOwner(start, end, target)
 		if source != nil {
 			p.releaseShapeMembers(owner, count)
 		}
@@ -860,7 +1238,7 @@ func (p *compactPalette) tryRangeLocked(c *compactGroups, offset, size uintptr, 
 	}
 	// Prove target-shape capacity without allocating or mutating the palette.
 	// One representative anchor per distinct target bounds comparisons by the
-	// palette's 254-shape ceiling and keeps the system-stack frame below 8 KiB.
+	// palette's 253-shape ceiling and keeps the system-stack frame below 8 KiB.
 	var representatives [compactPaletteMaxShapes]uintptr
 	representativeCount := 0
 	for anchor := start; anchor < end; anchor++ {
@@ -1004,15 +1382,40 @@ func (p *compactPalette) materializeWord(wordOffset uintptr, slot *ShadowSlot) {
 
 func (p *compactPalette) setRangeOwner(offset, size uintptr, owner uint8) {
 	start, end := compactRange(offset, size)
-	for anchor := start; anchor < end; anchor++ {
-		old := p.owner(anchor)
-		if old >= compactPaletteFirstShape {
-			record := p.shapeRecord(old, false)
-			if record != nil && record.members != 0 {
-				p.releaseShapeMembers(old, 1)
+	for start < end {
+		lane := start & 7
+		count := uintptr(8) - lane
+		if count > end-start {
+			count = end - start
+		}
+		cell := &p.owners[start>>3]
+		if fastOwner, read, readMask, ok := compactPaletteDecodeFastReadWord(cell.Load()); ok &&
+			(owner == compactPaletteDefault || owner == compactPaletteTombstone) {
+			selected := uint8(((uint16(1) << count) - 1) << lane)
+			readMask &^= selected
+			if readMask == 0 {
+				cell.Store(uint64(compactPaletteTombstone) * 0x0101010101010101)
+			} else {
+				word, representable := compactPaletteFastReadWord(fastOwner, read, readMask)
+				if !representable {
+					runtimeThrow("race detector dense palette lost fast-read word")
+				}
+				cell.Store(word)
+			}
+			start += count
+			continue
+		}
+		for anchor := start; anchor < start+count; anchor++ {
+			old := p.owner(anchor)
+			if old >= compactPaletteFirstShape {
+				record := p.shapeRecord(old, false)
+				if record != nil && record.members != 0 {
+					p.releaseShapeMembers(old, 1)
+				}
 			}
 		}
-		p.setOwner(anchor, owner)
+		p.setUniformRangeOwner(start, start+count, owner)
+		start += count
 	}
 }
 
@@ -1021,6 +1424,7 @@ func (p *compactPalette) clearRange(c *compactGroups, offset, size uintptr, defa
 	if start == end {
 		return
 	}
+	p.disableFastReads()
 	target := compactPaletteDefault
 	if defaultHasHistory {
 		target = compactPaletteTombstone
@@ -1049,6 +1453,7 @@ func (p *compactPalette) clearRange(c *compactGroups, offset, size uintptr, defa
 }
 
 func (p *compactPalette) reset(c *compactGroups) {
+	p.disableFastReads()
 	c.beginMutation()
 	c.palette.Store(nil)
 	for i := 0; i < compactInlineGroups; i++ {
@@ -1078,8 +1483,8 @@ func paletteMigrationValid(c *compactGroups) bool {
 		if !ok || descriptor != group.descriptor {
 			return false
 		}
-		for word := range group.members {
-			members := group.members[word].Load()
+		for word := 0; word < compactMembershipWords; word++ {
+			members := group.membershipWord(word)
 			if occupied[word]&members != 0 {
 				return false
 			}
@@ -1105,6 +1510,15 @@ func densePaletteFromBitmaps(c *compactGroups) *compactPalette {
 		return nil
 	}
 	p := new(compactPalette)
+	p.zeroOwner = p.ensureShape(compactPaletteShape{lifecycle: c.lifecycle})
+	if p.zeroOwner == 0 {
+		return nil
+	}
+	// The zero-lifecycle record is immutable for the palette lifetime. Fast
+	// read words carry their own membership mask, so the sentinel keeps normal
+	// shape recycling from repurposing this exact lifecycle witness.
+	p.shapeRecord(p.zeroOwner, false).members = ^uint16(0)
+	p.fastReadActive.Store(1)
 	for i := 0; i < compactGroupCapacity; i++ {
 		group := c.groupLoad(i)
 		if group == nil || group.empty() {
@@ -1115,8 +1529,21 @@ func densePaletteFromBitmaps(c *compactGroups) *compactPalette {
 		if owner == 0 {
 			return nil
 		}
-		for word := range group.members {
-			members := group.members[word].Load()
+		for word := 0; word < compactMembershipWords; word++ {
+			members := group.membershipWord(word)
+			// Bitmap membership words and owner words are both naturally aligned.
+			// Install complete eight-anchor classes directly in the root so the
+			// private migration never allocates a clock chunk for boxed uint64s.
+			for lanes := uintptr(0); lanes < 64; lanes += 8 {
+				mask := uint64(0xff) << lanes
+				if members&mask != mask {
+					continue
+				}
+				anchor := uintptr(word*64) + lanes
+				p.storeFusedOwnerWord(anchor, owner, writeLow, readLow)
+				p.shapeRecord(owner, false).members += 8
+				members &^= mask
+			}
 			for members != 0 {
 				bit := uint(bitsTrailingZeros64(members))
 				anchor := uintptr(word*64) + uintptr(bit)

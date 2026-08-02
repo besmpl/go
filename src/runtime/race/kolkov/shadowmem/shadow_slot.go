@@ -2,12 +2,57 @@ package shadowmem
 
 import (
 	"internal/runtime/atomic"
+	"runtime/race/kolkov/epoch"
+	"runtime/race/kolkov/vectorclock"
 	"unsafe"
 )
 
 const shadowSlotLanes = 8
 
 const atomicFastEscaped = uint32(1) << 31
+
+// slotSpinlock is an odd/even versioned lock for ShadowSlot membership. The
+// version lets the runtime retain an exact lane-equivalence certificate without
+// rescanning all eight pointers on every same-epoch write. Semantic state is
+// still validated separately through VarState.W and readerState.
+type slotSpinlock struct {
+	state atomic.Uint64
+}
+
+//go:nosplit
+func (s *slotSpinlock) lock() {
+	for delay := uint32(1); ; {
+		state := s.state.Load()
+		if state&1 == 0 && state != ^uint64(0)-1 && s.state.CompareAndSwap(state, state+1) {
+			return
+		}
+		if state >= ^uint64(0)-1 {
+			runtimeThrow("race detector exhausted shadow slot revisions")
+		}
+		runtimeKolkovSpinWait(delay, delay == spinlockMaxBackoff)
+		if delay < spinlockMaxBackoff {
+			delay <<= 1
+		}
+	}
+}
+
+//go:nosplit
+func (s *slotSpinlock) tryLock() bool {
+	state := s.state.Load()
+	if state&1 != 0 || state >= ^uint64(0)-1 {
+		return false
+	}
+	return s.state.CompareAndSwap(state, state+1)
+}
+
+//go:nosplit
+func (s *slotSpinlock) unlock() {
+	state := s.state.Load()
+	if state&1 == 0 || state == ^uint64(0) {
+		runtimeThrow("race detector shadow slot revision imbalance")
+	}
+	s.state.Store(state + 1)
+}
 
 // AtomicFastPath is the out-of-line detector binding for one atomic history.
 // Its exact lane signature becomes immutable when enrolled. Multiple ordinary
@@ -69,6 +114,24 @@ func (p *AtomicFastPath) Mask() uint8 {
 
 func (p *AtomicFastPath) matches(mask uint8) bool {
 	return p != nil && p.enrolled.Load() != 0 && p.mask == mask
+}
+
+// TryRetain revalidates and retains an already-known immutable capability for
+// mask. AtomicFastPath generations are never reopened or repurposed, so a
+// cached pointer can skip the shadow-slot lookup without creating an ABA path:
+// every lane or lifecycle mutation closes the generation before changing the
+// state and waits for retained users to drain.
+//
+//go:nosplit
+func (p *AtomicFastPath) TryRetain(mask uint8) bool {
+	if p == nil || !p.tryAcquire() {
+		return false
+	}
+	if !p.matches(mask) || p.lifecycle != p.state.GetLifecycleID() {
+		p.Release()
+		return false
+	}
+	return true
 }
 
 // OrdinaryMask returns the frozen ordinary group that fast completion must check.
@@ -168,7 +231,7 @@ type rangeBlock struct {
 // private layout for its call-free scalar read fast path.
 type ShadowSlot struct {
 	states [shadowSlotLanes]atomic.Pointer[VarState]
-	mu     spinlock
+	mu     slotSpinlock
 }
 
 // shadowSlot preserves the internal page-table name used by layout tests and
@@ -236,6 +299,7 @@ func (s *ShadowSlot) Isolate(lane uint8) *VarState {
 		return state
 	}
 
+	state.ClosePromotedReadFrontier()
 	clone := state.CloneOrdinaryLocked()
 	clone.LockAccess()
 	s.states[lane].Store(clone)
@@ -337,6 +401,7 @@ func (s *ShadowSlot) accessGroups(mask uint8, keepLocked, forbidFast bool, visit
 		state.LockAccess()
 		target := state
 		if hit != refs {
+			state.ClosePromotedReadFrontier()
 			target = state.CloneOrdinaryLocked()
 			target.LockAccess()
 			for i := uint8(0); i < shadowSlotLanes; i++ {
@@ -472,11 +537,7 @@ func (s *ShadowSlot) TryAtomicFast(mask uint8) *AtomicFastPath {
 	// mapped lane mutation escape the binding before changing that generation,
 	// so a successful retain makes the non-atomic lifecycle bytes stable on
 	// 32-bit systems as well as 64-bit systems.
-	if p == nil || !p.tryAcquire() {
-		return nil
-	}
-	if !p.matches(mask) || p.lifecycle != p.state.GetLifecycleID() {
-		p.Release()
+	if !p.TryRetain(mask) {
 		return nil
 	}
 	return p
@@ -595,6 +656,7 @@ func (s *ShadowSlot) clearMaskLocked(mask uint8) {
 			continue
 		}
 		state.LockAccess()
+		state.ClosePromotedReadFrontier()
 		locked[lockedCount] = state
 		lockedCount++
 	}
@@ -630,6 +692,117 @@ func (s *ShadowSlot) referenceMask(state *VarState) uint8 {
 		}
 	}
 	return mask
+}
+
+// promotedReadCapability snapshots an exact materialized lane group without
+// changing the slot revision. Existing capabilities therefore remain warm when
+// another logical reader enrolls. The two revision checks make a concurrent
+// COW/clear/atomic transaction a conservative miss.
+func (s *ShadowSlot) promotedReadCapability(addr, size uintptr, tid uint32, expected *VarState) *PromotedReadCapability {
+	if (size != 1 && size != 2 && size != 4 && size != 8) ||
+		size-1 > ^uintptr(0)-addr || size > shadowSlotLanes-(addr&7) {
+		return nil
+	}
+	mask := uint8(((uint16(1) << size) - 1) << (addr & 7))
+	revision := s.mu.state.Load()
+	state := s.states[firstLane(mask)].Load()
+	if state == nil || state != expected || s.referenceMask(state) != mask {
+		return nil
+	}
+	state.LockAccess()
+	if s.referenceMask(state) != mask || state.atomicState.Load() != nil || !state.IsPromoted() {
+		state.UnlockAccess()
+		return nil
+	}
+	state.mu.lock()
+	frontier := state.readClock
+	state.mu.unlock()
+	lifecycle := state.GetLifecycleID()
+	frontierRevision := uint64(1)
+	if frontier != nil {
+		frontierRevision = frontier.revision.Load()
+	}
+	state.UnlockAccess()
+	if frontier == nil || frontierRevision&1 != 0 {
+		return nil
+	}
+	// Registry insertion can allocate and is deliberately outside accessMu.
+	// Every exclusive mutation closes the immutable frontier before changing
+	// either the state or its lane mapping, so a concurrent change can only make
+	// the final capability validation fail and force the canonical retry.
+	node := frontier.nodeFor(tid)
+	if node == nil || s.referenceMask(state) != mask || state.atomicState.Load() != nil {
+		return nil
+	}
+	if frontier.revision.Load() != frontierRevision {
+		return nil
+	}
+	capability := &PromotedReadCapability{
+		frontier: frontier, node: node, state: state, slot: s, addr: addr,
+		lifecycle: lifecycle, slotRevision: revision,
+		frontierRev: frontierRevision, mask: mask, width: uint8(size),
+	}
+	if !capability.mappingValid(addr, size) {
+		return nil
+	}
+	return capability
+}
+
+// tryOrdinaryFastRead applies one complete conflict-free transition only when
+// mask is already an exact isolated materialized equivalence class. The slot
+// lock excludes COW, clear, and atomic enrollment; every other lock is acquired
+// with tryLock so contention always returns promptly.
+func (s *ShadowSlot) tryOrdinaryFastRead(mask uint8, current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr) (OrdinaryFastResult, *VarState) {
+	if mask == 0 || !s.mu.tryLock() {
+		return OrdinaryFastMiss, nil
+	}
+	state := s.states[firstLane(mask)].Load()
+	if state == nil || s.referenceMask(state) != mask || !state.TryLockAccess() {
+		s.mu.unlock()
+		return OrdinaryFastMiss, nil
+	}
+	lifecycle := state.GetLifecycleID()
+	plan, ok := state.tryOrdinaryFastPlan(current, clock, pc, false, nil)
+	if !ok || state.GetLifecycleID() != lifecycle || state.atomicState.Load() != nil ||
+		s.referenceMask(state) != mask {
+		if ok {
+			state.finishOrdinaryFastPlan(plan, false)
+		}
+		state.UnlockAccess()
+		s.mu.unlock()
+		return OrdinaryFastMiss, nil
+	}
+	state.finishOrdinaryFastPlan(plan, true)
+	state.UnlockAccess()
+	s.mu.unlock()
+	return OrdinaryFastHandledCacheable, state
+}
+
+// tryOrdinaryFastWrite is the write counterpart of tryOrdinaryFastRead.
+func (s *ShadowSlot) tryOrdinaryFastWrite(mask uint8, current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr) bool {
+	if mask == 0 || !s.mu.tryLock() {
+		return false
+	}
+	state := s.states[firstLane(mask)].Load()
+	if state == nil || s.referenceMask(state) != mask || !state.TryLockAccess() {
+		s.mu.unlock()
+		return false
+	}
+	lifecycle := state.GetLifecycleID()
+	plan, ok := state.tryOrdinaryFastPlan(current, clock, pc, true, nil)
+	if !ok || state.GetLifecycleID() != lifecycle || state.atomicState.Load() != nil ||
+		s.referenceMask(state) != mask {
+		if ok {
+			state.finishOrdinaryFastPlan(plan, false)
+		}
+		state.UnlockAccess()
+		s.mu.unlock()
+		return false
+	}
+	state.finishOrdinaryFastPlan(plan, true)
+	state.UnlockAccess()
+	s.mu.unlock()
+	return true
 }
 
 func firstLane(mask uint8) uint8 {

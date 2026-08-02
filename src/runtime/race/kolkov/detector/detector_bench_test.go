@@ -1,11 +1,57 @@
 package detector
 
 import (
+	internalsync "internal/sync"
+	"reflect"
+	"sync"
 	"testing"
 
 	"runtime/race/kolkov/epoch"
 	"runtime/race/kolkov/goroutine"
 )
+
+func BenchmarkOrdinaryFastRead(b *testing.B) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(901)
+	const (
+		addr = uintptr(0xc00000)
+		size = uintptr(8)
+		pc   = uintptr(0xc001)
+	)
+	d.OnWriteSized(addr, size, ctx, pc)
+	if result, _ := d.TryOrdinaryRead(addr, size, ctx, pc); result == 0 {
+		b.Fatal("ordinary read fast path did not warm")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		result, state := d.TryOrdinaryRead(addr, size, ctx, pc)
+		if result == 0 || state == nil {
+			b.Fatal("ordinary read fast path missed")
+		}
+	}
+}
+
+func BenchmarkOrdinaryFastWrite(b *testing.B) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(902)
+	const (
+		addr = uintptr(0xc10000)
+		size = uintptr(8)
+		pc   = uintptr(0xc101)
+	)
+	d.OnWriteSized(addr, size, ctx, pc)
+	if !d.TryOrdinaryWrite(addr, size, ctx, pc) {
+		b.Fatal("ordinary write fast path did not warm")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !d.TryOrdinaryWrite(addr, size, ctx, pc) {
+			b.Fatal("ordinary write fast path missed")
+		}
+	}
+}
 
 // BenchmarkOnWrite_NoRace benchmarks OnWrite in the common case (no race).
 //
@@ -607,5 +653,83 @@ func BenchmarkAtomicLoad64(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		d.AtomicBegin(addr, 8, reader, true, &token)
 		d.AtomicEnd(addr, 8, reader, &token, 0x4001, false)
+	}
+}
+
+func BenchmarkInternalRMWSameOwnerDirect(b *testing.B) {
+	for _, bench := range []struct {
+		name        string
+		pc          uintptr
+		synchronize bool
+	}{
+		{"MutexCAS", reflect.ValueOf((*internalsync.Mutex).Lock).Pointer() + 1, true},
+		{"RWMutexDisabledAdd", reflect.ValueOf((*sync.RWMutex).RLock).Pointer() + 1, false},
+	} {
+		b.Run(bench.name, func(b *testing.B) {
+			d := NewDetector()
+			ctx := goroutine.Alloc(903)
+			defer DeactivateAtomicLoadCache(ctx)
+			const addr = uintptr(0xb10000)
+			completeInternalRMWForTest(d, addr, 4, ctx, bench.pc, bench.synchronize, true)
+			if _, direct := completeInternalRMWForTest(d, addr, 4, ctx, bench.pc, bench.synchronize, true); !direct {
+				b.Fatal("internal RMW direct tier did not warm")
+			}
+			var token AtomicToken
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				retry, direct, _, _, _ := d.AtomicBeginInternalRMWCooperative(addr, 4, ctx, bench.pc, bench.synchronize, &token)
+				if retry || !direct {
+					b.Fatal("internal RMW direct tier missed")
+				}
+				d.AtomicEndInternalRMW(addr, 4, ctx, &token, bench.pc, true, bench.synchronize, direct)
+			}
+		})
+	}
+}
+
+func BenchmarkPublicRMWOnlyFast(b *testing.B) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(904)
+	const addr = uintptr(0xb20000)
+	var token AtomicToken
+	if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, ctx, true, &token); retry || atomicFastToken(&token) == nil {
+		b.Fatal("public RMW-only seed did not enroll a capability")
+	}
+	d.AtomicEnd(addr, 8, ctx, &token, 0x4100, true)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, ctx, true, &token); retry || atomicFastToken(&token) == nil {
+			b.Fatal("public RMW-only fast tier missed")
+		}
+		d.AtomicEnd(addr, 8, ctx, &token, 0x4100, true)
+	}
+}
+
+func BenchmarkPublicRMWSameOwnerDirect(b *testing.B) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(905)
+	defer DeactivateAtomicLoadCache(ctx)
+	ctx.AtomicRMWCacheActive = true
+	const (
+		addr = uintptr(0xb30000)
+		pc   = uintptr(0x4200)
+	)
+	completePublicDirectRMWForTest(b, d, addr, 8, ctx, pc, true)
+	if _, direct := completePublicDirectRMWForTest(b, d, addr, 8, ctx, pc, true); !direct {
+		b.Fatal("public RMW direct tier did not warm")
+	}
+
+	var token AtomicToken
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		retry, direct, _, _, _ := d.AtomicBeginInternalRMWCooperative(addr, 8, ctx, pc, true, &token)
+		if retry || !direct {
+			b.Fatal("public RMW direct tier missed")
+		}
+		d.AtomicEndInternalRMW(addr, 8, ctx, &token, pc, true, true, direct)
 	}
 }

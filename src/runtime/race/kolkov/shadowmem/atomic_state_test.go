@@ -115,9 +115,8 @@ func enrollAtomicFastPathInSlotForTest(t *testing.T, slot *ShadowSlot, mask uint
 
 func TestAtomicFastPathRetainWinsBeforeEscape(t *testing.T) {
 	slot, binding := enrolledAtomicFastPathForTest(t, 0xff)
-	fast := slot.TryAtomicFast(0xff)
-	if fast != binding {
-		t.Fatalf("retained capability = %p, want %p", fast, binding)
+	if !binding.TryRetain(0xff) {
+		t.Fatal("cached capability did not retain directly")
 	}
 
 	done := make(chan struct{})
@@ -139,7 +138,7 @@ func TestAtomicFastPathRetainWinsBeforeEscape(t *testing.T) {
 	default:
 	}
 
-	fast.Release()
+	binding.Release()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
@@ -157,6 +156,25 @@ func TestAtomicFastPathEscapeWinsBeforeRetain(t *testing.T) {
 		fast.Release()
 		t.Fatal("ordinary access lost the escape-before-retain race")
 	}
+	if binding.TryRetain(0xff) {
+		binding.Release()
+		t.Fatal("escaped cached capability retained directly")
+	}
+}
+
+func TestAtomicFastPathDirectRetainRejectsWrongMask(t *testing.T) {
+	_, binding := enrolledAtomicFastPathForTest(t, 0xff)
+	if binding.TryRetain(0x0f) {
+		binding.Release()
+		t.Fatal("cached capability retained an incompatible mask")
+	}
+	if got := binding.users.Load(); got != 0 {
+		t.Fatalf("wrong-mask retain left users=%#x, want 0", got)
+	}
+	if !binding.TryRetain(0xff) {
+		t.Fatal("wrong-mask miss damaged the exact cached capability")
+	}
+	binding.Release()
 }
 
 func TestAtomicFastPathReenrollmentWaitsAndUsesFreshGeneration(t *testing.T) {
@@ -193,7 +211,7 @@ func TestAtomicFastPathReenrollmentWaitsAndUsesFreshGeneration(t *testing.T) {
 		}
 		runtime.Gosched()
 	}
-	if old.tryAcquire() {
+	if old.TryRetain(0xff) {
 		old.Release()
 		held.Release()
 		t.Fatal("closed generation accepted a late retain")
@@ -225,10 +243,14 @@ func TestAtomicFastPathReenrollmentWaitsAndUsesFreshGeneration(t *testing.T) {
 	if got := old.users.Load(); got != atomicFastEscaped {
 		t.Fatalf("old generation gate = %#x, want permanently escaped %#x", got, atomicFastEscaped)
 	}
-	if old.tryAcquire() {
+	if old.TryRetain(0xff) {
 		old.Release()
 		t.Fatal("old generation reopened after replacement publication")
 	}
+	if !fresh.TryRetain(0xff) {
+		t.Fatal("fresh generation could not be retained directly")
+	}
+	fresh.Release()
 	if old.state != oldState || old.overlay != oldOverlay || old.lifecycle != oldLifecycle || old.mask != oldMask || old.ordinaryMask != oldOrdinaryMask {
 		t.Fatal("replacement repurposed immutable fields of the escaped descriptor")
 	}
@@ -293,7 +315,7 @@ func TestAtomicFastPathRearmProbationAvoidsGeneralRetryAllocation(t *testing.T) 
 func waitForClearToRetainSlot(t *testing.T, slot *ShadowSlot, done <-chan struct{}) {
 	t.Helper()
 	deadline := time.After(time.Second)
-	for slot.mu.state.Load() == 0 {
+	for slot.mu.state.Load()&1 == 0 {
 		select {
 		case <-done:
 			t.Fatal("clear returned before draining the retained access transaction")

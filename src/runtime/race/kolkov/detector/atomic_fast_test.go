@@ -1,6 +1,7 @@
 package detector
 
 import (
+	internalsync "internal/sync"
 	"reflect"
 	"runtime"
 	"sync"
@@ -121,26 +122,64 @@ func TestPlainAtomicFastTokenAndCompatibleSlowMiss(t *testing.T) {
 	d.AtomicEnd(addr, 8, ctx, &token, 0x5102, true)
 }
 
-func TestAtomicRMWMissNeverEnrolls(t *testing.T) {
+func TestAtomicRMWOnlyAddressEnrollsAndReuses(t *testing.T) {
 	d := NewDetector()
 	ctx := goroutine.Alloc(202)
 	const addr = uintptr(0x31100)
 
-	for operation := 0; operation < 3; operation++ {
-		var token AtomicToken
-		d.AtomicBeginRMW(addr, 8, ctx, true, &token)
-		if atomicFastToken(&token) != nil || token[0] == nil || token[1] == nil {
-			t.Fatalf("RMW miss %d token = [%p %p], want fully locked transaction", operation, token[0], token[1])
+	var token AtomicToken
+	d.AtomicBeginRMW(addr, 8, ctx, true, &token)
+	first := atomicFastToken(&token)
+	if first == nil || token[1] != nil {
+		t.Fatalf("first RMW-only token = [%p %p], want converted fast enrollment", token[0], token[1])
+	}
+	d.AtomicEnd(addr, 8, ctx, &token, 0x5110, true)
+
+	d.AtomicBeginRMW(addr, 8, ctx, true, &token)
+	if fast := atomicFastToken(&token); fast != first || token[1] != nil {
+		t.Fatalf("second RMW-only token = [%p %p], want enrolled capability %p", token[0], token[1], first)
+	}
+	d.AtomicEnd(addr, 8, ctx, &token, 0x5111, true)
+}
+
+func TestAtomicRMWOnlyCapabilityClearRebindAndOrdinaryInvalidation(t *testing.T) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(217)
+	const addr = uintptr(0x31180)
+
+	if !completeRMWAtomicForTest(d, addr, 8, ctx, true, 0x5112) {
+		t.Fatal("RMW-only seed did not enroll a capability")
+	}
+	oldSlot := d.slotMemory.GetSlot(addr)
+	old := plainAtomicCapabilityForTest(t, d, addr, 8)
+	d.ClearShadowRange(addr, 8)
+	if probe := oldSlot.TryAtomicFast(0xff); probe != nil {
+		probe.Release()
+		t.Fatal("cleared slot retained its RMW capability")
+	}
+	if !completeRMWAtomicForTest(d, addr, 8, ctx, true, 0x5113) {
+		t.Fatal("RMW-only access did not enroll after clear")
+	}
+	fresh := plainAtomicCapabilityForTest(t, d, addr, 8)
+	if fresh == old {
+		t.Fatal("RMW-only clear/rebind reopened the cleared capability")
+	}
+
+	d.OnRead(addr, ctx, 0x5114)
+	if slot := d.slotMemory.GetSlot(addr); slot != nil {
+		if probe := slot.TryAtomicFast(0xff); probe != nil {
+			probe.Release()
+			t.Fatal("ordinary access left the RMW capability usable")
 		}
-		d.AtomicEnd(addr, 8, ctx, &token, 0x5110+uintptr(operation), true)
-		slot := d.slotMemory.GetSlot(addr)
-		if slot == nil {
-			t.Fatalf("RMW miss %d did not materialize a slot", operation)
-		}
-		if fast := slot.TryAtomicFast(0xff); fast != nil {
-			fast.Release()
-			t.Fatalf("RMW miss %d enrolled capability %p", operation, fast)
-		}
+	}
+	if completeRMWAtomicForTest(d, addr, 8, ctx, true, 0x5115) {
+		t.Fatal("first RMW after ordinary invalidation bypassed probation")
+	}
+	if !completeRMWAtomicForTest(d, addr, 8, ctx, true, 0x5116) {
+		t.Fatal("second RMW after ordinary invalidation did not enroll")
+	}
+	if rebound := plainAtomicCapabilityForTest(t, d, addr, 8); rebound == fresh {
+		t.Fatal("RMW after ordinary invalidation reopened the escaped capability")
 	}
 }
 
@@ -150,7 +189,9 @@ func TestAtomicRMWReusesExactCapability(t *testing.T) {
 	failed := goroutine.Alloc(204)
 	success := goroutine.Alloc(205)
 	const addr = uintptr(0x31200)
-	enrollPlainAtomicForTest(t, d, addr, 8, seed)
+	if !completeRMWAtomicForTest(d, addr, 8, seed, true, 0x511f) {
+		t.Fatal("RMW-only seed did not enroll a capability")
+	}
 	capability := plainAtomicCapabilityForTest(t, d, addr, 8)
 	state := atomicHistoryForTest(t, d, addr)
 	state.mu.lock()
@@ -159,6 +200,14 @@ func TestAtomicRMWReusesExactCapability(t *testing.T) {
 	if previousRelease == nil {
 		t.Fatal("plain enrollment published no release for failed CAS to acquire")
 	}
+	// Exercise failed-CAS completion against the promoted representation: the
+	// acquire is semantic, but a failed hardware CAS must not append or advance
+	// the release generation.
+	anchor := vectorclock.New()
+	joinAtomicReleaseRanges(anchor, previousRelease.runs)
+	retireAtomicReleaseRanges(anchor, previousRelease.retired)
+	previousRelease.lineage = vectorclock.NewClockLineage(anchor)
+	previousRelease.view = previousRelease.lineage.Pin()
 	previousStream, previousVersion := previousRelease.stream, previousRelease.version
 
 	var token AtomicToken
@@ -212,7 +261,9 @@ func TestAtomicRMWCooperativeContentionIsClean(t *testing.T) {
 	defer seed.C.Release()
 	defer contender.C.Release()
 	const addr = uintptr(0x31240)
-	enrollPlainAtomicForTest(t, d, addr, 8, seed)
+	if !completeRMWAtomicForTest(d, addr, 8, seed, true, 0x5121) {
+		t.Fatal("RMW-only seed did not enroll a capability")
+	}
 	capability := plainAtomicCapabilityForTest(t, d, addr, 8)
 	state := atomicHistoryForTest(t, d, addr)
 
@@ -225,7 +276,7 @@ func TestAtomicRMWCooperativeContentionIsClean(t *testing.T) {
 	beforeSeedClock := contender.C.Get(seed.TID)
 	var token AtomicToken
 	token[0] = unsafe.Pointer(new(byte))
-	retry := d.AtomicBeginRMWCooperative(addr, 8, contender, true, &token)
+	retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, contender, true, &token)
 	if !retry {
 		state.mu.unlock()
 		t.Fatal("cooperative RMW contention did not request a retry")
@@ -267,13 +318,599 @@ func TestAtomicRMWCooperativeContentionIsClean(t *testing.T) {
 		t.Fatalf("contention replaced capability %p with %p", capability, fresh)
 	}
 
-	if retry := d.AtomicBeginRMWCooperative(addr, 8, contender, true, &token); retry {
+	if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, contender, true, &token); retry {
 		t.Fatal("uncontended cooperative RMW requested a retry")
 	}
 	if fast := atomicFastToken(&token); fast != capability {
 		t.Fatalf("uncontended cooperative token capability = %p, want %p", fast, capability)
 	}
 	d.AtomicEnd(addr, 8, contender, &token, 0x5122, true)
+}
+
+func TestAtomicRMWCooperativeHandsOffOneRetainedWaiter(t *testing.T) {
+	d := NewDetector()
+	seed := goroutine.Alloc(2070)
+	owner := goroutine.Alloc(2071)
+	first := goroutine.Alloc(2072)
+	second := goroutine.Alloc(2073)
+	defer seed.C.Release()
+	defer owner.C.Release()
+	defer first.C.Release()
+	defer second.C.Release()
+	const addr = uintptr(0x31248)
+	if !completeRMWAtomicForTest(d, addr, 8, seed, true, 0x5123) {
+		t.Fatal("RMW-only seed did not enroll a capability")
+	}
+
+	var ownerToken AtomicToken
+	if retry, _, _, park := d.AtomicBeginRMWCooperative(addr, 8, owner, true, &ownerToken); retry || park != nil {
+		t.Fatalf("owner begin = retry %v, park %p", retry, park)
+	}
+	capability := atomicFastToken(&ownerToken)
+	if capability == nil {
+		t.Fatal("owner did not retain exact capability")
+	}
+
+	var firstToken, secondToken AtomicToken
+	firstRetry, firstSpin, _, firstPark := d.AtomicBeginRMWCooperative(addr, 8, first, true, &firstToken)
+	secondRetry, secondSpin, _, secondPark := d.AtomicBeginRMWCooperative(addr, 8, second, true, &secondToken)
+	if !firstRetry || !firstSpin || firstPark == nil || !secondRetry || secondSpin || secondPark == nil || firstPark == secondPark {
+		t.Fatalf("waiter registration = first(%v,%p) second(%v,%p)", firstRetry, firstPark, secondRetry, secondPark)
+	}
+	if *firstPark != 0 {
+		t.Fatalf("spinner doorbell = %d, want 0 before owner completion", *firstPark)
+	}
+	if atomicFastToken(&firstToken) != capability || atomicFastToken(&secondToken) != capability {
+		t.Fatal("parked waiter did not retain the exact capability")
+	}
+
+	wake := d.AtomicEndMode(addr, 8, owner, &ownerToken, 0x5124, true, true)
+	if wake != nil {
+		t.Fatalf("owner unexpectedly woke parked waiter %p", wake)
+	}
+	if *firstPark != 1 {
+		t.Fatalf("spinner doorbell = %d, want 1 after owner completion", *firstPark)
+	}
+	state := atomicHistoryForTest(t, d, addr)
+	if !state.mu.tryLock() {
+		t.Fatal("spinner cohort completion did not unlock for competition")
+	}
+	state.mu.unlock()
+
+	// A failed CAS still owns the granted transaction and hands the next waiter
+	// onward without replaying its already-authoritative hardware result.
+	if retry, _, _, _ := d.AtomicResumeRMW(addr, 8, first, true, &firstToken); retry {
+		t.Fatal("spinner did not acquire unlocked state")
+	}
+	if *firstPark != 0 {
+		t.Fatalf("accepted spinner doorbell = %d, want consumed 0", *firstPark)
+	}
+	wake = d.AtomicEndMode(addr, 8, first, &firstToken, 0x5125, false, true)
+	if wake != secondPark {
+		t.Fatalf("failed-CAS completion wake = %p, want %p", wake, secondPark)
+	}
+	d.AtomicResumeRMW(addr, 8, second, true, &secondToken)
+	if wake = d.AtomicEndMode(addr, 8, second, &secondToken, 0x5126, true, true); wake != nil {
+		t.Fatalf("last waiter returned unexpected wake %p", wake)
+	}
+	if !state.mu.tryLock() {
+		t.Fatal("last waiter did not release exact state lock")
+	}
+	state.mu.unlock()
+}
+
+func TestAtomicRMWRecentOwnerSelectsPoliteSpinnerHint(t *testing.T) {
+	d := NewDetector()
+	seed := goroutine.Alloc(2080)
+	repeat := goroutine.Alloc(2081)
+	spinner := goroutine.Alloc(2209)
+	unique := goroutine.Alloc(2083)
+	other := goroutine.Alloc(2084)
+	defer seed.C.Release()
+	defer repeat.C.Release()
+	defer spinner.C.Release()
+	defer unique.C.Release()
+	defer other.C.Release()
+	const addr = uintptr(0x31250)
+	if !completeRMWAtomicForTest(d, addr, 8, seed, true, 0x5127) {
+		t.Fatal("seed did not enroll capability")
+	}
+	complete := func(ctx *goroutine.RaceContext, pc uintptr) {
+		var token AtomicToken
+		if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, ctx, true, &token); retry {
+			t.Fatal("unexpected owner retry")
+		}
+		d.AtomicEndMode(addr, 8, ctx, &token, pc, true, true)
+	}
+	complete(repeat, 0x5128)
+	var ownerToken, spinnerToken AtomicToken
+	if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, repeat, true, &ownerToken); retry {
+		t.Fatal("repeat owner retried")
+	}
+	retry, spin, polite, park := d.AtomicBeginRMWCooperative(addr, 8, spinner, true, &spinnerToken)
+	if !retry || !spin || !polite || park == nil || *park != 0 {
+		t.Fatalf("repeat-owner spinner = retry %v spin %v polite %v park %p", retry, spin, polite, park)
+	}
+	if spinnerToken[2] == nil {
+		t.Fatal("wide repeat-owner cohort did not select patient spinner delay")
+	}
+	d.AtomicEndMode(addr, 8, repeat, &ownerToken, 0x5129, true, true)
+	if retry, _, _, _ := d.AtomicResumeRMW(addr, 8, spinner, true, &spinnerToken); retry {
+		t.Fatal("repeat-owner spinner did not acquire")
+	}
+	d.AtomicEndMode(addr, 8, spinner, &spinnerToken, 0x512a, true, true)
+
+	if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, unique, true, &ownerToken); retry {
+		t.Fatal("unique owner retried")
+	}
+	retry, spin, polite, park = d.AtomicBeginRMWCooperative(addr, 8, other, true, &spinnerToken)
+	if !retry || !spin || polite || park == nil || *park != 0 {
+		t.Fatalf("unique-owner spinner = retry %v spin %v polite %v park %p", retry, spin, polite, park)
+	}
+	if spinnerToken[2] != nil {
+		t.Fatal("narrow unique-owner cohort selected patient spinner delay")
+	}
+	d.AtomicEndMode(addr, 8, unique, &ownerToken, 0x512b, true, true)
+	if retry, _, _, _ := d.AtomicResumeRMW(addr, 8, other, true, &spinnerToken); retry {
+		t.Fatal("unique-owner spinner did not acquire")
+	}
+	d.AtomicEndMode(addr, 8, other, &spinnerToken, 0x512c, true, true)
+}
+
+func TestAtomicResumeRMWWithoutSynchronizationKeepsHistoryButNotClockOrRelease(t *testing.T) {
+	d := NewDetector()
+	owner := goroutine.Alloc(2090)
+	waiter := goroutine.Alloc(2091)
+	defer owner.C.Release()
+	defer waiter.C.Release()
+	const addr = uintptr(0x52200)
+
+	var ownerToken AtomicToken
+	if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, owner, true, &ownerToken); retry {
+		t.Fatal("initial owner unexpectedly retried")
+	}
+	var waiterToken AtomicToken
+	retry, _, _, park := d.AtomicBeginRMWCooperative(addr, 8, waiter, true, &waiterToken)
+	if !retry || park == nil {
+		t.Fatalf("contended waiter = retry %v park %p, want true/non-nil", retry, park)
+	}
+	wake := d.AtomicEndMode(addr, 8, owner, &ownerToken, 0x5221, true, true)
+	if wake != nil || *park != 1 {
+		t.Fatalf("owner handoff = wake %p doorbell %d, want nil/1", wake, *park)
+	}
+
+	before := waiter.GetEpoch()
+	if retry, _, _, _ := d.AtomicResumeRMW(addr, 8, waiter, false, &waiterToken); retry {
+		t.Fatal("granted non-synchronizing waiter retried")
+	}
+	if wake := d.AtomicEndMode(addr, 8, waiter, &waiterToken, 0x5222, true, false); wake != nil {
+		t.Fatalf("last waiter returned unexpected wake %p", wake)
+	}
+	if got := waiter.GetEpoch(); got != before {
+		t.Fatalf("non-synchronizing resume advanced epoch from %v to %v", before, got)
+	}
+	state := atomicHistoryForTest(t, d, addr)
+	if _, ok := atomicHistoryAccess(state.writes, waiter.TID); !ok {
+		t.Fatal("non-synchronizing resumed write lost atomic history")
+	}
+	if release, _ := state.exactReleaseForMask(0xff); release != nil {
+		t.Fatal("non-synchronizing resumed write retained a release")
+	}
+}
+
+func TestAtomicRMWSpinnerForcesGrantAfterOwnershipEpochMisses(t *testing.T) {
+	d := NewDetector()
+	seed := goroutine.Alloc(2090)
+	owner := goroutine.Alloc(2091)
+	spinner := goroutine.Alloc(2092)
+	thief := goroutine.Alloc(2300)
+	defer seed.C.Release()
+	defer owner.C.Release()
+	defer spinner.C.Release()
+	defer thief.C.Release()
+	const addr = uintptr(0x31258)
+	if !completeRMWAtomicForTest(d, addr, 8, seed, true, 0x512d) {
+		t.Fatal("seed did not enroll capability")
+	}
+
+	var ownerToken, spinnerToken AtomicToken
+	if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, owner, true, &ownerToken); retry {
+		t.Fatal("owner retried")
+	}
+	retry, spin, _, doorbell := d.AtomicBeginRMWCooperative(addr, 8, spinner, true, &spinnerToken)
+	if !retry || !spin || doorbell == nil || *doorbell != 0 {
+		t.Fatalf("spinner enrollment = retry %v spin %v doorbell %p/%d", retry, spin, doorbell, valueOrZero(doorbell))
+	}
+	if spinnerToken[2] != nil {
+		t.Fatal("narrow initial owner selected patient spinner delay")
+	}
+	state := atomicHistoryForTest(t, d, addr)
+	activeOwner := owner
+
+	for miss := uint8(1); miss <= 64; miss++ {
+		if wake := d.AtomicEndMode(addr, 8, activeOwner, &ownerToken, 0x512e+uintptr(miss), true, true); wake != nil {
+			t.Fatalf("ownership epoch %d returned spinner wake %p", miss, wake)
+		}
+		if *doorbell != 1 {
+			t.Fatalf("ownership epoch %d doorbell = %d, want 1", miss, *doorbell)
+		}
+		// This test isolates the older epoch-miss force path. The locality
+		// certificate has its own bounded takeover tests below.
+		if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, thief, true, &ownerToken); retry {
+			t.Fatalf("thief ownership epoch %d retried", miss)
+		}
+		activeOwner = thief
+		retry, spin, _, park := d.AtomicResumeRMW(addr, 8, spinner, true, &spinnerToken)
+		if !retry || !spin || park != doorbell || *doorbell != 0 {
+			t.Fatalf("miss %d resume = retry %v spin %v park %p doorbell %d", miss, retry, spin, park, *doorbell)
+		}
+		if spinnerToken[2] == nil {
+			t.Fatalf("miss %d did not refresh patient delay for wide replacement owner", miss)
+		}
+		state.rmwQueue.lock()
+		gotMisses, forced := state.rmwSpinnerMisses, state.rmwForceSpinner
+		state.rmwQueue.unlock()
+		if gotMisses != miss || forced != (miss == 64) {
+			t.Fatalf("miss %d state = misses %d forced %v", miss, gotMisses, forced)
+		}
+	}
+
+	if wake := d.AtomicEndMode(addr, 8, thief, &ownerToken, 0x516e, true, true); wake != nil {
+		t.Fatalf("forced spinner grant returned wake %p", wake)
+	}
+	if *doorbell != 1 || state.mu.state.Load() == 0 {
+		t.Fatalf("forced grant doorbell/lock = %d/%d, want 1/locked", *doorbell, state.mu.state.Load())
+	}
+	if retry, _, _, _ := d.AtomicResumeRMW(addr, 8, spinner, true, &spinnerToken); retry {
+		t.Fatal("forced spinner grant did not resume")
+	}
+	if *doorbell != 0 {
+		t.Fatalf("accepted forced grant retained doorbell %d", *doorbell)
+	}
+	d.AtomicEndMode(addr, 8, spinner, &spinnerToken, 0x516f, true, true)
+	state.rmwQueue.lock()
+	invalid := state.rmwSpinnerTID != 0 || state.rmwSpinnerMisses != 0 || state.rmwForceSpinner ||
+		state.rmwCohortOps != 0 || state.rmwPromoteParked || state.rmwPromotedOwner ||
+		state.rmwWakeCompetitors != 0 || state.rmwGranted ||
+		state.rmwGrantTID != 0 || state.rmwSpinnerEpoch != 0
+	state.rmwQueue.unlock()
+	if invalid {
+		t.Fatal("accepted forced grant retained spinner lifecycle state")
+	}
+}
+
+func TestAtomicRMWForcedSpinnerReopensParkedCompetition(t *testing.T) {
+	d := NewDetector()
+	seed := goroutine.Alloc(2130)
+	owner := goroutine.Alloc(2131)
+	spinner := goroutine.Alloc(2132)
+	parked := goroutine.Alloc(2133)
+	thief := goroutine.Alloc(2134)
+	defer seed.C.Release()
+	defer owner.C.Release()
+	defer spinner.C.Release()
+	defer parked.C.Release()
+	defer thief.C.Release()
+	const addr = uintptr(0x31298)
+	if !completeRMWAtomicForTest(d, addr, 8, seed, true, 0x5205) {
+		t.Fatal("seed did not enroll capability")
+	}
+
+	var ownerToken, spinnerToken, parkedToken AtomicToken
+	if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, owner, true, &ownerToken); retry {
+		t.Fatal("owner retried")
+	}
+	retry, spin, _, doorbell := d.AtomicBeginRMWCooperative(addr, 8, spinner, true, &spinnerToken)
+	if !retry || !spin || doorbell == nil || *doorbell != 0 {
+		t.Fatal("spinner did not enroll")
+	}
+	retry, spin, _, parkedSema := d.AtomicBeginRMWCooperative(addr, 8, parked, true, &parkedToken)
+	if !retry || spin || parkedSema == nil || parkedSema == doorbell {
+		t.Fatal("parked waiter did not enroll")
+	}
+
+	active := owner
+	for miss := uint8(1); miss <= 64; miss++ {
+		if wake := d.AtomicEndMode(addr, 8, active, &ownerToken, 0x5205+uintptr(miss), true, true); wake != nil {
+			t.Fatalf("miss epoch %d returned wake %p", miss, wake)
+		}
+		if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, thief, true, &ownerToken); retry {
+			t.Fatalf("thief epoch %d retried", miss)
+		}
+		active = thief
+		retry, spin, _, park := d.AtomicResumeRMW(addr, 8, spinner, true, &spinnerToken)
+		if !retry || !spin || park != doorbell || *doorbell != 0 {
+			t.Fatalf("spinner miss %d = retry %v spin %v park %p bell %d", miss, retry, spin, park, *doorbell)
+		}
+	}
+	if wake := d.AtomicEndMode(addr, 8, thief, &ownerToken, 0x5246, true, true); wake != nil {
+		t.Fatalf("forced grant returned wake %p", wake)
+	}
+	if retry, _, _, _ := d.AtomicResumeRMW(addr, 8, spinner, true, &spinnerToken); retry {
+		t.Fatal("forced spinner did not resume")
+	}
+	if wake := d.AtomicEndMode(addr, 8, spinner, &spinnerToken, 0x5247, true, true); wake != parkedSema {
+		t.Fatalf("forced spinner wake = %p, want competitor %p", wake, parkedSema)
+	}
+	state := atomicHistoryForTest(t, d, addr)
+	state.rmwQueue.lock()
+	reopened := !state.rmwGranted && !state.rmwOwner && state.rmwWakeCompetitors == 1 && state.mu.state.Load() == 0
+	state.rmwQueue.unlock()
+	if !reopened {
+		t.Fatal("forced spinner entered a reserved semaphore chain")
+	}
+	if retry, _, _, _ := d.AtomicResumeRMW(addr, 8, parked, true, &parkedToken); retry {
+		t.Fatal("unreserved competitor did not acquire")
+	}
+
+	// A new contender can immediately become a spinner behind the competitor;
+	// the queue is no longer forced through one reserved handoff per operation.
+	var nextToken AtomicToken
+	retry, spin, _, nextDoorbell := d.AtomicBeginRMWCooperative(addr, 8, owner, true, &nextToken)
+	if !retry || !spin || nextDoorbell == nil || *nextDoorbell != 0 {
+		t.Fatalf("next spinner = retry %v spin %v doorbell %p/%d", retry, spin, nextDoorbell, valueOrZero(nextDoorbell))
+	}
+	d.AtomicEndMode(addr, 8, parked, &parkedToken, 0x5248, true, true)
+	if retry, _, _, _ := d.AtomicResumeRMW(addr, 8, owner, true, &nextToken); retry {
+		t.Fatal("next spinner did not acquire reopened competition")
+	}
+	d.AtomicEndMode(addr, 8, owner, &nextToken, 0x5249, true, true)
+}
+
+func TestAtomicRMWLateCompetitorRequeuesBehindForcedSpinner(t *testing.T) {
+	d := NewDetector()
+	contexts := make([]*goroutine.RaceContext, 7)
+	for i := range contexts {
+		contexts[i] = goroutine.Alloc(uint32(2160 + i))
+		defer contexts[i].C.Release()
+	}
+	seed, owner, firstSpinner, lateCompetitor, thief, secondSpinner, nextOwner :=
+		contexts[0], contexts[1], contexts[2], contexts[3], contexts[4], contexts[5], contexts[6]
+	const addr = uintptr(0x312d8)
+	if !completeRMWAtomicForTest(d, addr, 8, seed, true, 0x5260) {
+		t.Fatal("seed did not enroll capability")
+	}
+
+	var ownerToken, firstSpinnerToken, lateToken AtomicToken
+	if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, owner, true, &ownerToken); retry {
+		t.Fatal("owner retried")
+	}
+	retry, spin, _, firstDoorbell := d.AtomicBeginRMWCooperative(addr, 8, firstSpinner, true, &firstSpinnerToken)
+	if !retry || !spin || firstDoorbell == nil {
+		t.Fatal("first spinner did not enroll")
+	}
+	retry, spin, _, sema := d.AtomicBeginRMWCooperative(addr, 8, lateCompetitor, true, &lateToken)
+	if !retry || spin || sema == nil || sema == firstDoorbell {
+		t.Fatal("late competitor did not park")
+	}
+
+	active := owner
+	for miss := uint8(1); miss <= 64; miss++ {
+		if wake := d.AtomicEndMode(addr, 8, active, &ownerToken, 0x5260+uintptr(miss), true, true); wake != nil {
+			t.Fatalf("first epoch %d returned wake %p", miss, wake)
+		}
+		if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, thief, true, &ownerToken); retry {
+			t.Fatalf("first thief epoch %d retried", miss)
+		}
+		active = thief
+		if retry, spin, _, park := d.AtomicResumeRMW(addr, 8, firstSpinner, true, &firstSpinnerToken); !retry || !spin || park != firstDoorbell {
+			t.Fatalf("first spinner miss %d did not retry", miss)
+		}
+	}
+	if wake := d.AtomicEndMode(addr, 8, thief, &ownerToken, 0x52a1, true, true); wake != nil {
+		t.Fatalf("first forced grant returned wake %p", wake)
+	}
+	if retry, _, _, _ := d.AtomicResumeRMW(addr, 8, firstSpinner, true, &firstSpinnerToken); retry {
+		t.Fatal("first forced spinner did not resume")
+	}
+	if wake := d.AtomicEndMode(addr, 8, firstSpinner, &firstSpinnerToken, 0x52a2, true, true); wake != sema {
+		t.Fatalf("competitor wake = %p, want %p", wake, sema)
+	}
+
+	// Leave the released competitor runnable. A new cohort can acquire the
+	// unlocked state and reserve it for another spinner before that competitor
+	// reaches Resume.
+	if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, nextOwner, true, &ownerToken); retry {
+		t.Fatal("next owner retried")
+	}
+	var secondSpinnerToken AtomicToken
+	retry, spin, _, secondDoorbell := d.AtomicBeginRMWCooperative(addr, 8, secondSpinner, true, &secondSpinnerToken)
+	if !retry || !spin || secondDoorbell == nil {
+		t.Fatal("second spinner did not enroll")
+	}
+	active = nextOwner
+	for miss := uint8(1); miss <= 64; miss++ {
+		if wake := d.AtomicEndMode(addr, 8, active, &ownerToken, 0x52a2+uintptr(miss), true, true); wake != nil {
+			t.Fatalf("second epoch %d returned wake %p", miss, wake)
+		}
+		if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, thief, true, &ownerToken); retry {
+			t.Fatalf("second thief epoch %d retried", miss)
+		}
+		active = thief
+		if retry, spin, _, park := d.AtomicResumeRMW(addr, 8, secondSpinner, true, &secondSpinnerToken); !retry || !spin || park != secondDoorbell {
+			t.Fatalf("second spinner miss %d did not retry", miss)
+		}
+	}
+	if wake := d.AtomicEndMode(addr, 8, thief, &ownerToken, 0x52e3, true, true); wake != nil {
+		t.Fatalf("second forced grant returned wake %p", wake)
+	}
+
+	if retry, spin, _, park := d.AtomicResumeRMW(addr, 8, lateCompetitor, true, &lateToken); !retry || spin || park != sema {
+		t.Fatalf("late competitor = retry %v spin %v park %p, want parked retry", retry, spin, park)
+	}
+	if retry, _, _, _ := d.AtomicResumeRMW(addr, 8, secondSpinner, true, &secondSpinnerToken); retry {
+		t.Fatal("second forced spinner did not resume")
+	}
+	if wake := d.AtomicEndMode(addr, 8, secondSpinner, &secondSpinnerToken, 0x52e4, true, true); wake != sema {
+		t.Fatalf("second spinner wake = %p, want %p", wake, sema)
+	}
+	if retry, _, _, _ := d.AtomicResumeRMW(addr, 8, lateCompetitor, true, &lateToken); retry {
+		t.Fatal("requeued competitor did not receive reserved handoff")
+	}
+	d.AtomicEndMode(addr, 8, lateCompetitor, &lateToken, 0x52e5, true, true)
+}
+
+func TestAtomicRMWCohortPromotesParkedWaiterWithDescheduledSpinner(t *testing.T) {
+	d := NewDetector()
+	seed := goroutine.Alloc(2094)
+	owner := goroutine.Alloc(2095)
+	spinner := goroutine.Alloc(2096)
+	parked := goroutine.Alloc(2097)
+	thief := goroutine.Alloc(2098)
+	late := goroutine.Alloc(2099)
+	defer seed.C.Release()
+	defer owner.C.Release()
+	defer spinner.C.Release()
+	defer parked.C.Release()
+	defer thief.C.Release()
+	defer late.C.Release()
+	const addr = uintptr(0x31260)
+	if !completeRMWAtomicForTest(d, addr, 8, seed, true, 0x5172) {
+		t.Fatal("seed did not enroll capability")
+	}
+
+	var ownerToken, spinnerToken, parkedToken AtomicToken
+	if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, owner, true, &ownerToken); retry {
+		t.Fatal("owner retried")
+	}
+	retry, spin, _, doorbell := d.AtomicBeginRMWCooperative(addr, 8, spinner, true, &spinnerToken)
+	if !retry || !spin || doorbell == nil || *doorbell != 0 {
+		t.Fatalf("spinner enrollment = retry %v spin %v doorbell %p/%d", retry, spin, doorbell, valueOrZero(doorbell))
+	}
+	retry, spin, _, parkedSema := d.AtomicBeginRMWCooperative(addr, 8, parked, true, &parkedToken)
+	if !retry || spin || parkedSema == nil || parkedSema == doorbell {
+		t.Fatalf("parked enrollment = retry %v spin %v park %p", retry, spin, parkedSema)
+	}
+
+	// Do not resume the spinner. New owners repeatedly steal the unlocked
+	// exact-fast lock while its one-bit doorbell remains set. The owner-side
+	// cohort counter must still force the spinner after a bounded number of
+	// completed hardware epochs; coalescing doorbell stores cannot hide them.
+	active := owner
+	state := atomicHistoryForTest(t, d, addr)
+	for completion := uint16(1); completion <= rmwCohortLimit; completion++ {
+		if wake := d.AtomicEndMode(addr, 8, active, &ownerToken, 0x5173+uintptr(completion), true, true); wake != nil {
+			t.Fatalf("cohort completion %d returned wake %p", completion, wake)
+		}
+		if completion == rmwCohortLimit {
+			break
+		}
+		if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, thief, true, &ownerToken); retry {
+			t.Fatalf("thief completion %d retried", completion)
+		}
+		active = thief
+	}
+
+	state.rmwQueue.lock()
+	forced, promote, granted, grantTID, cohortOps, locked := state.rmwForceSpinner, state.rmwPromoteParked,
+		state.rmwGranted, state.rmwGrantTID, state.rmwCohortOps, state.mu.state.Load()
+	state.rmwQueue.unlock()
+	if !forced || !promote || !granted || grantTID != spinner.TID || cohortOps != rmwCohortLimit || locked == 0 || *doorbell != 1 {
+		t.Fatalf("bounded grant = forced %v promote %v granted %v tid %d cohort %d lock %d bell %d",
+			forced, promote, granted, grantTID, cohortOps, locked, *doorbell)
+	}
+	if retry, _, _, _ := d.AtomicResumeRMW(addr, 8, spinner, true, &spinnerToken); retry {
+		t.Fatal("forced spinner did not resume")
+	}
+
+	if wake := d.AtomicEndMode(addr, 8, spinner, &spinnerToken, 0x51b4, true, true); wake != parkedSema {
+		t.Fatalf("forced spinner competitor wake = %p, want %p", wake, parkedSema)
+	}
+	state.rmwQueue.lock()
+	unreserved := state.rmwWakeCompetitors == 1 && !state.rmwGranted && !state.rmwOwner && state.mu.state.Load() == 0
+	state.rmwQueue.unlock()
+	if !unreserved {
+		t.Fatal("forced spinner completion did not reopen unlocked competition")
+	}
+	if retry, _, _, _ := d.AtomicResumeRMW(addr, 8, parked, true, &parkedToken); retry {
+		t.Fatal("woken competitor did not acquire unlocked state")
+	}
+	var lateToken AtomicToken
+	retry, spin, _, lateDoorbell := d.AtomicBeginRMWCooperative(addr, 8, late, true, &lateToken)
+	if !retry || !spin || lateDoorbell == nil || *lateDoorbell != 0 {
+		t.Fatalf("reopened spinner = retry %v spin %v doorbell %p/%d", retry, spin, lateDoorbell, valueOrZero(lateDoorbell))
+	}
+	if wake := d.AtomicEndMode(addr, 8, parked, &parkedToken, 0x51b5, false, true); wake != nil {
+		t.Fatalf("competitor owner returned wake %p", wake)
+	}
+	if retry, _, _, _ := d.AtomicResumeRMW(addr, 8, late, true, &lateToken); retry {
+		t.Fatal("reopened spinner did not acquire")
+	}
+	if wake := d.AtomicEndMode(addr, 8, late, &lateToken, 0x51b6, true, true); wake != nil {
+		t.Fatalf("last cohort completion returned wake %p", wake)
+	}
+
+	state.rmwQueue.lock()
+	invalid := state.rmwOwner || state.rmwGranted || state.rmwWaiters != 0 || state.rmwSpinnerTID != 0 ||
+		state.rmwSpinnerMisses != 0 || state.rmwCohortOps != 0 || state.rmwForceSpinner ||
+		state.rmwPromoteParked || state.rmwPromotedOwner || state.rmwWakeCompetitors != 0 ||
+		state.rmwGrantTID != 0 || state.rmwSpinnerEpoch != 0
+	state.rmwQueue.unlock()
+	if invalid || state.mu.state.Load() != 0 {
+		t.Fatal("bounded parked promotion retained lifecycle state")
+	}
+}
+
+func valueOrZero(value *uint32) uint32 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func TestAtomicRMWSpinnerSurvivesStolenNonPublicExactOwner(t *testing.T) {
+	d := NewDetector()
+	internal := goroutine.Alloc(2100)
+	owner := goroutine.Alloc(2101)
+	spinner := goroutine.Alloc(2102)
+	defer DeactivateAtomicLoadCache(internal)
+	defer internal.C.Release()
+	defer owner.C.Release()
+	defer spinner.C.Release()
+	pc := reflect.ValueOf((*internalsync.Mutex).Lock).Pointer() + 1
+	const addr = uintptr(0x31268)
+	if fast, direct := completeInternalRMWForTest(d, addr, 4, internal, pc, false, true); !fast || direct {
+		t.Fatalf("internal enrollment = fast %v direct %v", fast, direct)
+	}
+	if fast, direct := completeInternalRMWForTest(d, addr, 4, internal, pc, false, true); !fast || !direct {
+		t.Fatalf("internal retained seed = fast %v direct %v", fast, direct)
+	}
+
+	var ownerToken, spinnerToken AtomicToken
+	if retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 4, owner, true, &ownerToken); retry {
+		t.Fatal("public owner retried")
+	}
+	retry, spin, _, doorbell := d.AtomicBeginRMWCooperative(addr, 4, spinner, true, &spinnerToken)
+	if !retry || !spin || doorbell == nil || *doorbell != 0 {
+		t.Fatalf("spinner enrollment = retry %v spin %v doorbell %p/%d", retry, spin, doorbell, valueOrZero(doorbell))
+	}
+	d.AtomicEndMode(addr, 4, owner, &ownerToken, 0x5170, true, true)
+
+	var internalToken AtomicToken
+	retry, direct, _, _, _ := d.AtomicBeginInternalRMWCooperative(addr, 4, internal, pc, false, &internalToken)
+	if retry || !direct {
+		t.Fatalf("non-public steal = retry %v direct %v", retry, direct)
+	}
+	state := atomicHistoryForTest(t, d, addr)
+	state.rmwQueue.lock()
+	publicOwner := state.rmwOwner
+	state.rmwQueue.unlock()
+	if publicOwner {
+		t.Fatal("direct internal thief was recorded as a public owner")
+	}
+	if retry, spin, _, park := d.AtomicResumeRMW(addr, 4, spinner, true, &spinnerToken); !retry || !spin || park != doorbell || *doorbell != 0 {
+		t.Fatalf("stolen resume = retry %v spin %v park %p doorbell %d", retry, spin, park, *doorbell)
+	}
+	if wake := d.AtomicEndInternalRMW(addr, 4, internal, &internalToken, pc, true, false, direct); wake != nil {
+		t.Fatalf("non-public owner returned spinner wake %p", wake)
+	}
+	if *doorbell != 1 {
+		t.Fatalf("non-public owner completion doorbell = %d, want 1", *doorbell)
+	}
+	if retry, _, _, _ := d.AtomicResumeRMW(addr, 4, spinner, true, &spinnerToken); retry {
+		t.Fatal("spinner did not acquire after non-public owner completion")
+	}
+	d.AtomicEndMode(addr, 4, spinner, &spinnerToken, 0x5171, true, true)
 }
 
 func TestAtomicLoadStoreCooperativeContentionIsClean(t *testing.T) {
@@ -496,7 +1133,9 @@ func TestAtomicRMWFastClearDrainsRetainedTransaction(t *testing.T) {
 	d := NewDetector()
 	ctx := goroutine.Alloc(215)
 	const addr = uintptr(0x31500)
-	enrollPlainAtomicForTest(t, d, addr, 8, ctx)
+	if !completeRMWAtomicForTest(d, addr, 8, ctx, true, 0x514f) {
+		t.Fatal("RMW-only seed did not enroll a capability")
+	}
 
 	var token AtomicToken
 	d.AtomicBeginRMW(addr, 8, ctx, true, &token)
@@ -526,7 +1165,9 @@ func TestAtomicRMWFastResetDrainsRetainedTransaction(t *testing.T) {
 	d := NewDetector()
 	ctx := goroutine.Alloc(216)
 	const addr = uintptr(0x31600)
-	enrollPlainAtomicForTest(t, d, addr, 8, ctx)
+	if !completeRMWAtomicForTest(d, addr, 8, ctx, true, 0x515f) {
+		t.Fatal("RMW-only seed did not enroll a capability")
+	}
 
 	var token AtomicToken
 	d.AtomicBeginRMW(addr, 8, ctx, true, &token)
@@ -1509,4 +2150,598 @@ func TestPlainAtomicFastResetWaitsThroughAtomicEnd(t *testing.T) {
 	if got := d.RacesDetected(); got != 0 {
 		t.Fatalf("ordered initialized transaction reported %d races", got)
 	}
+}
+
+func completeInternalRMWForTest(d *Detector, addr, size uintptr, ctx *goroutine.RaceContext, pc uintptr, synchronize, write bool) (fast, direct bool) {
+	var token AtomicToken
+	retry, direct, _, _, _ := d.AtomicBeginInternalRMWCooperative(addr, size, ctx, pc, synchronize, &token)
+	if retry {
+		panic("unexpected uncontended internal RMW retry")
+	}
+	fast = atomicFastToken(&token) != nil
+	d.AtomicEndInternalRMW(addr, size, ctx, &token, pc, write, synchronize, direct)
+	return fast, direct
+}
+
+type countingSlotShadow struct {
+	shadowmem.SlotShadow
+	getSlotCalls int
+}
+
+func (s *countingSlotShadow) GetSlot(addr uintptr) *shadowmem.ShadowSlot {
+	s.getSlotCalls++
+	return s.SlotShadow.GetSlot(addr)
+}
+
+func beginPublicRMWForTest(d *Detector, addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken) {
+	retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, size, ctx, true, token)
+	if retry {
+		panic("unexpected uncontended public RMW retry")
+	}
+}
+
+func completePublicRMWForTest(d *Detector, addr, size uintptr, ctx *goroutine.RaceContext, pc uintptr, write bool) *shadowmem.AtomicFastPath {
+	var token AtomicToken
+	beginPublicRMWForTest(d, addr, size, ctx, &token)
+	fast := atomicFastToken(&token)
+	d.AtomicEndInternalRMW(addr, size, ctx, &token, pc, write, true, false)
+	return fast
+}
+
+type publicRMWTestHelper interface {
+	Helper()
+	Fatalf(string, ...any)
+}
+
+func completePublicDirectRMWForTest(t publicRMWTestHelper, d *Detector, addr, size uintptr, ctx *goroutine.RaceContext, pc uintptr, write bool) (*shadowmem.AtomicFastPath, bool) {
+	t.Helper()
+	var token AtomicToken
+	retry, direct, spin, polite, park := d.AtomicBeginInternalRMWCooperative(addr, size, ctx, pc, true, &token)
+	if retry {
+		t.Fatalf("unexpected uncontended public RMW retry: direct=%v spin=%v polite=%v park=%p token=%v", direct, spin, polite, park, token)
+	}
+	fast := atomicFastToken(&token)
+	if wake := d.AtomicEndInternalRMW(addr, size, ctx, &token, pc, write, true, direct); wake != nil {
+		t.Fatalf("uncontended public RMW returned wake %p", wake)
+	}
+	if token != (AtomicToken{}) {
+		t.Fatalf("public RMW retained token entries: %v", token)
+	}
+	return fast, direct
+}
+
+func assertPublicRMWOwnerIdle(t *testing.T, state *atomicState) {
+	t.Helper()
+	state.rmwQueue.lock()
+	defer state.rmwQueue.unlock()
+	if state.rmwOwner || state.rmwGranted || state.rmwGrantTID != 0 || state.rmwWaiters != 0 || state.rmwSpinnerTID != 0 {
+		t.Fatalf("public RMW owner state remained live: owner=%v granted=%v grantTID=%d waiters=%d spinner=%d",
+			state.rmwOwner, state.rmwGranted, state.rmwGrantTID, state.rmwWaiters, state.rmwSpinnerTID)
+	}
+	if state.mu.state.Load() != 0 {
+		t.Fatalf("public RMW state lock remained held: %d", state.mu.state.Load())
+	}
+	if state.directRMWRelease != nil || state.directRMWAppend.Valid() {
+		t.Fatalf("public RMW retained direct publication proof: release=%p append=%v", state.directRMWRelease, state.directRMWAppend.Valid())
+	}
+}
+
+func TestPublicRMWSameOwnerDirectCompletionAndFailedCASFallback(t *testing.T) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(124)
+	defer DeactivateAtomicLoadCache(ctx)
+	ctx.AtomicRMWCacheActive = true
+	const (
+		addr = uintptr(0x92400)
+		pc   = uintptr(0x6150)
+	)
+
+	if fast, direct := completePublicDirectRMWForTest(t, d, addr, 8, ctx, pc, true); fast == nil || direct {
+		t.Fatalf("public enrollment = fast %p direct %v, want non-nil/false", fast, direct)
+	}
+	entry, ok := lookupAtomicRMWCache(ctx, addr, 0xff, true)
+	if !ok {
+		t.Fatal("public enrollment did not retain the exact capability")
+	}
+	state := (*atomicState)(entry.State)
+
+	beforeDirect := ctx.GetEpoch()
+	if fast, direct := completePublicDirectRMWForTest(t, d, addr, 8, ctx, pc+1, true); fast != (*shadowmem.AtomicFastPath)(entry.Fast) || !direct {
+		t.Fatalf("same-owner public completion = fast %p direct %v, want %p/true", fast, direct, entry.Fast)
+	}
+	tid, clock := beforeDirect.Decode()
+	if got, want := ctx.GetEpoch(), epoch.NewEpoch(tid, clock+1); got != want {
+		t.Fatalf("direct public RMW epoch = %v, want %v", got, want)
+	}
+	state.mu.lock()
+	write, hasWrite := atomicHistoryAccess(state.writes, ctx.TID)
+	release, membership := state.exactReleaseForMask(0xff)
+	state.mu.unlock()
+	if !hasWrite {
+		t.Fatal("direct public RMW did not retain its exact write history")
+	}
+	for lane, got := range write.clocks {
+		if got != uint32(clock) {
+			t.Fatalf("direct public RMW write lane %d clock = %d, want %d", lane, got, clock)
+		}
+	}
+	if release == nil || membership != 0xff {
+		t.Fatalf("direct public RMW release = %p/%#x, want exact full mask", release, membership)
+	}
+	if seen, strong, ok := ctx.LookupAtomicRelease(unsafe.Pointer(release), release.stream, membership); !ok || !strong || seen != release.version {
+		t.Fatalf("direct public RMW release proof = version %d strong %v ok %v, want %d/true/true", seen, strong, ok, release.version)
+	}
+	assertPublicRMWOwnerIdle(t, state)
+
+	beforeFailed := ctx.GetEpoch()
+	if fast, direct := completePublicDirectRMWForTest(t, d, addr, 8, ctx, pc+2, false); fast != (*shadowmem.AtomicFastPath)(entry.Fast) || !direct {
+		t.Fatalf("failed public CAS begin = fast %p direct %v, want %p/true", fast, direct, entry.Fast)
+	}
+	if got := ctx.GetEpoch(); got != beforeFailed {
+		t.Fatalf("failed public CAS advanced epoch to %v, want %v", got, beforeFailed)
+	}
+	state.mu.lock()
+	_, hasRead := atomicHistoryAccess(state.reads, ctx.TID)
+	state.mu.unlock()
+	if !hasRead {
+		t.Fatal("failed public CAS did not complete canonically as a read")
+	}
+	assertPublicRMWOwnerIdle(t, state)
+	if got := d.RacesDetected(); got != 0 {
+		t.Fatalf("direct public atomic-only sequence reported %d races", got)
+	}
+}
+
+func TestPublicRMWDirectProofMissesFailClosed(t *testing.T) {
+	t.Run("foreign owner", func(t *testing.T) {
+		d := NewDetector()
+		owner := goroutine.Alloc(125)
+		other := goroutine.Alloc(126)
+		defer DeactivateAtomicLoadCache(owner)
+		defer DeactivateAtomicLoadCache(other)
+		owner.AtomicRMWCacheActive = true
+		other.AtomicRMWCacheActive = true
+		const (
+			addr = uintptr(0x92500)
+			pc   = uintptr(0x6160)
+		)
+
+		completePublicDirectRMWForTest(t, d, addr, 8, owner, pc, true)
+		if _, direct := completePublicDirectRMWForTest(t, d, addr, 8, owner, pc+1, true); !direct {
+			t.Fatal("same owner did not establish the direct tier")
+		}
+		if _, direct := completePublicDirectRMWForTest(t, d, addr, 8, other, pc+2, true); direct {
+			t.Fatal("foreign owner used a stale same-owner release proof")
+		}
+		if _, direct := completePublicDirectRMWForTest(t, d, addr, 8, owner, pc+3, true); direct {
+			t.Fatal("old owner bypassed canonical acquire after foreign publication")
+		}
+		if _, direct := completePublicDirectRMWForTest(t, d, addr, 8, owner, pc+4, true); !direct {
+			t.Fatal("canonical reacquire did not restore the same-owner direct tier")
+		}
+		entry, ok := lookupAtomicRMWCache(owner, addr, 0xff, true)
+		if !ok {
+			t.Fatal("owner lost its bounded public RMW cache entry")
+		}
+		assertPublicRMWOwnerIdle(t, (*atomicState)(entry.State))
+	})
+
+	t.Run("clear and ordinary history", func(t *testing.T) {
+		d := NewDetector()
+		ctx := goroutine.Alloc(127)
+		ordinary := goroutine.Alloc(128)
+		defer DeactivateAtomicLoadCache(ctx)
+		defer DeactivateAtomicLoadCache(ordinary)
+		ctx.AtomicRMWCacheActive = true
+		const (
+			addr = uintptr(0x92600)
+			pc   = uintptr(0x6170)
+		)
+
+		old, _ := completePublicDirectRMWForTest(t, d, addr, 8, ctx, pc, true)
+		if _, direct := completePublicDirectRMWForTest(t, d, addr, 8, ctx, pc+1, true); !direct {
+			t.Fatal("same owner did not establish the direct tier before clear")
+		}
+		d.ClearShadowRange(addr, 8)
+		if old.TryRetain(0xff) {
+			old.Release()
+			t.Fatal("cleared public direct capability retained after generation replacement")
+		}
+		if _, direct := completePublicDirectRMWForTest(t, d, addr, 8, ctx, pc+2, true); direct {
+			t.Fatal("clear/address reuse accepted a stale direct proof")
+		}
+		d.OnRead(addr, ordinary, pc+3)
+		if _, direct := completePublicDirectRMWForTest(t, d, addr, 8, ctx, pc+4, true); direct {
+			t.Fatal("ordinary history accepted a public direct completion")
+		}
+	})
+}
+
+func TestPublicRMWDirectPreparedPromotedRelease(t *testing.T) {
+	d := NewDetector()
+	const (
+		addr = uintptr(0x92700)
+		pc   = uintptr(0x6180)
+	)
+	contexts := make([]*goroutine.RaceContext, atomicReleasePromotionCoordinateThreshold+8)
+	for i := range contexts {
+		ctx := goroutine.Alloc(200 + uint32(i))
+		ctx.AtomicRMWCacheActive = true
+		contexts[i] = ctx
+		defer DeactivateAtomicLoadCache(ctx)
+		if _, direct := completePublicDirectRMWForTest(t, d, addr, 8, ctx, pc+uintptr(i), true); direct {
+			t.Fatalf("fresh public owner %d unexpectedly used direct completion", i)
+		}
+	}
+
+	owner := contexts[len(contexts)-1]
+	entry, ok := lookupAtomicRMWCache(owner, addr, 0xff, true)
+	if !ok {
+		t.Fatal("promoted public owner did not retain its exact capability")
+	}
+	state := (*atomicState)(entry.State)
+	state.mu.lock()
+	release, membership := state.exactReleaseForMask(0xff)
+	if release == nil || membership != 0xff || release.lineage == nil || !release.view.Valid() {
+		state.mu.unlock()
+		t.Fatalf("wide public release = %p/%#x lineage=%p, want promoted exact release", release, membership, func() *vectorclock.ClockLineage {
+			if release == nil {
+				return nil
+			}
+			return release.lineage
+		}())
+	}
+	beforeReleaseVersion := release.version
+	beforeLineageVersion := release.view.Version()
+	state.mu.unlock()
+
+	if _, direct := completePublicDirectRMWForTest(t, d, addr, 8, owner, pc+0x100, true); !direct {
+		t.Fatal("same owner did not prepare direct completion for a promoted release")
+	}
+	state.mu.lock()
+	if release.version <= beforeReleaseVersion || release.view.Version() <= beforeLineageVersion {
+		state.mu.unlock()
+		t.Fatalf("prepared direct publication did not advance release/view: release %d->%d view %d->%d",
+			beforeReleaseVersion, release.version, beforeLineageVersion, release.view.Version())
+	}
+	afterSuccessVersion := release.version
+	afterSuccessView := release.view.Version()
+	state.mu.unlock()
+	if seen, strong, ok := owner.LookupAtomicRelease(unsafe.Pointer(release), release.stream, 0xff); !ok || !strong || seen != release.version {
+		t.Fatalf("prepared direct release proof = version %d strong %v ok %v, want %d/true/true", seen, strong, ok, release.version)
+	}
+
+	if _, direct := completePublicDirectRMWForTest(t, d, addr, 8, owner, pc+0x101, false); !direct {
+		t.Fatal("promoted failed CAS did not begin through the direct tier")
+	}
+	state.mu.lock()
+	if release.version != afterSuccessVersion || release.view.Version() != afterSuccessView {
+		state.mu.unlock()
+		t.Fatalf("failed CAS published prepared release: release %d->%d view %d->%d",
+			afterSuccessVersion, release.version, afterSuccessView, release.view.Version())
+	}
+	state.mu.unlock()
+	assertPublicRMWOwnerIdle(t, state)
+
+	if _, direct := completePublicDirectRMWForTest(t, d, addr, 8, owner, pc+0x102, true); !direct {
+		t.Fatal("aborted failed-CAS append did not preserve later direct completion")
+	}
+	assertPublicRMWOwnerIdle(t, state)
+	if got := d.RacesDetected(); got != 0 {
+		t.Fatalf("prepared promoted public RMW sequence reported %d races", got)
+	}
+}
+
+func TestPublicRMWCacheSkipsSlotLookupAndKeepsCanonicalCompletion(t *testing.T) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(121)
+	defer DeactivateAtomicLoadCache(ctx)
+	const (
+		addr = uintptr(0x92100)
+		pc   = uintptr(0x6120)
+	)
+
+	first := completePublicRMWForTest(d, addr, 8, ctx, pc, true)
+	if first == nil {
+		t.Fatal("public RMW seed did not retain an exact capability")
+	}
+	if _, ok := lookupAtomicRMWCache(ctx, addr, 0xff, true); ok {
+		t.Fatal("uncontended public RMW activated the contention cache")
+	}
+	state := atomicHistoryForTest(t, d, addr)
+	state.mu.lock()
+	var contended AtomicToken
+	retry, _, _, _ := d.AtomicBeginRMWCooperative(addr, 8, ctx, true, &contended)
+	state.mu.unlock()
+	if !retry || contended != (AtomicToken{}) || !ctx.AtomicRMWCacheActive {
+		t.Fatalf("contended begin = retry %v token %v active %v, want true/empty/true", retry, contended, ctx.AtomicRMWCacheActive)
+	}
+	if seeded := completePublicRMWForTest(d, addr, 8, ctx, pc+1, true); seeded != first {
+		t.Fatalf("cache-seeding public RMW capability = %p, want %p", seeded, first)
+	}
+	entry, ok := lookupAtomicRMWCache(ctx, addr, 0xff, true)
+	if !ok || entry.Fast != unsafe.Pointer(first) {
+		t.Fatalf("public RMW cache = (%v, %p), want capability %p", ok, entry.Fast, first)
+	}
+
+	probe := &countingSlotShadow{SlotShadow: d.slotMemory}
+	d.slotMemory = probe
+	beforeWrite := ctx.GetEpoch()
+	second := completePublicRMWForTest(d, addr, 8, ctx, pc+2, true)
+	if second != first {
+		t.Fatalf("cached public RMW capability = %p, want %p", second, first)
+	}
+	if probe.getSlotCalls != 0 {
+		t.Fatalf("cached public RMW performed %d shadow-slot lookups, want 0", probe.getSlotCalls)
+	}
+	tid, clock := beforeWrite.Decode()
+	wantWrite := epoch.NewEpoch(tid, clock+1)
+	if got := ctx.GetEpoch(); got != wantWrite {
+		t.Fatalf("cached public RMW epoch = %v, want one advance from %v", got, beforeWrite)
+	}
+
+	beforeFailedCAS := ctx.GetEpoch()
+	failed := completePublicRMWForTest(d, addr, 8, ctx, pc+3, false)
+	if failed != first {
+		t.Fatalf("cached failed-CAS capability = %p, want %p", failed, first)
+	}
+	if probe.getSlotCalls != 0 {
+		t.Fatalf("cached failed CAS performed %d shadow-slot lookups, want 0", probe.getSlotCalls)
+	}
+	if got := ctx.GetEpoch(); got != beforeFailedCAS {
+		t.Fatalf("failed CAS advanced epoch to %v, want %v", got, beforeFailedCAS)
+	}
+	state.mu.lock()
+	_, hasRead := atomicHistoryAccess(state.reads, ctx.TID)
+	state.mu.unlock()
+	if !hasRead {
+		t.Fatal("cached failed CAS did not complete canonically as a read")
+	}
+
+	if got := d.RacesDetected(); got != 0 {
+		t.Fatalf("cached public RMW sequence reported %d races", got)
+	}
+}
+
+func TestPublicRMWCacheFailsClosedAfterClearAndMismatch(t *testing.T) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(122)
+	defer DeactivateAtomicLoadCache(ctx)
+	const (
+		addr = uintptr(0x92200)
+		pc   = uintptr(0x6130)
+	)
+	ctx.AtomicRMWCacheActive = true
+
+	old := completePublicRMWForTest(d, addr, 8, ctx, pc, true)
+	_, ok := lookupAtomicRMWCache(ctx, addr, 0xff, true)
+	if !ok {
+		t.Fatal("public RMW did not seed cache before clear")
+	}
+	d.ClearShadowRange(addr, 8)
+	if old.TryRetain(0xff) {
+		old.Release()
+		t.Fatal("cleared cached capability retained after address reuse")
+	}
+
+	probe := &countingSlotShadow{SlotShadow: d.slotMemory}
+	d.slotMemory = probe
+	completePublicRMWForTest(d, addr, 8, ctx, pc+1, true)
+	if probe.getSlotCalls == 0 {
+		t.Fatal("closed cached capability did not fall back to slot lookup")
+	}
+
+	// A stale arena-generation discriminator must also miss before using the
+	// cached pointer. Restore it before completion refreshes the same owned entry
+	// so the test does not manufacture an ownership leak.
+	_, ok = lookupAtomicRMWCache(ctx, addr, 0xff, true)
+	if !ok {
+		t.Fatal("post-clear public RMW did not refresh cache")
+	}
+	for i := range ctx.AtomicRMWCache {
+		cached := &ctx.AtomicRMWCache[i]
+		if cached.Addr != addr || cached.Mask != 0xff || !cached.Synchronize {
+			continue
+		}
+		generation := cached.StateGeneration
+		cached.StateGeneration++
+		probe.getSlotCalls = 0
+		var token AtomicToken
+		beginPublicRMWForTest(d, addr, 8, ctx, &token)
+		cached.StateGeneration = generation
+		d.AtomicEndInternalRMW(addr, 8, ctx, &token, pc+2, true, true, false)
+		if probe.getSlotCalls == 0 {
+			t.Fatal("stale cache generation did not fall back to slot lookup")
+		}
+		return
+	}
+	t.Fatal("post-clear cache entry was not addressable")
+}
+
+func TestPublicRMWCacheBoundedEvictionAndOverlayMismatch(t *testing.T) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(123)
+	defer DeactivateAtomicLoadCache(ctx)
+	ctx.AtomicRMWCacheActive = true
+	const pc = uintptr(0x6140)
+	addrs := [3]uintptr{0x92300, 0x92308, 0x92310}
+	fast := make([]*shadowmem.AtomicFastPath, len(addrs))
+	for i, addr := range addrs {
+		fast[i] = completePublicRMWForTest(d, addr, 8, ctx, pc+uintptr(i), true)
+		if fast[i] == nil {
+			t.Fatalf("address %d did not enroll an exact capability", i)
+		}
+	}
+	populated := 0
+	for i := range ctx.AtomicRMWCache {
+		if ctx.AtomicRMWCache[i].State != nil {
+			populated++
+		}
+	}
+	if populated != goroutine.AtomicRMWCacheSlots {
+		t.Fatalf("populated cache entries = %d, want bounded %d", populated, goroutine.AtomicRMWCacheSlots)
+	}
+	if _, ok := lookupAtomicRMWCache(ctx, addrs[0], 0xff, true); ok {
+		t.Fatal("third exact address did not evict the oldest two-slot entry")
+	}
+
+	// Replace one entry's descriptor root with the other live descriptor while
+	// keeping its state ownership intact. Direct retain succeeds, but overlay
+	// identity must reject it before state mutation and use the slot fallback.
+	firstIndex, secondIndex := -1, -1
+	for i := range ctx.AtomicRMWCache {
+		switch ctx.AtomicRMWCache[i].Addr {
+		case addrs[1]:
+			firstIndex = i
+		case addrs[2]:
+			secondIndex = i
+		}
+	}
+	if firstIndex < 0 || secondIndex < 0 {
+		t.Fatalf("post-eviction cache indices = %d/%d, want both retained", firstIndex, secondIndex)
+	}
+	ctx.AtomicRMWCache[firstIndex].Fast = ctx.AtomicRMWCache[secondIndex].Fast
+	probe := &countingSlotShadow{SlotShadow: d.slotMemory}
+	d.slotMemory = probe
+	if got := completePublicRMWForTest(d, addrs[1], 8, ctx, pc+3, true); got != fast[1] {
+		t.Fatalf("overlay-mismatch fallback capability = %p, want %p", got, fast[1])
+	}
+	if probe.getSlotCalls == 0 {
+		t.Fatal("overlay-mismatched cache entry did not use slot fallback")
+	}
+	entry, ok := lookupAtomicRMWCache(ctx, addrs[1], 0xff, true)
+	if !ok || entry.Fast != unsafe.Pointer(fast[1]) {
+		t.Fatalf("overlay-mismatch refresh = (%v, %p), want %p", ok, entry.Fast, fast[1])
+	}
+}
+
+func TestInternalRMWSameOwnerDirectAndFailedCASCanonicalCompletion(t *testing.T) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(101)
+	defer DeactivateAtomicLoadCache(ctx)
+	pc := reflect.ValueOf((*internalsync.Mutex).Lock).Pointer() + 1
+	const addr = uintptr(0x8d000)
+
+	if fast, direct := completeInternalRMWForTest(d, addr, 4, ctx, pc, true, true); !fast || direct {
+		t.Fatalf("enrollment completion = fast %v direct %v, want true/false", fast, direct)
+	}
+	if fast, direct := completeInternalRMWForTest(d, addr, 4, ctx, pc, true, true); !fast || !direct {
+		t.Fatalf("same-owner completion = fast %v direct %v, want true/true", fast, direct)
+	}
+	entry, ok := lookupAtomicRMWCache(ctx, addr, 0x0f, true)
+	if !ok {
+		t.Fatal("same-owner completion did not retain cache entry")
+	}
+	state := (*atomicState)(entry.State)
+	state.mu.lock()
+	var contended AtomicToken
+	retry, direct, _, _, _ := d.AtomicBeginInternalRMWCooperative(addr, 4, ctx, pc, true, &contended)
+	state.mu.unlock()
+	if !retry || direct || contended[0] != nil {
+		t.Fatalf("contended begin = retry %v direct %v token %p, want true/false/nil", retry, direct, contended[0])
+	}
+
+	// A failed compare-and-swap executes hardware once, then completes the
+	// already-retained transaction canonically as a read. The subsequent success
+	// proves that completion neither escaped the capability nor lost its release.
+	if fast, direct := completeInternalRMWForTest(d, addr, 4, ctx, pc, true, false); !fast || !direct {
+		t.Fatalf("failed-CAS begin = fast %v direct %v, want true/true", fast, direct)
+	}
+	if fast, direct := completeInternalRMWForTest(d, addr, 4, ctx, pc, true, true); !fast || !direct {
+		t.Fatalf("post-failed-CAS completion = fast %v direct %v, want true/true", fast, direct)
+	}
+	if got := d.RacesDetected(); got != 0 {
+		t.Fatalf("internal atomic-only sequence reported %d races", got)
+	}
+}
+
+func TestInternalRMWNonSynchronizingModeIsSeparateAndRetained(t *testing.T) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(102)
+	defer DeactivateAtomicLoadCache(ctx)
+	pc := reflect.ValueOf((*internalsync.Mutex).Lock).Pointer() + 1
+	const addr = uintptr(0x8e000)
+	before := ctx.GetEpoch()
+
+	if fast, direct := completeInternalRMWForTest(d, addr, 4, ctx, pc, false, true); !fast || direct {
+		t.Fatalf("disabled enrollment = fast %v direct %v, want true/false", fast, direct)
+	}
+	if fast, direct := completeInternalRMWForTest(d, addr, 4, ctx, pc, false, true); !fast || !direct {
+		t.Fatalf("disabled same-owner completion = fast %v direct %v, want true/true", fast, direct)
+	}
+	if got := ctx.GetEpoch(); got != before {
+		t.Fatalf("disabled RMW advanced epoch from %v to %v", before, got)
+	}
+	if _, direct := completeInternalRMWForTest(d, addr, 4, ctx, pc, true, true); direct {
+		t.Fatal("synchronizing operation reused RaceDisable cache mode")
+	}
+}
+
+func TestInternalRMWNonSynchronizingMissDoesNotRequireClockSuccessor(t *testing.T) {
+	// NewEpoch records process-wide near-overflow diagnostics. Restore those
+	// globals so this boundary test cannot disable unrelated fast-path tests
+	// which run later in the same package process.
+	epoch.ResetOverflowFlags()
+	defer epoch.ResetOverflowFlags()
+	d := NewDetector()
+	ctx := goroutine.Alloc(102)
+	defer ctx.C.Release()
+	ctx.C.Set(ctx.TID, ^uint32(0))
+	ctx.Epoch = epoch.NewEpoch(ctx.TID, epoch.MaxClock)
+	pc := reflect.ValueOf((*internalsync.Mutex).Lock).Pointer() + 1
+	const addr = uintptr(0x8e100)
+
+	if fast, direct := completeInternalRMWForTest(d, addr, 4, ctx, pc, false, true); !fast || direct {
+		t.Fatalf("non-synchronizing max-clock miss = fast %v direct %v, want true/false", fast, direct)
+	}
+	if _, got := ctx.GetEpoch().Decode(); got != epoch.MaxClock {
+		t.Fatalf("non-synchronizing max-clock miss changed epoch to %v", got)
+	}
+}
+
+func TestInternalRMWDirectFallsBackOnOwnerReleaseAndOrdinaryHistory(t *testing.T) {
+	t.Run("owner", func(t *testing.T) {
+		d := NewDetector()
+		owner := goroutine.Alloc(103)
+		other := goroutine.Alloc(104)
+		defer DeactivateAtomicLoadCache(owner)
+		defer DeactivateAtomicLoadCache(other)
+		pc := reflect.ValueOf((*internalsync.Mutex).Lock).Pointer() + 1
+		const addr = uintptr(0x8f000)
+		completeInternalRMWForTest(d, addr, 4, owner, pc, true, true)
+		if _, direct := completeInternalRMWForTest(d, addr, 4, other, pc, true, true); direct {
+			t.Fatal("foreign context used owner's retained entry")
+		}
+		if _, direct := completeInternalRMWForTest(d, addr, 4, owner, pc, true, true); direct {
+			t.Fatal("stale same-owner release proof bypassed canonical acquire")
+		}
+	})
+
+	t.Run("ordinary", func(t *testing.T) {
+		d := NewDetector()
+		ctx := goroutine.Alloc(105)
+		defer DeactivateAtomicLoadCache(ctx)
+		pc := reflect.ValueOf((*internalsync.Mutex).Lock).Pointer() + 1
+		const addr = uintptr(0x90000)
+		d.OnWrite(addr, ctx, 0x9001)
+		for i := 0; i < 3; i++ {
+			if _, direct := completeInternalRMWForTest(d, addr, 4, ctx, pc, true, true); direct {
+				t.Fatal("direct completion accepted frozen ordinary history")
+			}
+		}
+	})
+
+	t.Run("clear", func(t *testing.T) {
+		d := NewDetector()
+		ctx := goroutine.Alloc(106)
+		defer DeactivateAtomicLoadCache(ctx)
+		pc := reflect.ValueOf((*internalsync.Mutex).Lock).Pointer() + 1
+		const addr = uintptr(0x91000)
+		completeInternalRMWForTest(d, addr, 4, ctx, pc, true, true)
+		completeInternalRMWForTest(d, addr, 4, ctx, pc, true, true)
+		d.ClearShadowRange(addr, 4)
+		if _, direct := completeInternalRMWForTest(d, addr, 4, ctx, pc, true, true); direct {
+			t.Fatal("cleared lifecycle reused dormant direct entry")
+		}
+	})
 }

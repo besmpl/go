@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"runtime/race/kolkov/goroutine"
 	"runtime/race/kolkov/vectorclock"
 )
 
@@ -99,6 +100,24 @@ func TestGoStartFromExplicitContext(t *testing.T) {
 	detachedContextsMu.unlock()
 	if parentRooted {
 		t.Fatal("ended explicit parent remains rooted")
+	}
+}
+
+func TestEnqueueSpawnPreservesPreparedDenseParentAdvance(t *testing.T) {
+	parent := goroutine.Alloc(vectorclock.DenseThreads + 100)
+	defer parent.C.Release()
+
+	spawnID := enqueueSpawn(0x1234, 1<<49, parent)
+	if got := parent.C.Get(parent.TID); got != 2 {
+		t.Fatalf("parent clock after spawn = %d, want 2", got)
+	}
+	spawnClock := consumeSpawnContextByID(spawnID, 1<<49+1)
+	if spawnClock == nil {
+		t.Fatal("spawn clock was not published")
+	}
+	defer spawnClock.Release()
+	if got := spawnClock.Get(parent.TID); got != 1 {
+		t.Fatalf("spawn clock inherited parent clock %d, want 1", got)
 	}
 }
 

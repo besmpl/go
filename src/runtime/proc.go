@@ -1118,6 +1118,12 @@ const (
 
 // Mark gp ready to run.
 func ready(gp *g, traceskip int, next bool) {
+	readyWithWake(gp, traceskip, next, true)
+}
+
+// readyWithWake is the implementation of ready. Suppressing wakep is valid
+// only when the caller will immediately transfer its current P to gp.
+func readyWithWake(gp *g, traceskip int, next, wake bool) {
 	status := readgstatus(gp)
 
 	// Mark runnable.
@@ -1135,7 +1141,9 @@ func ready(gp *g, traceskip int, next bool) {
 		traceRelease(trace)
 	}
 	runqput(mp.p.ptr(), gp, next)
-	wakep()
+	if wake {
+		wakep()
+	}
 	releasem(mp)
 }
 

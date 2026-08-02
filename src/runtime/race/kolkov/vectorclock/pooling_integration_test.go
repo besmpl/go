@@ -109,7 +109,14 @@ func TestVectorClockPooling_Integration(t *testing.T) {
 		clock.Set(0, 11)
 		clock.Set(DenseThreads+10_000, 12)
 		clock.RetireRange(9, 10)
+		root := clock.Freeze()
+		if root == nil || clock.base != root {
+			t.Fatal("test clock did not install its immutable base")
+		}
 		clock.Release()
+		if clock.base != nil {
+			t.Fatal("Release retained an immutable base before pool publication")
+		}
 
 		poolCursor.Store(selectedShard)
 		reused := NewFromPool()
@@ -120,7 +127,7 @@ func TestVectorClockPooling_Integration(t *testing.T) {
 			t.Fatalf("checked-out shard tag = %d, want %d", reused.poolShard, selectedShard)
 		}
 		if reused.maxDense != 0 || reused.GetMaxTID() != 0 || reused.Get(0) != 0 ||
-			len(reused.denseTail) != 0 || len(reused.sparseRuns) != 0 || len(reused.retired) != 0 {
+			reused.base != nil || len(reused.denseTail) != 0 || len(reused.sparseRuns) != 0 || len(reused.retired) != 0 {
 			t.Fatalf("reused clock was not empty: maxDense=%d maxTID=%d tail/runs/retired=%d/%d/%d",
 				reused.maxDense, reused.GetMaxTID(), len(reused.denseTail), len(reused.sparseRuns), len(reused.retired))
 		}

@@ -41,13 +41,20 @@ func TestRaceContextLayoutOffsets(t *testing.T) {
 		t.Fatalf("ReadCacheWidths offset = %d, want %d", got, readWidthOffset)
 	}
 	var loadEntry AtomicLoadCacheEntry
+	var rmwEntry AtomicRMWCacheEntry
 	if ptrSize == 8 {
 		const (
 			atomicCacheOffset = uintptr(96)
-			wantSize          = uintptr(360)
+			wantSize          = uintptr(536)
 		)
 		if got := unsafe.Offsetof(ctx.AtomicReleaseCache); got != atomicCacheOffset {
 			t.Fatalf("AtomicReleaseCache offset = %d, want %d", got, atomicCacheOffset)
+		}
+		if got := unsafe.Offsetof(ctx.AtomicRMWCache); got != 408 {
+			t.Fatalf("AtomicRMWCache offset = %d, want 408", got)
+		}
+		if got := unsafe.Sizeof(rmwEntry); got != 32 {
+			t.Fatalf("AtomicRMWCacheEntry size = %d, want 32", got)
 		}
 		if got := unsafe.Offsetof(ctx.ForeignGeneration); got != 344 {
 			t.Fatalf("ForeignGeneration offset = %d, want 344", got)
@@ -57,6 +64,27 @@ func TestRaceContextLayoutOffsets(t *testing.T) {
 		}
 		if got := unsafe.Sizeof(loadEntry); got != 56 {
 			t.Fatalf("AtomicLoadCacheEntry size = %d, want 56", got)
+		}
+		if got := unsafe.Offsetof(ctx.WriteCacheWidth); got != 355 {
+			t.Fatalf("WriteCacheWidth offset = %d, want 355", got)
+		}
+		if got := unsafe.Offsetof(ctx.WriteCacheAddr); got != 360 {
+			t.Fatalf("WriteCacheAddr offset = %d, want 360", got)
+		}
+		if got := unsafe.Offsetof(ctx.WriteCacheState); got != 368 {
+			t.Fatalf("WriteCacheState offset = %d, want 368", got)
+		}
+		if got := unsafe.Offsetof(ctx.WriteCacheSlot); got != 376 {
+			t.Fatalf("WriteCacheSlot offset = %d, want 376", got)
+		}
+		if got := unsafe.Offsetof(ctx.WriteCacheVersion); got != 384 {
+			t.Fatalf("WriteCacheVersion offset = %d, want 384", got)
+		}
+		if got := unsafe.Offsetof(ctx.ReadCacheGeneration); got != 392 {
+			t.Fatalf("ReadCacheGeneration offset = %d, want 392", got)
+		}
+		if got := unsafe.Offsetof(ctx.WriteCacheReadGeneration); got != 400 {
+			t.Fatalf("WriteCacheReadGeneration offset = %d, want 400", got)
 		}
 		if got := unsafe.Sizeof(ctx); got != wantSize {
 			t.Fatalf("RaceContext size = %d, want %d", got, wantSize)
@@ -68,6 +96,12 @@ func TestRaceContextLayoutOffsets(t *testing.T) {
 		if got := unsafe.Offsetof(ctx.AtomicLoadCache); got != 120 {
 			t.Fatalf("AtomicLoadCache offset = %d, want 120", got)
 		}
+		if got := unsafe.Offsetof(ctx.AtomicRMWCache); got != 288 {
+			t.Fatalf("AtomicRMWCache offset = %d, want 288", got)
+		}
+		if got := unsafe.Sizeof(rmwEntry); got != 20 {
+			t.Fatalf("AtomicRMWCacheEntry size = %d, want 20", got)
+		}
 		if got := unsafe.Offsetof(ctx.ForeignGeneration); got != 240 {
 			t.Fatalf("ForeignGeneration offset = %d, want 240", got)
 		}
@@ -77,9 +111,63 @@ func TestRaceContextLayoutOffsets(t *testing.T) {
 		if got := unsafe.Sizeof(loadEntry); got != 40 {
 			t.Fatalf("AtomicLoadCacheEntry size = %d, want 40", got)
 		}
-		if got := unsafe.Sizeof(ctx); got != 252 {
-			t.Fatalf("RaceContext size = %d, want 252", got)
+		if got := unsafe.Offsetof(ctx.WriteCacheWidth); got != 251 {
+			t.Fatalf("WriteCacheWidth offset = %d, want 251", got)
 		}
+		if got := unsafe.Offsetof(ctx.WriteCacheAddr); got != 252 {
+			t.Fatalf("WriteCacheAddr offset = %d, want 252", got)
+		}
+		if got := unsafe.Offsetof(ctx.WriteCacheState); got != 256 {
+			t.Fatalf("WriteCacheState offset = %d, want 256", got)
+		}
+		if got := unsafe.Offsetof(ctx.WriteCacheSlot); got != 260 {
+			t.Fatalf("WriteCacheSlot offset = %d, want 260", got)
+		}
+		if got := unsafe.Offsetof(ctx.WriteCacheVersion); got != 264 {
+			t.Fatalf("WriteCacheVersion offset = %d, want 264", got)
+		}
+		if got := unsafe.Offsetof(ctx.ReadCacheGeneration); got != 272 {
+			t.Fatalf("ReadCacheGeneration offset = %d, want 272", got)
+		}
+		if got := unsafe.Offsetof(ctx.WriteCacheReadGeneration); got != 280 {
+			t.Fatalf("WriteCacheReadGeneration offset = %d, want 280", got)
+		}
+		if got := unsafe.Sizeof(ctx); got != 364 {
+			t.Fatalf("RaceContext size = %d, want 364", got)
+		}
+	}
+}
+
+func TestReadCacheGenerationInvalidatesWriteCertificateOnPublication(t *testing.T) {
+	ctx := Alloc(17)
+	ctx.WriteCacheAddr = 0x1234
+	ctx.RecordReadSized(0x2000, 8, nil)
+	if ctx.ReadCacheGeneration != 1 {
+		t.Fatalf("first publication generation = %d, want 1", ctx.ReadCacheGeneration)
+	}
+	if ctx.WriteCacheAddr != 0x1234 {
+		t.Fatalf("non-wrapping publication cleared certificate addr %#x", ctx.WriteCacheAddr)
+	}
+
+	ctx.ReadCacheGeneration = ^uint64(0)
+	ctx.WriteCacheAddr = 0x5678
+	ctx.WriteCacheState = unsafe.Pointer(new(byte))
+	ctx.WriteCacheSlot = unsafe.Pointer(new(byte))
+	ctx.WriteCacheWidth = 8
+	ctx.WriteCacheVersion = 42
+	ctx.WriteCacheReadGeneration = 17
+	ctx.RecordAddressOnlyReadRange(0x3000, 4)
+	if ctx.ReadCacheGeneration != 1 {
+		t.Fatalf("wrapped publication generation = %d, want 1", ctx.ReadCacheGeneration)
+	}
+	if ctx.WriteCacheAddr != 0 {
+		t.Fatalf("wrapped publication retained certificate addr %#x", ctx.WriteCacheAddr)
+	}
+	if ctx.WriteCacheState != nil || ctx.WriteCacheSlot != nil || ctx.WriteCacheWidth != 0 ||
+		ctx.WriteCacheVersion != 0 || ctx.WriteCacheReadGeneration != 0 {
+		t.Fatalf("wrapped publication retained certificate metadata: state=%p slot=%p width=%d version=%d read-generation=%d",
+			ctx.WriteCacheState, ctx.WriteCacheSlot, ctx.WriteCacheWidth,
+			ctx.WriteCacheVersion, ctx.WriteCacheReadGeneration)
 	}
 }
 
@@ -166,6 +254,22 @@ func TestHighLogicalIDInheritance(t *testing.T) {
 	tid, clock := child.Epoch.Decode()
 	if tid != 1<<24+9 || clock != 1 {
 		t.Fatalf("child epoch = %d@%d, want 1@%d", clock, tid, uint32(1<<24+9))
+	}
+}
+
+func TestHighLogicalIDInheritancePreservesPreparedParentAdvance(t *testing.T) {
+	parent := Alloc(vectorclock.DenseThreads + 120)
+	defer parent.C.Release()
+	next := parent.PreflightClockAdvance()
+	child := AllocWithParentClock(vectorclock.DenseThreads+121, parent.C, 1)
+	defer child.C.Release()
+	parent.CommitClockAdvance(next)
+
+	if got := parent.C.Get(parent.TID); got != 2 {
+		t.Fatalf("parent clock after prepared fork = %d, want 2", got)
+	}
+	if got := child.C.Get(parent.TID); got != 1 {
+		t.Fatalf("child inherited parent clock %d, want 1", got)
 	}
 }
 
@@ -350,6 +454,55 @@ func TestClockAdvancePreflightAndCommit(t *testing.T) {
 	}
 }
 
+func TestKnownClockAdvanceMatchesCheckedCommit(t *testing.T) {
+	checked := Alloc(117)
+	known := Alloc(117)
+	defer checked.C.Release()
+	defer known.C.Release()
+
+	const addr = uintptr(0x1170)
+	checked.RecordRead(addr, unsafe.Pointer(new(byte)))
+	known.RecordRead(addr, unsafe.Pointer(new(byte)))
+	checked.InvalidateReadCacheAt(checked.Epoch)
+	known.InvalidateReadCacheAt(known.Epoch)
+
+	next := checked.PreflightClockAdvance()
+	current := known.C.Get(known.TID)
+	checked.CommitClockAdvance(next)
+	known.CommitKnownClockAdvance(current)
+
+	if !checked.C.LessOrEqual(known.C) || !known.C.LessOrEqual(checked.C) || checked.Epoch != known.Epoch {
+		t.Fatalf("known commit diverged: checked C=%v epoch=%s, known C=%v epoch=%s", checked.C, checked.Epoch, known.C, known.Epoch)
+	}
+	if checked.ReadCache != known.ReadCache || checked.ReadCacheStates != known.ReadCacheStates ||
+		checked.ReadCacheWidths != known.ReadCacheWidths {
+		t.Fatal("known commit weakened caches differently from checked commit")
+	}
+	if checked.ReadCacheInvalidatedClock.Load() != known.ReadCacheInvalidatedClock.Load() {
+		t.Fatal("known commit cleared external read-cache invalidation differently")
+	}
+}
+
+func TestKnownClockAdvanceFromImmutableOwnBase(t *testing.T) {
+	const tid = uint32(60_117)
+	ctx := Alloc(tid)
+	defer ctx.C.Release()
+	ctx.C.Set(9, 13)
+	ctx.C.Freeze()
+
+	next := ctx.PreflightClockAdvance()
+	ctx.CommitKnownClockAdvance(uint32(next - 1))
+	if got := ctx.C.Get(tid); got != 2 {
+		t.Fatalf("own clock after base-backed commit = %d, want 2", got)
+	}
+	if got := ctx.C.Get(9); got != 13 {
+		t.Fatalf("foreign base clock changed to %d, want 13", got)
+	}
+	if ctx.Epoch != epoch.NewEpoch(tid, 2) {
+		t.Fatalf("epoch after base-backed commit = %s, want 2@%d", ctx.Epoch, tid)
+	}
+}
+
 func TestClockAdvanceRejectsNonSuccessor(t *testing.T) {
 	if os.Getenv("KOLKOV_NON_SUCCESSOR_CLOCK") == "1" {
 		ctx := Alloc(18)
@@ -465,6 +618,12 @@ func TestReadCacheLifecycle(t *testing.T) {
 	if !ctx.HasReadHintSized(addr2, 1) || ctx.HasReadHintSized(addr2, 2) {
 		t.Fatal("weak cache hint did not preserve exact address and width")
 	}
+	capability := unsafe.Pointer(&ctx)
+	ctx.RecordPromotedReadCapability(addr2, 1, capability)
+	ctx.IncrementClock()
+	if got := ctx.LookupPromotedReadCapability(addr2, 1); got != capability {
+		t.Fatal("clock advance discarded non-semantic promoted capability")
+	}
 
 	ctx.RecordRead(addr, state)
 	ctx.RecordRead(addr2, state2)
@@ -477,6 +636,24 @@ func TestReadCacheLifecycle(t *testing.T) {
 	}
 	if ctx.ReadCacheWidths != [ReadCacheSlots]uint8{} {
 		t.Fatalf("ClearReadCache retained widths %#v", ctx.ReadCacheWidths)
+	}
+	if ctx.PromotedReadAddr != 0 || ctx.PromotedReadCap != nil || ctx.PromotedReadWidth != 0 {
+		t.Fatal("ClearReadCache retained promoted capability")
+	}
+}
+
+func TestWriteInvalidatesOverlappingPromotedCapability(t *testing.T) {
+	ctx := Alloc(19)
+	capability := unsafe.Pointer(&ctx)
+	ctx.RecordPromotedReadCapability(0x2000, 8, capability)
+	ctx.InvalidateReadRange(0x2004, 1)
+	if got := ctx.LookupPromotedReadCapability(0x2000, 8); got != nil {
+		t.Fatal("overlapping write retained promoted capability")
+	}
+	ctx.RecordPromotedReadCapability(0x2000, 8, capability)
+	ctx.InvalidateReadRange(0x3000, 8)
+	if got := ctx.LookupPromotedReadCapability(0x2000, 8); got != capability {
+		t.Fatal("unrelated write evicted promoted capability")
 	}
 }
 
@@ -842,6 +1019,19 @@ func BenchmarkIncrementClock(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		ctx.IncrementClock()
+	}
+}
+
+// BenchmarkCommitKnownClockAdvance includes the warmed-path preflight read but
+// commits its already-bounded value without a second vector-clock lookup.
+func BenchmarkCommitKnownClockAdvance(b *testing.B) {
+	ctx := Alloc(42)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		current := uint32(ctx.GetEpoch())
+		ctx.C.PrepareKnownMonotonicSet(ctx.TID)
+		ctx.CommitKnownClockAdvance(current)
 	}
 }
 

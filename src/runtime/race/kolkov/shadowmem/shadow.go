@@ -1,5 +1,16 @@
 package shadowmem
 
+// OrdinaryFastResult reports whether an optimistic ordinary-memory
+// transaction completed and whether its exact authoritative state may be
+// published in the per-context redundant-read cache.
+type OrdinaryFastResult uint8
+
+const (
+	OrdinaryFastMiss OrdinaryFastResult = iota
+	OrdinaryFastHandled
+	OrdinaryFastHandledCacheable
+)
+
 // Shadow is the interface for shadow memory implementations.
 //
 // All shadow memory backends must implement this interface to be used

@@ -76,7 +76,8 @@ type spinlock struct {
 
 // Keep the maximum pause short enough to react promptly to an unlock while
 // reducing cache-line traffic under contention. On g0 the runtime helper uses
-// bounded procyield, then an OS-thread yield at this cap.
+// bounded procyield; user-stack test callers may yield their goroutine at the
+// cap, while production g0 callers keep using procyield for these short locks.
 const spinlockMaxBackoff = uint32(64)
 
 //go:nosplit
@@ -172,7 +173,7 @@ type VarState struct {
 	readEpochs  [maxInlineReaders]epoch.Epoch // Inline reader slots (32 bytes = 4 × 8).
 	readerCount uint8                         // Number of inline readers (0-4, or 255 if promoted).
 	lifecycleID lifecycleID                   // Allocator generation, packed into readerCount's alignment gap.
-	readClock   *vectorclock.VectorClock      // Promoted actual-read event frontier (8-byte pointer + clock allocation).
+	readClock   *promotedReadFrontier         // Promoted actual-read event frontier (8-byte sidecar pointer).
 
 	// Hash references to stack depot for the previous write/read.
 	// Enables complete race reports showing both current and previous stacks.
@@ -185,6 +186,194 @@ type VarState struct {
 	// ShadowSlot. accessMu serializes attachment/reset and copy-on-write; cloned
 	// ordinary groups share the binding, whose detector lock serializes history.
 	atomicState atomic.Pointer[AtomicFastPath]
+}
+
+// ordinaryFastPlan is a prevalidated, allocation-free ordinary transition.
+// A successful plan retains vs.mu until finishOrdinaryFastPlan is called. The
+// enclosing PageTable transaction also retains accessMu, so every field in the
+// plan remains stable and a rejected plan has not changed semantic state.
+type ordinaryFastPlan struct {
+	before ordinaryFastHistory
+	after  ordinaryFastHistory
+}
+
+// ordinaryFastHistory is the exact allocation-free subset shared by compact
+// and materialized ordinary histories. It intentionally mirrors the canonical
+// transition fields rather than retaining representation-specific pointers.
+type ordinaryFastHistory struct {
+	write           epoch.Epoch
+	read            epoch.Epoch
+	exclusiveWriter int64
+	writePC         uintptr
+	readPC          uintptr
+	writeCount      uint32
+	lifecycle       lifecycleID
+}
+
+func ordinaryFastHappensBefore(e epoch.Epoch, clock *vectorclock.VectorClock) bool {
+	return e == 0 || clock != nil && e.HappensBefore(clock)
+}
+
+func (history ordinaryFastHistory) afterRead(current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr) (ordinaryFastHistory, bool) {
+	if current == 0 || !ordinaryFastHappensBefore(history.write, clock) {
+		return ordinaryFastHistory{}, false
+	}
+	next := history
+	next.readPC = pc
+	if history.read == current {
+		return next, true
+	}
+	if history.read == 0 {
+		next.read = current
+		return next, true
+	}
+	existingTID, _ := history.read.Decode()
+	currentTID, _ := current.Decode()
+	if existingTID == currentTID || ordinaryFastHappensBefore(history.read, clock) {
+		next.read = current
+		return next, true
+	}
+	return ordinaryFastHistory{}, false
+}
+
+func (history ordinaryFastHistory) afterWrite(current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr) (ordinaryFastHistory, bool) {
+	if current == 0 || !ordinaryFastHappensBefore(history.write, clock) ||
+		!ordinaryFastHappensBefore(history.read, clock) {
+		return ordinaryFastHistory{}, false
+	}
+	next := history
+	if history.write == current && history.read == 0 {
+		next.writePC = pc
+		return next, true
+	}
+	currentTID, _ := current.Decode()
+	if next.exclusiveWriter == 0 {
+		next.exclusiveWriter = int64(currentTID)
+	} else if next.exclusiveWriter > 0 && next.exclusiveWriter != int64(currentTID) {
+		next.exclusiveWriter = -1
+	}
+	next.write = current
+	next.writeCount++
+	next.writePC = pc
+	next.read = 0
+	return next, true
+}
+
+// tryOrdinaryFastPlan proves the simple, non-promoted subset of the canonical
+// FastTrack transition without changing history. The optional expected
+// descriptor binds a compact membership to its exact immutable publication.
+// Returning true transfers ownership of vs.mu to the caller.
+func (vs *VarState) tryOrdinaryFastPlan(current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr, write bool, expected *ordinaryFastHistory) (ordinaryFastPlan, bool) {
+	if current == 0 || vs.atomicState.Load() != nil || !vs.mu.tryLock() {
+		return ordinaryFastPlan{}, false
+	}
+
+	// The optimistic path never allocates. Multi-reader and promoted histories
+	// may require promotion, clock pruning, or pooled-clock release, so leave
+	// them to the canonical transaction.
+	if vs.readClock != nil || vs.readerCount > 1 ||
+		vs.readerState.Load() != uint32(vs.readerCount) {
+		vs.mu.unlock()
+		return ordinaryFastPlan{}, false
+	}
+
+	read := epoch.Epoch(0)
+	switch vs.readerCount {
+	case 0:
+		if vs.readEpoch0.Load() != 0 {
+			vs.mu.unlock()
+			return ordinaryFastPlan{}, false
+		}
+	case 1:
+		read = epoch.Epoch(vs.readEpoch0.Load())
+		if read == 0 || vs.readEpochs[0] != read {
+			vs.mu.unlock()
+			return ordinaryFastPlan{}, false
+		}
+	default:
+		vs.mu.unlock()
+		return ordinaryFastPlan{}, false
+	}
+	for i := int(vs.readerCount); i < len(vs.readEpochs); i++ {
+		if vs.readEpochs[i] != 0 {
+			vs.mu.unlock()
+			return ordinaryFastPlan{}, false
+		}
+	}
+
+	writeEpoch := epoch.Epoch(vs.W.Load())
+	owner := vs.exclusiveWriter.Load()
+	if owner < -1 || writeEpoch == 0 &&
+		(owner != 0 || vs.writeCount != 0 || vs.writePC.Load() != 0) {
+		vs.mu.unlock()
+		return ordinaryFastPlan{}, false
+	}
+	if writeEpoch != 0 && owner >= 0 {
+		writeTID, _ := writeEpoch.Decode()
+		if owner != int64(writeTID) {
+			vs.mu.unlock()
+			return ordinaryFastPlan{}, false
+		}
+	}
+
+	plan := ordinaryFastPlan{before: ordinaryFastHistory{
+		write:           writeEpoch,
+		read:            read,
+		exclusiveWriter: owner,
+		writePC:         vs.writePC.Load(),
+		readPC:          vs.readPC.Load(),
+		writeCount:      vs.writeCount,
+		lifecycle:       vs.lifecycleID,
+	}}
+	if expected != nil {
+		// Compact descriptors deliberately exclude side metadata. A state with
+		// stack metadata cannot be the exact compact publication it claims to be.
+		if vs.writeStackHash != 0 || vs.readStackHash != 0 || plan.before != *expected {
+			vs.mu.unlock()
+			return ordinaryFastPlan{}, false
+		}
+	}
+
+	next := ordinaryFastHistory{}
+	var ok bool
+	if write {
+		next, ok = plan.before.afterWrite(current, clock, pc)
+	} else {
+		next, ok = plan.before.afterRead(current, clock, pc)
+	}
+	if !ok || vs.atomicState.Load() != nil || vs.lifecycleID != plan.before.lifecycle {
+		vs.mu.unlock()
+		return ordinaryFastPlan{}, false
+	}
+	plan.after = next
+	return plan, true
+}
+
+// finishOrdinaryFastPlan commits a previously proved plan and releases vs.mu.
+// Passing commit=false is an unchanged semantic miss.
+func (vs *VarState) finishOrdinaryFastPlan(plan ordinaryFastPlan, commit bool) {
+	if commit {
+		next := plan.after
+		vs.W.Store(uint64(next.write))
+		vs.exclusiveWriter.Store(next.exclusiveWriter)
+		vs.writePC.Store(next.writePC)
+		vs.readPC.Store(next.readPC)
+		vs.writeCount = next.writeCount
+		for i := range vs.readEpochs {
+			vs.readEpochs[i] = 0
+		}
+		if next.read == 0 {
+			vs.readerCount = 0
+			vs.readEpoch0.Store(0)
+			vs.readerState.Store(0)
+		} else {
+			vs.readerCount = 1
+			vs.readEpochs[0] = next.read
+			vs.readEpoch0.Store(uint64(next.read))
+			vs.readerState.Store(1)
+		}
+	}
+	vs.mu.unlock()
 }
 
 // LockAccess starts one linearized detector access to this exact address.
@@ -206,6 +395,16 @@ func (vs *VarState) TryLockAccess() bool {
 //go:nosplit
 func (vs *VarState) UnlockAccess() {
 	vs.accessMu.unlock()
+}
+
+// ClosePromotedReadFrontier permanently excludes lock-free promoted reads
+// before an exclusive mutation. It is idempotent and allocation-free.
+//
+//go:nosplit
+func (vs *VarState) ClosePromotedReadFrontier() {
+	if frontier := vs.readClock; frontier != nil {
+		frontier.close()
+	}
 }
 
 // GetAtomicState returns the opaque detector-owned history in the current
@@ -237,6 +436,7 @@ func (vs *VarState) SetAtomicStateOwned(state unsafe.Pointer, retain, release fu
 	if state == nil {
 		runtimeThrow("race detector cannot publish a nil atomic sidecar")
 	}
+	vs.ClosePromotedReadFrontier()
 	if retain != nil {
 		retain(state)
 	}
@@ -258,6 +458,7 @@ func (vs *VarState) SetAtomicStateOwned(state unsafe.Pointer, retain, release fu
 // drains slow transactions; the release callback may therefore reclaim all
 // sidecar metadata immediately.
 func (vs *VarState) DetachAtomicStateLocked() {
+	vs.ClosePromotedReadFrontier()
 	binding := vs.atomicState.Load()
 	if binding == nil {
 		return
@@ -287,6 +488,10 @@ func NewVarState() *VarState {
 // protects width-aware per-lane history, so copy-on-write ordinary groups can
 // safely retain the same overlay while their FastTrack histories diverge.
 func (vs *VarState) CloneOrdinaryLocked() *VarState {
+	// Copy-on-write is an exclusive representation mutation. Close before
+	// snapshotting so every stable node is included and every odd publisher is
+	// forced to retry against the post-COW mapping.
+	vs.ClosePromotedReadFrontier()
 	clone := &VarState{lifecycleID: vs.lifecycleID}
 	clone.W.Store(vs.W.Load())
 	clone.exclusiveWriter.Store(vs.exclusiveWriter.Load())
@@ -305,7 +510,9 @@ func (vs *VarState) CloneOrdinaryLocked() *VarState {
 	clone.readEpochs = vs.readEpochs
 	clone.readerCount = vs.readerCount
 	if vs.readClock != nil {
-		clone.readClock = vs.readClock.Clone()
+		vs.readClock.refreshLegacyLocked()
+		clone.readClock = newPromotedReadFrontier(vs.readClock.legacy.Clone(), clone.GetLifecycleID())
+		clone.readClock.close()
 	}
 	clone.writeStackHash = vs.writeStackHash
 	clone.readStackHash = vs.readStackHash
@@ -332,6 +539,7 @@ func (vs *VarState) GetLifecycleID() uint64 {
 func (vs *VarState) Reset() {
 	vs.LockAccess()
 	defer vs.UnlockAccess()
+	vs.ClosePromotedReadFrontier()
 	// A retained atomic capability does not hold accessMu. Close and drain it
 	// before changing any ordinary field, detector overlay, or lifecycle byte so
 	// fast completion observes either the complete old generation or the
@@ -349,8 +557,8 @@ func (vs *VarState) Reset() {
 	vs.readerState.Store(0)
 	vs.readEpoch0.Store(0)
 	// Release VectorClock back to pool if promoted.
-	if vs.readClock != nil {
-		vs.readClock.Release()
+	if vs.readClock != nil && vs.readClock.legacy != nil {
+		vs.readClock.legacy.Release()
 	}
 	// Clear all inline reader slots.
 	for i := range vs.readEpochs {
@@ -406,7 +614,7 @@ func (vs *VarState) PromoteToReadClock(current epoch.Epoch, observed *vectorcloc
 	// Another reader may have completed promotion while this caller waited.
 	// Record only this completed read in the already-published event set.
 	if vs.readerCount == promotedMarker {
-		recordPromotedRead(vs.readClock, current, observed)
+		recordPromotedRead(vs.readClock.legacy, current, observed)
 		return
 	}
 
@@ -417,22 +625,22 @@ func (vs *VarState) PromoteToReadClock(current epoch.Epoch, observed *vectorcloc
 	}
 
 	// Allocate VectorClock from pool for promoted read tracking.
-	vs.readClock = vectorclock.NewFromPool()
+	vs.readClock = newPromotedReadFrontier(vectorclock.NewFromPool(), vs.GetLifecycleID())
 
 	// Copy ALL inline reader epochs into VectorClock.
 	for i := uint8(0); i < vs.readerCount && i < maxInlineReaders; i++ {
 		if vs.readEpochs[i] != 0 {
 			tid, clock := vs.readEpochs[i].Decode()
 			//nolint:gosec // G115: Epoch clock is uint64, but per-thread VectorClock uses uint32 (safe truncation).
-			vs.readClock.Set(tid, uint32(clock))
+			vs.readClock.legacy.Set(tid, uint32(clock))
 		}
 	}
 
 	// readClock is an event set, not a causal VectorClock snapshot. Recording
 	// the reader's full causal clock would manufacture reads by every thread
 	// that this reader has merely observed.
-	pruneObservedReadEvents(vs.readClock, observed)
-	setReadClockEpoch(vs.readClock, current)
+	pruneObservedReadEvents(vs.readClock.legacy, observed)
+	setReadClockEpoch(vs.readClock.legacy, current)
 
 	// Clear inline slots and mark as promoted.
 	for i := range vs.readEpochs {
@@ -453,7 +661,7 @@ func pruneObservedReadEvents(readClock, observed *vectorclock.VectorClock) {
 	if readClock == nil || observed == nil {
 		return
 	}
-	readClock.PruneLessOrEqual(observed)
+	readClock.PruneEventSetLessOrEqual(observed)
 }
 
 func setReadClockEpoch(readClock *vectorclock.VectorClock, read epoch.Epoch) {
@@ -577,7 +785,7 @@ func (vs *VarState) SetReadEpoch(e epoch.Epoch) {
 	if vs.readerCount == promotedMarker {
 		// A reader racing with promotion must join the published read clock,
 		// rather than writing the retired inline mirror.
-		setReadClockEpoch(vs.readClock, e)
+		setReadClockEpoch(vs.readClock.legacy, e)
 		return
 	}
 
@@ -665,7 +873,15 @@ func (vs *VarState) HasInlineSlot() bool {
 // Note: Removed //go:nosplit because sync.Mutex.Lock() requires stack space.
 func (vs *VarState) GetReadClock() *vectorclock.VectorClock {
 	vs.mu.lock()
-	rc := vs.readClock
+	frontier := vs.readClock
+	if frontier != nil {
+		frontier.close()
+		frontier.refreshLegacyLocked()
+	}
+	var rc *vectorclock.VectorClock
+	if frontier != nil {
+		rc = frontier.legacy
+	}
 	vs.mu.unlock()
 	return rc
 }
@@ -680,7 +896,7 @@ func (vs *VarState) JoinReadClock(e epoch.Epoch, observed *vectorclock.VectorClo
 	defer vs.mu.unlock()
 
 	if vs.readerCount == promotedMarker && vs.readClock != nil {
-		recordPromotedRead(vs.readClock, e, observed)
+		recordPromotedRead(vs.readClock.legacy, e, observed)
 		return
 	}
 
@@ -717,15 +933,15 @@ func (vs *VarState) JoinReadClock(e epoch.Epoch, observed *vectorclock.VectorClo
 
 	// All inline slots were filled after the stale promoted observation.
 	// Promote the actual inline read events and this completed read.
-	vs.readClock = vectorclock.NewFromPool()
+	vs.readClock = newPromotedReadFrontier(vectorclock.NewFromPool(), vs.GetLifecycleID())
 	for i := uint8(0); i < vs.readerCount && i < maxInlineReaders; i++ {
 		if vs.readEpochs[i] != 0 {
 			readerTID, clock := vs.readEpochs[i].Decode()
 			//nolint:gosec // Epoch clocks intentionally use VectorClock's uint32 representation.
-			vs.readClock.Set(readerTID, uint32(clock))
+			vs.readClock.legacy.Set(readerTID, uint32(clock))
 		}
 	}
-	setReadClockEpoch(vs.readClock, e)
+	setReadClockEpoch(vs.readClock.legacy, e)
 	for i := range vs.readEpochs {
 		vs.readEpochs[i] = 0
 	}
@@ -737,8 +953,12 @@ func (vs *VarState) JoinReadClock(e epoch.Epoch, observed *vectorclock.VectorClo
 // ReadClockHappensBefore reports whether every promoted reader happens before
 // vc. The comparison is serialized with concurrent reader joins and demotion.
 func (vs *VarState) ReadClockHappensBefore(vc *vectorclock.VectorClock) bool {
+	vs.ClosePromotedReadFrontier()
 	vs.mu.lock()
-	result := vs.readClock == nil || vs.readClock.HappensBefore(vc)
+	if vs.readClock != nil {
+		vs.readClock.refreshLegacyLocked()
+	}
+	result := vs.readClock == nil || vs.readClock.legacy.HappensBefore(vc)
 	vs.mu.unlock()
 	return result
 }
@@ -747,12 +967,24 @@ func (vs *VarState) ReadClockHappensBefore(vc *vectorclock.VectorClock) bool {
 // vc. The caller normally holds the access lock; mu stabilizes both inline and
 // promoted read representations while they are inspected.
 func (vs *VarState) FirstConcurrentRead(vc *vectorclock.VectorClock) (epoch.Epoch, bool) {
+	vs.ClosePromotedReadFrontier()
 	vs.mu.lock()
 	defer vs.mu.unlock()
 
 	if vs.readerCount == promotedMarker && vs.readClock != nil {
+		for node := vs.readClock.head.Load(); node != nil; node = node.next {
+			read, pc, stable := node.stableEpochPC()
+			if stable && read != 0 && !read.HappensBefore(vc) {
+				// Preserve the PC paired with the exact witness selected below.
+				// The frontier is closed and the caller holds accessMu, so this
+				// diagnostic publication cannot be displaced by another reader.
+				vs.readPC.Store(pc)
+				return read, true
+			}
+		}
+		vs.readClock.refreshLegacyLocked()
 		var concurrent epoch.Epoch
-		vs.readClock.Range(func(tid, clock uint32) bool {
+		vs.readClock.legacy.Range(func(tid, clock uint32) bool {
 			if clock > vc.Get(tid) {
 				concurrent = epoch.NewEpoch(tid, uint64(clock))
 				return false
@@ -781,12 +1013,14 @@ func (vs *VarState) FirstConcurrentRead(vc *vectorclock.VectorClock) (epoch.Epoc
 //
 // A promoted VectorClock is returned to its pool.
 func (vs *VarState) Demote() {
+	vs.ClosePromotedReadFrontier()
 	vs.mu.lock()
 	defer vs.mu.unlock()
 
 	// Release VectorClock back to pool if promoted.
-	if vs.readClock != nil {
-		vs.readClock.Release()
+	if vs.readClock != nil && vs.readClock.legacy != nil {
+		vs.readClock.refreshLegacyLocked()
+		vs.readClock.legacy.Release()
 	}
 	// Clear all inline reader slots.
 	for i := range vs.readEpochs {
@@ -818,6 +1052,7 @@ func (vs *VarState) GetW() epoch.Epoch {
 //
 //go:nosplit
 func (vs *VarState) SetW(e epoch.Epoch) {
+	vs.ClosePromotedReadFrontier()
 	vs.W.Store(uint64(e))
 }
 
@@ -837,6 +1072,7 @@ func (vs *VarState) SetW(e epoch.Epoch) {
 //
 //go:nosplit
 func (vs *VarState) CompareAndSwapW(oldVal, newVal epoch.Epoch) bool {
+	vs.ClosePromotedReadFrontier()
 	return vs.W.CompareAndSwap(uint64(oldVal), uint64(newVal))
 }
 
@@ -946,12 +1182,14 @@ func (vs *VarState) String() string {
 	// Note: We manually build the string to avoid fmt import overhead.
 	wStr := "W:" + vs.GetW().String()
 
+	vs.ClosePromotedReadFrontier()
 	vs.mu.lock()
 	defer vs.mu.unlock()
 
 	if vs.readerCount == promotedMarker && vs.readClock != nil {
+		vs.readClock.refreshLegacyLocked()
 		// Promoted: Show VectorClock.
-		return wStr + " R:" + vs.readClock.String() + " [PROMOTED]"
+		return wStr + " R:" + vs.readClock.legacy.String() + " [PROMOTED]"
 	}
 
 	// Inline slots: Show all active reader epochs.

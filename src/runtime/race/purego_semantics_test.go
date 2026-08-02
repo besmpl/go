@@ -79,6 +79,65 @@ func main() {
 `,
 		},
 		{
+			name:     "retained-static-scalar-revalidates-foreign-write",
+			wantRace: true,
+			source: `package main
+
+import (
+	"runtime"
+	"sync/atomic"
+)
+
+var value uint64
+var ready uint32
+
+func main() {
+	for i := range 1000 {
+		_ = value
+		value = uint64(i)
+	}
+	start := make(chan struct{})
+	go func() {
+		<-start
+		value = 1001
+		runtime.RaceDisable()
+		atomic.StoreUint32(&ready, 1)
+		runtime.RaceEnable()
+	}()
+	close(start)
+	runtime.RaceDisable()
+	for atomic.LoadUint32(&ready) == 0 {
+		runtime.Gosched()
+	}
+	runtime.RaceEnable()
+	_ = value
+	value = 1002
+}
+`,
+		},
+		{
+			name: "retained-static-scalar-respects-acquire",
+			source: `package main
+
+var value uint64
+
+func main() {
+	for i := range 1000 {
+		_ = value
+		value = uint64(i)
+	}
+	done := make(chan struct{})
+	go func() {
+		value = 1001
+		close(done)
+	}()
+	<-done
+	_ = value
+	value = 1002
+}
+`,
+		},
+		{
 			name: "buffered-channel-slot-handoff",
 			source: `package main
 

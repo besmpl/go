@@ -512,7 +512,10 @@ func enqueueSpawn(pc uintptr, parentGID int64, parentCtx *goroutine.RaceContext)
 	var spawnClock *vectorclock.VectorClock
 	if parentCtx != nil && parentCtx.C != nil {
 		next := parentCtx.PreflightClockAdvance()
-		spawnClock = parentCtx.C.Clone()
+		// Fork snapshots must not turn the live parent's dense tail into a
+		// copy-on-write source after its clock-advance preflight. The parent
+		// commits immediately below, so publish a fully detached child image.
+		spawnClock = parentCtx.C.CloneDetached()
 		parentCtx.CommitClockAdvance(next)
 	}
 	info := &spawnInfo{
@@ -916,6 +919,9 @@ func raceFinalizerGoFromRuntime(racectx uintptr) {
 		target.NoteForeignImport()
 	}
 
+	// The snapshot import may reshape the target's sparse overlay. Re-reserve
+	// the allocation-free own-coordinate successor after the final mutation.
+	target.PreflightClockAdvance()
 	target.CommitClockAdvance(targetNext)
 }
 

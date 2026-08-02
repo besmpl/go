@@ -7,6 +7,64 @@ import (
 	"runtime/race/kolkov/vectorclock"
 )
 
+func BenchmarkOrdinaryFastMaterializedRead(b *testing.B) {
+	pt := NewPageTableShadow()
+	const addr = uintptr(0x70000)
+	state := pt.GetOrCreate(addr)
+	current := epoch.NewEpoch(71, 17)
+	clock := vectorclock.New()
+	clock.Set(71, 17)
+	if result, cached := pt.TryOrdinaryRead(addr, 1, current, clock, 0x7100); result != OrdinaryFastHandledCacheable || cached != state {
+		b.Fatalf("ordinary read warmup = (%v, %p), want cacheable %p", result, cached, state)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if result, cached := pt.TryOrdinaryRead(addr, 1, current, clock, 0x7100); result != OrdinaryFastHandledCacheable || cached != state {
+			b.Fatal("ordinary materialized read missed")
+		}
+	}
+}
+
+func BenchmarkOrdinaryFastCompactRead(b *testing.B) {
+	pt := NewPageTableShadow()
+	const addr = uintptr(0x70080)
+	current := epoch.NewEpoch(72, 19)
+	clock := vectorclock.New()
+	clock.Set(72, 19)
+	if got := pt.TryCompactRead(addr, current, clock, 0x7200); got != CompactReadHandled {
+		b.Fatalf("compact warmup=%v", got)
+	}
+	if result, cached := pt.TryOrdinaryRead(addr, 1, current, clock, 0x7200); result != OrdinaryFastHandledCacheable || cached == nil {
+		b.Fatalf("ordinary compact warmup = (%v, %p)", result, cached)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if result, cached := pt.TryOrdinaryRead(addr, 1, current, clock, 0x7200); result != OrdinaryFastHandledCacheable || cached == nil {
+			b.Fatal("ordinary compact read missed")
+		}
+	}
+}
+
+func BenchmarkOrdinaryFastContentionMiss(b *testing.B) {
+	pt := NewPageTableShadow()
+	const addr = uintptr(0x700c0)
+	state := pt.GetOrCreate(addr)
+	current := epoch.NewEpoch(73, 23)
+	clock := vectorclock.New()
+	clock.Set(73, 23)
+	state.LockAccess()
+	defer state.UnlockAccess()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if result, cached := pt.TryOrdinaryRead(addr, 1, current, clock, 0x7300); result != OrdinaryFastMiss || cached != nil {
+			b.Fatal("contended ordinary read did not miss")
+		}
+	}
+}
+
 // Baseline: Phase 2 behavior (always using Epoch for comparison).
 // We'll simulate this by measuring epoch-only operations.
 

@@ -3,12 +3,15 @@
 package shadowmem
 
 import (
+	"runtime"
 	"testing"
 	"unsafe"
 
 	"runtime/race/kolkov/epoch"
 	"runtime/race/kolkov/vectorclock"
 )
+
+var compactGroupAllocationSink *compactGroup
 
 func TestCompactReadResultDistinguishesMissHandledAndExactNoop(t *testing.T) {
 	pt := NewPageTableShadow()
@@ -44,6 +47,179 @@ func TestCompactGroupsStorageLayout(t *testing.T) {
 	}
 	if got := unsafe.Sizeof(groups.active); got != 4 {
 		t.Fatalf("compactGroups.active width=%d, want 4", got)
+	}
+}
+
+func TestCompactGroupCoLocatesInitialState(t *testing.T) {
+	descriptor := compactHistoryDescriptor{
+		history: compactHistoryKey{
+			write:           epoch.NewEpoch(17, 9),
+			exclusiveWriter: 17,
+			writePC:         0x1700,
+			writeCount:      1,
+		},
+		lifecycle: allocateLifecycleID(),
+	}
+	group := newCompactGroup(descriptor)
+	if state := group.state.Load(); state != &group.initialState {
+		t.Fatalf("initial state=%p, want co-located %p", state, &group.initialState)
+	}
+	if got, ok := compactDescriptorFromState(group.state.Load()); !ok || got != descriptor {
+		t.Fatalf("co-located descriptor=%+v ok=%v, want %+v", got, ok, descriptor)
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		compactGroupAllocationSink = newCompactGroup(descriptor)
+	}); allocs != 1 {
+		t.Fatalf("new compact group allocations=%.2f, want one co-located object", allocs)
+	}
+	compactGroupAllocationSink = nil
+
+	state := func() *VarState {
+		return newCompactGroup(descriptor).state.Load()
+	}()
+	runtime.GC()
+	if got, ok := compactDescriptorFromState(state); !ok || got != descriptor {
+		t.Fatalf("interior state after GC=%+v ok=%v, want %+v", got, ok, descriptor)
+	}
+}
+
+func TestCompactGroupAdaptiveMembership(t *testing.T) {
+	if got, want := unsafe.Sizeof(compactGroup{}), uintptr(224); got != want {
+		t.Fatalf("compact group size=%d, want sparse group size %d", got, want)
+	}
+	group := newCompactGroup(compactHistoryDescriptor{lifecycle: allocateLifecycleID()})
+	compactSetMember(group, 5)
+	compactSetMember(group, 54)
+	if group.members.Load() != nil {
+		t.Fatal("single-word membership allocated a full plane")
+	}
+	if !compactMember(group, 5) || !compactMember(group, 54) || compactMember(group, 55) {
+		t.Fatal("inline membership lookup lost exact bits")
+	}
+
+	// Touching both extreme octets is the exact escape hatch for the two
+	// overlapping 56-lane windows.
+	compactSetMember(group, 0)
+	compactSetMember(group, 63)
+	compactSetMember(group, 64)
+	plane := group.members.Load()
+	if plane == nil {
+		t.Fatal("second membership word did not expand the plane")
+	}
+	if !compactMember(group, 0) || !compactMember(group, 5) || !compactMember(group, 54) || !compactMember(group, 63) || !compactMember(group, 64) {
+		t.Fatal("expanded membership did not preserve exact bits")
+	}
+	compactClearMember(group, 0)
+	compactClearMember(group, 5)
+	compactClearMember(group, 54)
+	compactClearMember(group, 63)
+	compactClearMember(group, 64)
+	if !group.empty() || group.members.Load() != plane {
+		t.Fatal("empty expanded membership collapsed or retained a bit")
+	}
+}
+
+func TestCompactGroupEmptyInlineMembershipRetargetsWithoutExpansion(t *testing.T) {
+	group := newCompactGroup(compactHistoryDescriptor{lifecycle: allocateLifecycleID()})
+	compactSetMember(group, 17)
+	compactClearMember(group, 17)
+	compactSetMember(group, 129)
+	if group.members.Load() != nil {
+		t.Fatal("empty inline membership retarget allocated a full plane")
+	}
+	if compactMember(group, 17) || !compactMember(group, 129) || !group.soleMember(129) {
+		t.Fatal("inline membership retarget was not exact")
+	}
+}
+
+func TestCompactGroupPackedMembershipMatchesBitmapModel(t *testing.T) {
+	group := newCompactGroup(compactHistoryDescriptor{lifecycle: allocateLifecycleID()})
+	var model [compactMembershipWords]uint64
+	x := uint64(0x9e3779b97f4a7c15)
+	for operation := 0; operation < 2000; operation++ {
+		x = x*6364136223846793005 + 1442695040888963407
+		word := int(x & uint64(compactMembershipWords-1))
+		lane := uint((x >> 12) & 63)
+		mask := uint64(1) << lane
+		if x>>63 == 0 {
+			compactSetMembershipMask(group, word, mask)
+			model[word] |= mask
+		} else {
+			compactClearMembershipMask(group, word, mask)
+			model[word] &^= mask
+		}
+		for checkWord, want := range model {
+			if got := group.membershipWord(checkWord); got != want {
+				t.Fatalf("operation %d word %d membership=%#x, want %#x", operation, checkWord, got, want)
+			}
+		}
+	}
+}
+
+func TestCompactGroupPackedMembershipCoversEveryAlignedScalar(t *testing.T) {
+	for word := 0; word < compactMembershipWords; word++ {
+		for lane := uint(0); lane <= 56; lane += 8 {
+			group := newCompactGroup(compactHistoryDescriptor{lifecycle: allocateLifecycleID()})
+			mask := uint64(0xff) << lane
+			compactSetMembershipMask(group, word, mask)
+			if group.members.Load() != nil || group.membershipWord(word) != mask {
+				t.Fatalf("word %d lane %d scalar membership=%#x plane=%p, want packed %#x",
+					word, lane, group.membershipWord(word), group.members.Load(), mask)
+			}
+			clear := uint64(0x18) << lane
+			compactClearMembershipMask(group, word, clear)
+			if got := group.membershipWord(word); got != mask&^clear || group.members.Load() != nil {
+				t.Fatalf("word %d lane %d partial clear=%#x plane=%p, want packed %#x",
+					word, lane, got, group.members.Load(), mask&^clear)
+			}
+		}
+	}
+}
+
+func TestCompactGroupPackedMembershipRewindowsHighSubset(t *testing.T) {
+	group := newCompactGroup(compactHistoryDescriptor{lifecycle: allocateLifecycleID()})
+	const word = 37
+	high := uint64(1)<<8 | uint64(1)<<17 | uint64(1)<<55 | uint64(1)<<63
+	compactSetMembershipMask(group, word, high)
+	if got := group.membershipWord(word); got != high || group.members.Load() != nil {
+		t.Fatalf("high-window membership=%#x plane=%p, want packed %#x", got, group.members.Load(), high)
+	}
+
+	// Removing both boundary lanes lets the same exact subset move to the low
+	// window; adding lane 63 then moves it back to the high window. Neither
+	// repack may allocate the full plane.
+	middle := uint64(1)<<17 | uint64(1)<<55
+	compactClearMembershipMask(group, word, uint64(1)<<8|uint64(1)<<63)
+	if got := group.membershipWord(word); got != middle || group.members.Load() != nil {
+		t.Fatalf("low rewindow membership=%#x plane=%p, want packed %#x", got, group.members.Load(), middle)
+	}
+	compactSetMembershipMask(group, word, uint64(1)<<63)
+	if got, want := group.membershipWord(word), middle|uint64(1)<<63; got != want || group.members.Load() != nil {
+		t.Fatalf("high rewindow membership=%#x plane=%p, want packed %#x", got, group.members.Load(), want)
+	}
+}
+
+func TestCompactGroupMembershipClearNeverAllocates(t *testing.T) {
+	inline := newCompactGroup(compactHistoryDescriptor{lifecycle: allocateLifecycleID()})
+	compactSetMember(inline, 17)
+	if allocs := testing.AllocsPerRun(1000, func() {
+		compactClearMember(inline, 17)
+		compactSetMember(inline, 17)
+	}); allocs != 0 {
+		t.Fatalf("inline clear/set allocated %.2f objects/op", allocs)
+	}
+
+	expanded := newCompactGroup(compactHistoryDescriptor{lifecycle: allocateLifecycleID()})
+	compactSetMember(expanded, 0)
+	compactSetMember(expanded, 63)
+	if expanded.members.Load() == nil {
+		t.Fatal("high-lane setup did not expand membership")
+	}
+	if allocs := testing.AllocsPerRun(1000, func() {
+		compactClearMember(expanded, 63)
+		compactSetMember(expanded, 63)
+	}); allocs != 0 {
+		t.Fatalf("expanded clear/set allocated %.2f objects/op", allocs)
 	}
 }
 

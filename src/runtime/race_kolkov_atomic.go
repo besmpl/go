@@ -48,11 +48,26 @@ func kolkovApiAtomicBeginRMW(addr, size, racectx uintptr, acquire bool, token *[
 
 //go:linkname kolkovApiAtomicBeginRMWCooperative runtime/race/kolkov/api.raceAtomicBeginRMWCooperative
 //go:noescape
-func kolkovApiAtomicBeginRMWCooperative(addr, size, racectx uintptr, acquire bool, token *[8]unsafe.Pointer) (context uintptr, retry bool)
+func kolkovApiAtomicBeginRMWCooperative(addr, size, racectx uintptr, acquire bool, token *[8]unsafe.Pointer) (context uintptr, retry, spin, polite bool, park *uint32)
+
+//go:linkname kolkovApiAtomicResumeRMW runtime/race/kolkov/api.raceAtomicResumeRMW
+//go:noescape
+func kolkovApiAtomicResumeRMW(addr, size, racectx uintptr, acquire bool, token *[8]unsafe.Pointer) (context uintptr, retry, spin, polite bool, park *uint32)
+
+//go:linkname kolkovApiAtomicInternalRMWPC runtime/race/kolkov/api.raceAtomicInternalRMWPC
+func kolkovApiAtomicInternalRMWPC(pc uintptr) bool
+
+//go:linkname kolkovApiAtomicBeginInternalRMWCooperative runtime/race/kolkov/api.raceAtomicBeginInternalRMWCooperative
+//go:noescape
+func kolkovApiAtomicBeginInternalRMWCooperative(addr, size, pc, racectx uintptr, synchronize bool, token *[8]unsafe.Pointer) (context uintptr, retry, direct, spin, polite bool, park *uint32)
 
 //go:linkname kolkovApiAtomicEnd runtime/race/kolkov/api.raceAtomicEnd
 //go:noescape
 func kolkovApiAtomicEnd(addr, size, pc, racectx uintptr, token *[8]unsafe.Pointer, write, synchronize bool)
+
+//go:linkname kolkovApiAtomicEndInternalRMW runtime/race/kolkov/api.raceAtomicEndInternalRMW
+//go:noescape
+func kolkovApiAtomicEndInternalRMW(addr, size, pc, racectx uintptr, token *[8]unsafe.Pointer, write, synchronize, direct bool) *uint32
 
 //go:linkname kolkovApiAtomicLoadFastBegin runtime/race/kolkov/api.raceAtomicLoadFastBegin
 //go:noescape
@@ -373,6 +388,41 @@ func kolkovAtomicSyncFrame(pc uintptr) bool {
 	if pc == 0 {
 		return false
 	}
+	entry := &kolkovAtomicSyncFrameCache[(pc^(pc>>11))&uintptr(len(kolkovAtomicSyncFrameCache)-1)]
+	if entry.state.LoadAcquire() == kolkovAtomicSyncFrameCacheReady && entry.pc == pc {
+		return entry.sync
+	}
+	sync := kolkovAtomicSyncFrameUncached(pc)
+	if entry.state.CompareAndSwap(kolkovAtomicSyncFrameCacheEmpty, kolkovAtomicSyncFrameCacheWriting) {
+		entry.pc = pc
+		entry.sync = sync
+		entry.state.StoreRelease(kolkovAtomicSyncFrameCacheReady)
+	}
+	return sync
+}
+
+const (
+	kolkovAtomicSyncFrameCacheEmpty = iota
+	kolkovAtomicSyncFrameCacheWriting
+	kolkovAtomicSyncFrameCacheReady
+	kolkovAtomicSyncFrameCacheSize = 1024
+)
+
+// Each exact-PC cache slot is written at most once. Immutable publication
+// avoids torn key/value pairs without a lock or generation-wrap argument;
+// collisions remain ordinary uncached lookups and can never guess. The table
+// is intentionally bounded because code PCs and their classification are
+// process-lifetime constants.
+type kolkovAtomicSyncFrameCacheEntry struct {
+	state atomic.Uint32
+	pc    uintptr
+	sync  bool
+}
+
+var kolkovAtomicSyncFrameCache [kolkovAtomicSyncFrameCacheSize]kolkovAtomicSyncFrameCacheEntry
+
+//go:nosplit
+func kolkovAtomicSyncFrameUncached(pc uintptr) bool {
 	name := funcname(findfunc(pc - 1))
 	const prefix = "sync/atomic."
 	return len(name) >= len(prefix) && name[:len(prefix)] == prefix
@@ -431,23 +481,34 @@ func kolkovAtomicStoreBegin(addr, size, racectx uintptr, synchronize bool, token
 	return kolkovApiAtomicBegin(addr, size, racectx, false, token), false
 }
 
-// kolkovAtomicRMWBegin lets an enabled aligned RMW reuse an existing exact
-// capability without allowing the RMW itself to enroll one. A miss and every
-// ignored operation retain the general path, including its incompatible-shape
-// escape and full ordinary-state transaction.
+// kolkovAtomicRMWBegin lets an enabled aligned RMW reuse or canonically enroll
+// an exact capability. Ignored and incompatible-shape operations retain the
+// general path and its full ordinary-state transaction.
 //
 //go:nosplit
-func kolkovAtomicRMWBegin(addr, size, racectx uintptr, synchronize bool, token *[8]unsafe.Pointer) (context uintptr, retry bool) {
-	if synchronize {
-		return kolkovApiAtomicBeginRMWCooperative(addr, size, racectx, true, token)
-	}
-	return kolkovApiAtomicBegin(addr, size, racectx, false, token), false
+func kolkovAtomicRMWBegin(addr, size, pc, racectx uintptr, synchronize bool, token *[8]unsafe.Pointer) (context uintptr, retry, direct, spin, polite bool, park *uint32) {
+	return kolkovApiAtomicBeginInternalRMWCooperative(addr, size, pc, racectx, synchronize, token)
+}
+
+// kolkovAtomicRMWSynchronize excludes only internal/sync Mutex atomics. Mutex
+// publishes the precise Go memory-model edge with explicit race annotations;
+// the detector still records its atomic/plain access history. Public atomics
+// retain full synchronization.
+//
+//go:nosplit
+func kolkovAtomicRMWSynchronize(gp *g, pc uintptr) bool {
+	return gp.raceignore == 0 && !kolkovApiAtomicInternalRMWPC(pc)
 }
 
 // procyield is a pause-count on most targets, but an approximate nanosecond
 // delay on arm64. Keep the portable count deliberately small while giving
 // arm64 enough elapsed time for the short detector critical section to finish.
 const kolkovAtomicRetryMaxDelay = uint32(32 + goarch.IsArm64*(1<<20-32))
+
+const (
+	kolkovAtomicPoliteDelay  = uint32(64 + goarch.IsArm64*(10000-64))
+	kolkovAtomicPatientDelay = uint32(256 + goarch.IsArm64*(40000-256))
+)
 
 // kolkovAtomicRetry backs off on the user goroutine after a clean exact-lock
 // miss. Short ownership intervals normally resolve during bounded processor
@@ -467,6 +528,69 @@ func kolkovAtomicRetry(delay *uint32) {
 	}
 	*delay = 1
 	goschedguarded()
+}
+
+// kolkovAtomicRMWRetry waits for a retained spinner's one-bit ownership-epoch
+// doorbell, parks a later retained waiter, or backs off after a clean queue
+// miss. A retained wait is already a bounded delay, so it restarts the clean
+// miss backoff for any later enrollment attempt.
+//
+//go:nosplit
+func kolkovAtomicRMWRetry(delay *uint32, park *uint32, patient unsafe.Pointer, spin, polite bool) (resume bool) {
+	if spin {
+		if park == nil {
+			throw("race detector missing atomic RMW spinner doorbell")
+		}
+		*delay = 1
+		for attempts := uint32(0); atomic.Load(park) == 0; attempts++ {
+			if polite {
+				politeDelay := kolkovAtomicPoliteDelay
+				if patient != nil {
+					politeDelay = kolkovAtomicPatientDelay
+				}
+				procyield(politeDelay)
+			} else {
+				procyield(32)
+			}
+			if attempts&63 == 63 {
+				goschedguarded()
+			}
+		}
+		return true
+	}
+	if park != nil {
+		*delay = 1
+		// Normal handoff remains LIFO to preserve exact-address/TID locality. A
+		// global FIFO queue rotates ownership across the whole waiter population
+		// and makes exact causal projection dominate the hardware operation.
+		// Queue progress is provided by the detector's finite spinner/cohort
+		// epochs rather than by changing the semaphore's admission order.
+		// Some atomic implementations (notably atomic.Value's first store) pin
+		// the current P across their hardware operation. semacquire1 must not
+		// park such a goroutine: procPin is represented by m.locks, and park_m
+		// would reach the scheduler while still holding that lock. The detector
+		// has already reserved this waiter a logical handoff, so it must still
+		// consume exactly one semaphore permit before resuming. Detector owners
+		// never block while holding the corresponding state lock, making a
+		// bounded processor wait the scheduler-safe form of that handoff.
+		if canPreemptM(getg().m) {
+			semacquire1(park, true, 0, 0, waitReasonSemacquire)
+		} else {
+			for !cansemacquire(park) {
+				procyield(uint32(64 + goarch.IsArm64*(10000-64)))
+			}
+		}
+		return true
+	}
+	kolkovAtomicRetry(delay)
+	return false
+}
+
+//go:nosplit
+func kolkovAtomicRMWWake(addr *uint32) {
+	if addr != nil {
+		semrelease1Direct(addr, true, 0)
+	}
 }
 
 func kolkovAtomicLoad32(addr *uint32, pc uintptr) (value uint32) {
@@ -885,21 +1009,32 @@ func kolkovAtomicSwapPointer(addr *unsafe.Pointer, new unsafe.Pointer, pc uintpt
 		return old
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			old = kolkovAtomicSwapPointerHardware(addr, new)
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, true, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, true, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -908,7 +1043,8 @@ func kolkovAtomicSwapPointer(addr *unsafe.Pointer, new unsafe.Pointer, pc uintpt
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	KeepAlive(addr)
@@ -927,21 +1063,32 @@ func kolkovAtomicCASPointer(addr *unsafe.Pointer, old, new unsafe.Pointer, pc ui
 		return swapped
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			swapped = kolkovAtomicCASPointerHardware(addr, old, new)
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, swapped, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, swapped, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -950,7 +1097,8 @@ func kolkovAtomicCASPointer(addr *unsafe.Pointer, old, new unsafe.Pointer, pc ui
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	KeepAlive(addr)
@@ -965,21 +1113,32 @@ func kolkovAtomicSwap32(addr *uint32, new uint32, pc uintptr) (old uint32) {
 		return atomic.Xchg(addr, new)
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 4, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), 4, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 4, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			old = atomic.Xchg(addr, new)
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 4, pc, context, &token, true, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), 4, pc, context, &token, true, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -988,7 +1147,8 @@ func kolkovAtomicSwap32(addr *uint32, new uint32, pc uintptr) (old uint32) {
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	return old
@@ -1003,21 +1163,32 @@ func kolkovAtomicSwap64(addr *uint64, new uint64, pc uintptr) (old uint64) {
 		return atomic.Xchg64(addr, new)
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 8, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), 8, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 8, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			old = atomic.Xchg64(addr, new)
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 8, pc, context, &token, true, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), 8, pc, context, &token, true, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -1026,7 +1197,8 @@ func kolkovAtomicSwap64(addr *uint64, new uint64, pc uintptr) (old uint64) {
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	return old
@@ -1038,21 +1210,32 @@ func kolkovAtomicSwapUintptr(addr *uintptr, new uintptr, pc uintptr) (old uintpt
 		return atomic.Xchguintptr(addr, new)
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			old = atomic.Xchguintptr(addr, new)
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, true, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, true, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -1061,7 +1244,8 @@ func kolkovAtomicSwapUintptr(addr *uintptr, new uintptr, pc uintptr) (old uintpt
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	return old
@@ -1073,21 +1257,32 @@ func kolkovAtomicCAS32(addr *uint32, old, new uint32, pc uintptr) (swapped bool)
 		return atomic.Cas(addr, old, new)
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 4, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), 4, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 4, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			swapped = atomic.Cas(addr, old, new)
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 4, pc, context, &token, swapped, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), 4, pc, context, &token, swapped, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -1096,7 +1291,8 @@ func kolkovAtomicCAS32(addr *uint32, old, new uint32, pc uintptr) (swapped bool)
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	return swapped
@@ -1111,21 +1307,32 @@ func kolkovAtomicCAS64(addr *uint64, old, new uint64, pc uintptr) (swapped bool)
 		return atomic.Cas64(addr, old, new)
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 8, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), 8, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 8, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			swapped = atomic.Cas64(addr, old, new)
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 8, pc, context, &token, swapped, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), 8, pc, context, &token, swapped, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -1134,7 +1341,8 @@ func kolkovAtomicCAS64(addr *uint64, old, new uint64, pc uintptr) (swapped bool)
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	return swapped
@@ -1146,21 +1354,32 @@ func kolkovAtomicCASUintptr(addr *uintptr, old, new uintptr, pc uintptr) (swappe
 		return atomic.Casuintptr(addr, old, new)
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			swapped = atomic.Casuintptr(addr, old, new)
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, swapped, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, swapped, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -1169,7 +1388,8 @@ func kolkovAtomicCASUintptr(addr *uintptr, old, new uintptr, pc uintptr) (swappe
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	return swapped
@@ -1181,21 +1401,32 @@ func kolkovAtomicAdd32(addr *uint32, delta uint32, pc uintptr) (value uint32) {
 		return atomic.Xadd(addr, int32(delta))
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 4, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), 4, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 4, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			value = atomic.Xadd(addr, int32(delta))
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 4, pc, context, &token, true, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), 4, pc, context, &token, true, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -1204,7 +1435,8 @@ func kolkovAtomicAdd32(addr *uint32, delta uint32, pc uintptr) (value uint32) {
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	return value
@@ -1219,21 +1451,32 @@ func kolkovAtomicAdd64(addr *uint64, delta uint64, pc uintptr) (value uint64) {
 		return atomic.Xadd64(addr, int64(delta))
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 8, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), 8, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 8, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			value = atomic.Xadd64(addr, int64(delta))
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 8, pc, context, &token, true, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), 8, pc, context, &token, true, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -1242,7 +1485,8 @@ func kolkovAtomicAdd64(addr *uint64, delta uint64, pc uintptr) (value uint64) {
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	return value
@@ -1254,21 +1498,32 @@ func kolkovAtomicAddUintptr(addr *uintptr, delta uintptr, pc uintptr) (value uin
 		return atomic.Xadduintptr(addr, delta)
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			value = atomic.Xadduintptr(addr, delta)
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, true, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, true, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -1277,7 +1532,8 @@ func kolkovAtomicAddUintptr(addr *uintptr, delta uintptr, pc uintptr) (value uin
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	return value
@@ -1289,21 +1545,32 @@ func kolkovAtomicAnd32(addr *uint32, mask uint32, pc uintptr) (old uint32) {
 		return atomic.And32(addr, mask)
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 4, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), 4, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 4, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			old = atomic.And32(addr, mask)
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 4, pc, context, &token, true, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), 4, pc, context, &token, true, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -1312,7 +1579,8 @@ func kolkovAtomicAnd32(addr *uint32, mask uint32, pc uintptr) (old uint32) {
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	return old
@@ -1327,21 +1595,32 @@ func kolkovAtomicAnd64(addr *uint64, mask uint64, pc uintptr) (old uint64) {
 		return atomic.And64(addr, mask)
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 8, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), 8, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 8, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			old = atomic.And64(addr, mask)
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 8, pc, context, &token, true, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), 8, pc, context, &token, true, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -1350,7 +1629,8 @@ func kolkovAtomicAnd64(addr *uint64, mask uint64, pc uintptr) (old uint64) {
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	return old
@@ -1362,21 +1642,32 @@ func kolkovAtomicAndUintptr(addr *uintptr, mask uintptr, pc uintptr) (old uintpt
 		return atomic.Anduintptr(addr, mask)
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			old = atomic.Anduintptr(addr, mask)
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, true, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, true, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -1385,7 +1676,8 @@ func kolkovAtomicAndUintptr(addr *uintptr, mask uintptr, pc uintptr) (old uintpt
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	return old
@@ -1397,21 +1689,32 @@ func kolkovAtomicOr32(addr *uint32, mask uint32, pc uintptr) (old uint32) {
 		return atomic.Or32(addr, mask)
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 4, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), 4, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 4, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			old = atomic.Or32(addr, mask)
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 4, pc, context, &token, true, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), 4, pc, context, &token, true, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -1420,7 +1723,8 @@ func kolkovAtomicOr32(addr *uint32, mask uint32, pc uintptr) (old uint32) {
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	return old
@@ -1435,21 +1739,32 @@ func kolkovAtomicOr64(addr *uint64, mask uint64, pc uintptr) (old uint64) {
 		return atomic.Or64(addr, mask)
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 8, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), 8, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), 8, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			old = atomic.Or64(addr, mask)
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), 8, pc, context, &token, true, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), 8, pc, context, &token, true, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -1458,7 +1773,8 @@ func kolkovAtomicOr64(addr *uint64, mask uint64, pc uintptr) (old uint64) {
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	return old
@@ -1470,21 +1786,32 @@ func kolkovAtomicOrUintptr(addr *uintptr, mask uintptr, pc uintptr) (old uintptr
 		return atomic.Oruintptr(addr, mask)
 	}
 	racectx := gp.racectx
-	synchronize := gp.raceignore == 0
+	synchronize := kolkovAtomicRMWSynchronize(gp, pc)
 	gp.raceguard++
 	var token [8]unsafe.Pointer
 	var context uintptr
+	var park, wake *uint32
+	var resume, spin, polite bool
 	retryDelay := uint32(1)
 	for {
 		var retry bool
+		var direct bool
 		systemstack(func() {
-			context, retry = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+			if resume {
+				resume = false
+				context, retry, spin, polite, park = kolkovApiAtomicResumeRMW(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, racectx, synchronize, &token)
+				direct = false
+			} else {
+				context, retry, direct, spin, polite, park = kolkovAtomicRMWBegin(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, racectx, synchronize, &token)
+			}
 			if retry {
 				return
 			}
 			old = atomic.Oruintptr(addr, mask)
-			kolkovApiAtomicEnd(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, true, synchronize)
+			wake = kolkovApiAtomicEndInternalRMW(uintptr(unsafe.Pointer(addr)), goarch.PtrSize, pc, context, &token, true, synchronize, direct)
 		})
+		kolkovAtomicRMWWake(wake)
+		wake = nil
 		if racectx <= 1 && context > 1 {
 			gp.racectx = context
 			kolkovCacheShadowPtr()
@@ -1493,7 +1820,8 @@ func kolkovAtomicOrUintptr(addr *uintptr, mask uintptr, pc uintptr) (old uintptr
 		if !retry {
 			break
 		}
-		kolkovAtomicRetry(&retryDelay)
+		resume = kolkovAtomicRMWRetry(&retryDelay, park, token[2], spin, polite)
+		park = nil
 	}
 	gp.raceguard--
 	return old

@@ -44,6 +44,14 @@ func (l *spinlock) lock() {
 	l.lockWithFallbackCounter(nil)
 }
 
+// tryLock makes one acquisition attempt. Fast paths use it when waiting would
+// cost more than falling back to the canonical synchronization operation.
+//
+//go:nosplit
+func (l *spinlock) tryLock() bool {
+	return l.state.CompareAndSwap(0, 1)
+}
+
 // lockWithFallbackCounter implements the writer lock's TTAS schedule. The
 // optional counter is test observability: production callers pass nil, so the
 // immediate acquisition path remains only one CAS and never allocates.
@@ -238,6 +246,21 @@ func (s *SyncShadow) GetOrCreate(addr uintptr) *SyncVar {
 	}
 }
 
+// Get returns the current SyncVar owned by addr without creating one. The
+// lookup consists only of atomic loads. A returned identity remains a valid Go
+// object after a concurrent clear, but the retired identity is never reused or
+// republished for a later allocation at the same address.
+//
+//go:nosplit
+func (s *SyncShadow) Get(addr uintptr) *SyncVar {
+	bucket := &s.buckets[fastHashSync(addr)]
+	page := findPage(bucket, addr>>syncPageShift)
+	if page == nil {
+		return nil
+	}
+	return findSyncVar(page, addr)
+}
+
 // HasEntry reports whether addr currently owns synchronization shadow state.
 // It is used to suppress reports on a synchronization primitive's own runtime
 // fields. ClearRange removes that suppression when allocator lifecycle ends.
@@ -255,7 +278,11 @@ func clearPageLocked(page *syncPage, first, last uintptr) {
 	pageBase := page.number << syncPageShift
 	if first == pageBase && last-pageBase == syncPageMask {
 		for i := range page.segments {
+			cell := page.segments[i].Load()
 			page.segments[i].Store(nil)
+			for ; cell != nil; cell = cell.next.Load() {
+				cell.syncVar.retire()
+			}
 		}
 		page.entryCount = 0
 		return
@@ -275,6 +302,9 @@ func clearPageLocked(page *syncPage, first, last uintptr) {
 					previous.next.Store(next)
 				}
 				page.entryCount--
+				// Ownership has already been removed from the reader-visible
+				// chain, so retirement cannot make a live lookup disappear.
+				cell.syncVar.retire()
 			} else {
 				previous = cell
 			}
@@ -416,7 +446,15 @@ func (s *SyncShadow) Reset() {
 	for i := range s.buckets {
 		bucket := &s.buckets[i]
 		bucket.mu.lock()
+		pages := bucket.pages.Load()
 		bucket.pages.Store(nil)
 		bucket.mu.unlock()
+		for page := pages; page != nil; page = page.next.Load() {
+			for segment := range page.segments {
+				for cell := page.segments[segment].Load(); cell != nil; cell = cell.next.Load() {
+					cell.syncVar.retire()
+				}
+			}
+		}
 	}
 }

@@ -16,8 +16,12 @@ func runtimeThrow(s string)
 
 const (
 	// DenseThreads is the number of logical thread IDs represented inline.
-	// The common path keeps the original 4 KiB, direct-indexed clock array.
-	DenseThreads = 1024
+	// Process-lifetime TIDs quickly leave the initial cohort, so keeping a full
+	// 4 KiB array in every transient synchronization snapshot makes fork-heavy
+	// programs pay for 1024 coordinates even when only one changes. The first
+	// cache-line-sized cohort remains direct-indexed; later TIDs use the exact
+	// compressed run representation below.
+	DenseThreads = 64
 
 	// MaxThreads is retained as the dense-capacity compatibility name. It is
 	// not a limit on logical thread IDs; IDs at or above it use sparse storage.
@@ -99,12 +103,107 @@ func poolPut(vc *VectorClock) {
 // zeroes are gaps, and adjacent equal-clock runs are always coalesced. This
 // keeps long fresh-TID frontiers proportional to clock changes rather than TIDs.
 type VectorClock struct {
-	clocks     [DenseThreads]uint32
-	maxDense   uint16
-	poolShard  uint8
-	denseTail  []uint32
-	sparseRuns []finiteRun
-	retired    []RetiredRange
+	clocks    [DenseThreads]uint32
+	maxDense  uint16
+	poolShard uint8
+	denseTail []uint32
+	// denseTailShared means another clock may read the same immutable backing
+	// array. Clone and CopyFrom set this on both clocks; canonical mutations
+	// detach once, while allocation-free Try operations reject a required write.
+	// GC owns the backing lifetime, so sharing needs no explicit reference count.
+	denseTailShared bool
+	sparseRuns      []finiteRun
+	retired         []RetiredRange
+	base            *ClockSnapshot
+	// causal contains independently retained immutable lineage views. The
+	// logical clock is the pointwise maximum of these views, base, and the
+	// owned mutable representation above.
+	causal causalRootSet
+}
+
+// CausalRootCapacity is the number of unrelated immutable lineage roots a
+// VectorClock can retain inline before an exact cold-path materialization.
+const CausalRootCapacity = 4
+
+// causalRootSet is packed so all operations over it are bounded and require no
+// allocation. Each entry owns one independently releasable segment reference.
+type causalRootSet struct {
+	roots [CausalRootCapacity]CausalView
+	count uint8
+}
+
+func (s *causalRootSet) Valid() bool { return s != nil && s.count != 0 }
+
+func (s *causalRootSet) Release() {
+	if s == nil {
+		return
+	}
+	for i := 0; i < int(s.count); i++ {
+		s.roots[i].Release()
+		s.roots[i] = CausalView{}
+	}
+	s.count = 0
+}
+
+func (s *causalRootSet) duplicateFrom(other *causalRootSet) bool {
+	if s == nil || other == nil || s.count != 0 {
+		return false
+	}
+	for i := 0; i < int(other.count); i++ {
+		root, ok := other.roots[i].Duplicate()
+		if !ok {
+			s.Release()
+			return false
+		}
+		s.roots[i] = root
+		s.count++
+	}
+	return true
+}
+
+func (s *causalRootSet) tryJoin(view CausalView) bool {
+	if !view.Valid() {
+		return true
+	}
+	for i := 0; i < int(s.count); i++ {
+		root := &s.roots[i]
+		if !root.SameFamily(view) {
+			continue
+		}
+		if root.Dominates(view) {
+			return true
+		}
+		return root.AdvanceTo(view)
+	}
+	if int(s.count) == len(s.roots) {
+		return false
+	}
+	root, ok := view.Duplicate()
+	if !ok {
+		return false
+	}
+	s.roots[s.count] = root
+	s.count++
+	return true
+}
+
+func (s *causalRootSet) Get(tid uint32) uint32 {
+	var clock uint32
+	for i := 0; i < int(s.count); i++ {
+		if candidate := s.roots[i].Get(tid); candidate > clock {
+			clock = candidate
+		}
+	}
+	return clock
+}
+
+func (s *causalRootSet) IsRetired(tid uint32) bool {
+	for i := 0; i < int(s.count); i++ {
+		if s.roots[i].IsRetired(tid) {
+			return true
+		}
+	}
+	return false
 }
 
 // FiniteRange is one inclusive, non-zero vector-clock run. Bulk callers pass
@@ -132,16 +231,21 @@ func (vc *VectorClock) Release() { poolPut(vc) }
 // Reset clears values while retaining run and retirement buffers for reuse.
 // Release applies the bounded pool-retention policy after resetting.
 func (vc *VectorClock) Reset() {
+	vc.causal.Release()
 	for i := uint32(0); i <= uint32(vc.maxDense); i++ {
 		vc.clocks[i] = 0
 	}
 	vc.maxDense = 0
-	for i := range vc.denseTail {
-		vc.denseTail[i] = 0
+	if vc.denseTailShared {
+		vc.denseTail = nil
+	} else {
+		clear(vc.denseTail)
+		vc.denseTail = vc.denseTail[:0]
 	}
-	vc.denseTail = vc.denseTail[:0]
+	vc.denseTailShared = false
 	vc.sparseRuns = vc.sparseRuns[:0]
 	vc.retired = vc.retired[:0]
+	vc.base = nil
 }
 
 func (vc *VectorClock) Clone() *VectorClock {
@@ -151,22 +255,55 @@ func (vc *VectorClock) Clone() *VectorClock {
 }
 
 func (vc *VectorClock) copyFromZero(other *VectorClock) {
+	vc.copyFromZeroWithDenseOwnership(other, false)
+}
+
+// CloneDetached is Clone with privately owned mutable buffers. It is used for
+// immutable publication slots whose next reuse must copy allocation-free
+// without making the live source clock copy-on-write.
+func (vc *VectorClock) CloneDetached() *VectorClock {
+	clone := poolGet()
+	clone.copyFromZeroWithDenseOwnership(vc, true)
+	return clone
+}
+
+func (vc *VectorClock) copyFromZeroWithDenseOwnership(other *VectorClock, detachDense bool) {
+	vc.base = other.base
+	if !vc.causal.duplicateFrom(&other.causal) && other.causal.Valid() {
+		runtimeThrow("race detector copied a released causal clock root set")
+	}
 	cloneLimit := uint32(other.maxDense)
 	for i := uint32(0); i <= cloneLimit; i++ {
 		vc.clocks[i] = other.clocks[i]
 	}
 	vc.maxDense = other.maxDense
 	if len(other.denseTail) != 0 {
-		if cap(vc.denseTail) < len(other.denseTail) {
-			vc.denseTail = make([]uint32, len(other.denseTail))
+		if detachDense {
+			if cap(vc.denseTail) < len(other.denseTail) {
+				vc.denseTail = make([]uint32, len(other.denseTail))
+			} else {
+				vc.denseTail = vc.denseTail[:len(other.denseTail)]
+			}
+			copy(vc.denseTail, other.denseTail)
+			vc.denseTailShared = false
 		} else {
-			vc.denseTail = vc.denseTail[:len(other.denseTail)]
+			vc.denseTail = other.denseTail
+			vc.denseTailShared = true
+			other.denseTailShared = true
 		}
-		copy(vc.denseTail, other.denseTail)
 	}
 	if len(other.sparseRuns) != 0 {
 		if cap(vc.sparseRuns) < len(other.sparseRuns) {
-			vc.sparseRuns = make([]finiteRun, len(other.sparseRuns))
+			capacity := len(other.sparseRuns)
+			// Canonical point insertion gives tiny sparse clocks four slots of
+			// headroom. Preserve that same bounded preparation across Clone so an
+			// immutable synchronization scratch version can absorb the next small
+			// shape change without allocating. Larger peak capacities are not
+			// inherited, keeping clones proportional to live metadata.
+			if capacity < 4 && cap(other.sparseRuns) >= 4 {
+				capacity = 4
+			}
+			vc.sparseRuns = make([]finiteRun, len(other.sparseRuns), capacity)
 		} else {
 			vc.sparseRuns = vc.sparseRuns[:len(other.sparseRuns)]
 		}
@@ -187,8 +324,28 @@ func (vc *VectorClock) copyRetiredFromZero(other *VectorClock) {
 	copy(vc.retired, other.retired)
 }
 
+func (vc *VectorClock) ownedEmpty() bool {
+	return vc.maxDense == 0 && vc.clocks[0] == 0 && len(vc.denseTail) == 0 &&
+		len(vc.sparseRuns) == 0 && len(vc.retired) == 0
+}
+
 func (vc *VectorClock) denseTailEnd() uint64 {
 	return uint64(DenseThreads) + uint64(len(vc.denseTail))
+}
+
+func (vc *VectorClock) detachDenseTail() {
+	if !vc.denseTailShared {
+		return
+	}
+	if len(vc.denseTail) == 0 {
+		vc.denseTail = nil
+		vc.denseTailShared = false
+		return
+	}
+	next := make([]uint32, len(vc.denseTail))
+	copy(next, vc.denseTail)
+	vc.denseTail = next
+	vc.denseTailShared = false
 }
 
 // maybePromoteDenseTail moves a dense prefix of sparse run metadata into
@@ -215,6 +372,7 @@ func (vc *VectorClock) maybePromoteDenseTail() {
 	if best == 0 || targetLen > uint64(^uint(0)>>1) {
 		return
 	}
+	vc.detachDenseTail()
 	oldLen := len(vc.denseTail)
 	newLen := int(targetLen)
 	if cap(vc.denseTail) < newLen {
@@ -253,6 +411,7 @@ func (vc *VectorClock) maybePromoteDenseTail() {
 }
 
 func (vc *VectorClock) ensureDenseTail(length int) {
+	vc.detachDenseTail()
 	if length <= len(vc.denseTail) {
 		return
 	}
@@ -272,6 +431,7 @@ func (vc *VectorClock) ensureDenseTail(length int) {
 }
 
 func (vc *VectorClock) extendDenseTail(length int) {
+	vc.detachDenseTail()
 	if length <= len(vc.denseTail) {
 		return
 	}
@@ -307,41 +467,371 @@ func (vc *VectorClock) extendDenseTail(length int) {
 
 // Join performs the point-wise maximum vc = vc ⊔ other.
 func (vc *VectorClock) Join(other *VectorClock) {
-	if len(vc.retired) == 0 {
-		for i := uint32(0); i <= uint32(other.maxDense); i++ {
-			if other.clocks[i] > vc.clocks[i] {
-				vc.clocks[i] = other.clocks[i]
-			}
-		}
-		if other.maxDense > vc.maxDense {
-			vc.maxDense = other.maxDense
-		}
-	} else {
-		for i := uint32(0); i <= uint32(other.maxDense); i++ {
-			if clock := other.clocks[i]; clock > vc.Get(i) {
-				vc.Set(i, clock)
-			}
-		}
+	if other == nil || vc == other {
+		return
 	}
-	if len(other.denseTail) != 0 {
-		vc.extendDenseTail(len(other.denseTail))
-		for i, clock := range other.denseTail {
-			if clock != 0 && clock > vc.denseTail[i] {
-				tid := uint32(DenseThreads + i)
-				if len(vc.retired) == 0 || !vc.IsRetired(tid) {
-					vc.denseTail[i] = clock
+	if vc.base != nil || other.base != nil {
+		vc.JoinSnapshot(joinClockSnapshots(other.base, other.ownedSnapshot()))
+	} else {
+		if len(vc.retired) == 0 {
+			for i := uint32(0); i <= uint32(other.maxDense); i++ {
+				if other.clocks[i] > vc.clocks[i] {
+					vc.clocks[i] = other.clocks[i]
+				}
+			}
+			if other.maxDense > vc.maxDense {
+				vc.maxDense = other.maxDense
+			}
+		} else {
+			for i := uint32(0); i <= uint32(other.maxDense); i++ {
+				if clock := other.clocks[i]; clock > vc.Get(i) {
+					vc.Set(i, clock)
 				}
 			}
 		}
+		if len(other.denseTail) != 0 {
+			vc.extendDenseTail(len(other.denseTail))
+			for i, clock := range other.denseTail {
+				if clock != 0 && clock > vc.denseTail[i] {
+					tid := uint32(DenseThreads + i)
+					if len(vc.retired) == 0 || !vc.IsRetired(tid) {
+						vc.denseTail[i] = clock
+					}
+				}
+			}
+		}
+		// The two clocks may use opposite representations for the same high-TID
+		// coordinates. Import the source's sparse prefix covered by our dense tail
+		// before joinSparseRuns discards everything below the sparse floor.
+		vc.joinSparseRuns(vc.joinDenseTailRanges(other.sparseRuns))
+		hadOtherRetirement := len(other.retired) != 0
+		vc.RetireRanges(other.retired)
+		if !hadOtherRetirement && len(vc.retired) != 0 {
+			vc.dropRetiredFiniteEntries()
+		}
 	}
-	// The two clocks may use opposite representations for the same high-TID
-	// coordinates. Import the source's sparse prefix covered by our dense tail
-	// before joinSparseRuns discards everything below the sparse floor.
-	vc.joinSparseRuns(vc.joinDenseTailRanges(other.sparseRuns))
-	hadOtherRetirement := len(other.retired) != 0
-	vc.RetireRanges(other.retired)
-	if !hadOtherRetirement && len(vc.retired) != 0 {
-		vc.dropRetiredFiniteEntries()
+	for i := 0; i < int(other.causal.count); i++ {
+		vc.JoinCausal(other.causal.roots[i])
+	}
+}
+
+// TryJoin is an allocation-free, nonblocking Join. It intentionally returns
+// false before mutation for representation combinations whose exact merge may
+// need scratch storage. Dense overlays and immutable checkpoints cover the
+// pinned synchronization fast paths; Join remains the unrestricted fallback.
+func (vc *VectorClock) TryJoin(other *VectorClock) bool {
+	if vc == other || other == nil || other.ownedEmpty() && other.base == nil && !other.causal.Valid() {
+		return true
+	}
+	var otherRoots [CausalRootCapacity]CausalView
+	otherRootCount := other.BorrowCausalRoots(&otherRoots)
+	if !vc.CanJoinCausalSet(&otherRoots, otherRootCount) {
+		return false
+	}
+	if other.base == nil && other.ownedEmpty() {
+		return vc.TryJoinCausalSet(&otherRoots, otherRootCount)
+	}
+	if !vc.causal.Valid() && !other.causal.Valid() && clockLessOrEqualClock(other, vc) {
+		return true
+	}
+	if vc.base == nil && vc.ownedEmpty() && !vc.causal.Valid() {
+		return vc.TryCopyFrom(other)
+	}
+	// Equal mutable layouts can be maxed and coalesced in place. Preflight every
+	// buffer before adopting an immutable root so failure remains all-or-nothing.
+	if len(other.retired) != 0 || len(vc.denseTail) != len(other.denseTail) ||
+		len(vc.sparseRuns) != len(other.sparseRuns) {
+		return false
+	}
+	for i := range other.sparseRuns {
+		if vc.sparseRuns[i].First != other.sparseRuns[i].First ||
+			vc.sparseRuns[i].Last != other.sparseRuns[i].Last {
+			return false
+		}
+	}
+	if vc.denseTailShared {
+		for i, clock := range other.denseTail {
+			if clock > vc.denseTail[i] && !vc.IsRetired(uint32(DenseThreads+i)) {
+				return false
+			}
+		}
+	}
+	if other.base != nil && !vc.TryJoinSnapshot(other.base) {
+		return false
+	}
+	for tid := uint32(0); tid <= uint32(other.maxDense); tid++ {
+		if clock := other.clocks[tid]; clock > vc.Get(tid) {
+			// Inline Set cannot allocate. Retirement in vc simply dominates it.
+			vc.Set(tid, clock)
+		}
+	}
+	for i, clock := range other.denseTail {
+		if clock > vc.denseTail[i] && !vc.IsRetired(uint32(DenseThreads+i)) {
+			vc.denseTail[i] = clock
+		}
+	}
+	for i, run := range other.sparseRuns {
+		if run.Clock > vc.sparseRuns[i].Clock {
+			vc.sparseRuns[i].Clock = run.Clock
+		}
+	}
+	vc.sparseRuns = coalesceFiniteRuns(vc.sparseRuns)
+	return vc.TryJoinCausalSet(&otherRoots, otherRootCount)
+}
+
+// TryJoinCausal pointwise joins one pinned immutable lineage view without
+// allocating. A clock owns its own segment reference: the caller remains
+// responsible for releasing view. Same-family advancement is an O(1) pointer
+// replacement and preserves the snapshot base and mutable owned overlay.
+// Unrelated families occupy another inline slot until capacity is reached.
+func (vc *VectorClock) TryJoinCausal(view CausalView) bool {
+	return vc != nil && vc.causal.tryJoin(view)
+}
+
+// BorrowCausalRoots copies vc's retained roots into dst without retaining
+// them. The returned views remain owned by vc and are valid only while vc is
+// kept alive and unmodified. Unused entries are cleared.
+func (vc *VectorClock) BorrowCausalRoots(dst *[CausalRootCapacity]CausalView) int {
+	if dst == nil {
+		return 0
+	}
+	clear(dst[:])
+	if vc == nil {
+		return 0
+	}
+	n := int(vc.causal.count)
+	copy(dst[:n], vc.causal.roots[:n])
+	return n
+}
+
+// CanJoinCausalSet reports whether all views fit in vc's inline root set after
+// same-family normalization. It neither retains nor mutates anything.
+func (vc *VectorClock) CanJoinCausalSet(views *[CausalRootCapacity]CausalView, n int) bool {
+	if vc == nil || views == nil || n < 0 || n > len(views) {
+		return false
+	}
+	families := int(vc.causal.count)
+	for i := 0; i < n; i++ {
+		view := views[i]
+		if !view.Valid() {
+			continue
+		}
+		known := false
+		for j := 0; j < int(vc.causal.count); j++ {
+			if vc.causal.roots[j].SameFamily(view) {
+				known = true
+				break
+			}
+		}
+		for j := 0; !known && j < i; j++ {
+			if views[j].Valid() && views[j].SameFamily(view) {
+				known = true
+			}
+		}
+		if !known {
+			families++
+			if families > CausalRootCapacity {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// TryJoinCausalSet joins a preflighted fixed set allocation-free. Capacity is
+// checked before the first mutation, preserving Try's all-or-nothing contract
+// for every ordinary live-view call.
+func (vc *VectorClock) TryJoinCausalSet(views *[CausalRootCapacity]CausalView, n int) bool {
+	if !vc.CanJoinCausalSet(views, n) {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		if !vc.causal.tryJoin(views[i]) {
+			runtimeThrow("race detector joined a released causal clock root")
+		}
+	}
+	return true
+}
+
+const maxCausalResidualProofRun = uint64(64)
+
+// ResidualLessOrEqualCausal proves that every logical coordinate in vc, except
+// ownTID, is dominated by view. It is read-only and allocation-free. False
+// means "not proven", not necessarily logical inequality: wide finite and
+// retirement residuals are rejected conservatively rather than expanded
+// without bound.
+//
+// The synchronization hot path is constant time for vc's causal root when
+// view is a later version of the same family; only the small residual base and
+// owned overlay are scanned.
+func (vc *VectorClock) ResidualLessOrEqualCausal(view CausalView, ownTID uint32) bool {
+	views := [CausalRootCapacity]CausalView{view}
+	return vc.ResidualLessOrEqualCausalSet(&views, 1, ownTID)
+}
+
+// ResidualLessOrEqualCausalSet proves that every logical coordinate in vc,
+// except ownTID, is dominated by the pointwise union of views. It is read-only
+// and allocation-free. False means not proven; deliberately bounded scans of
+// wide residual runs preserve the synchronization hot-path ceiling.
+func (vc *VectorClock) ResidualLessOrEqualCausalSet(views *[CausalRootCapacity]CausalView, n int, ownTID uint32) bool {
+	if vc == nil {
+		return true
+	}
+	if views == nil || n < 0 || n > len(views) {
+		return false
+	}
+	for i := 0; i < int(vc.causal.count); i++ {
+		left := vc.causal.roots[i]
+		dominated := false
+		for j := 0; j < n; j++ {
+			if views[j].Dominates(left) {
+				dominated = true
+				break
+			}
+		}
+		if !dominated && !causalViewResidualLessOrEqualSet(left, views, n, ownTID) {
+			return false
+		}
+	}
+	for _, retired := range vc.retired {
+		if !causalSetDominatesRetiredRun(views, n, retired.First, retired.Last, ownTID) {
+			return false
+		}
+	}
+	if vc.base != nil {
+		ok := true
+		snapshotRange(vc.base.retired, func(first, last, _ uint32) bool {
+			ok = causalSetDominatesRetiredRun(views, n, first, last, ownTID)
+			return ok
+		})
+		if !ok {
+			return false
+		}
+		snapshotRange(vc.base.finite, func(first, last, clock uint32) bool {
+			ok = causalSetDominatesFiniteRun(views, n, first, last, clock, ownTID)
+			return ok
+		})
+		if !ok {
+			return false
+		}
+	}
+	ok := true
+	vc.rangeOwnedRuns(func(first, last, clock uint32) bool {
+		ok = causalSetDominatesFiniteRun(views, n, first, last, clock, ownTID)
+		return ok
+	})
+	return ok
+}
+
+func causalSetGet(views *[CausalRootCapacity]CausalView, n int, tid uint32) uint32 {
+	var clock uint32
+	for i := 0; i < n; i++ {
+		if candidate := views[i].Get(tid); candidate > clock {
+			clock = candidate
+		}
+	}
+	return clock
+}
+
+func causalSetIsRetired(views *[CausalRootCapacity]CausalView, n int, tid uint32) bool {
+	for i := 0; i < n; i++ {
+		if views[i].IsRetired(tid) {
+			return true
+		}
+	}
+	return false
+}
+
+func causalSetDominatesFiniteRun(views *[CausalRootCapacity]CausalView, n int, first, last, clock, skip uint32) bool {
+	residual := uint64(last) - uint64(first) + 1
+	if skip >= first && skip <= last {
+		residual--
+	}
+	if residual > maxCausalResidualProofRun {
+		return false
+	}
+	for tid := uint64(first); tid <= uint64(last); tid++ {
+		id := uint32(tid)
+		if id != skip && !causalSetIsRetired(views, n, id) && causalSetGet(views, n, id) < clock {
+			return false
+		}
+	}
+	return true
+}
+
+func causalSetDominatesRetiredRun(views *[CausalRootCapacity]CausalView, n int, first, last, skip uint32) bool {
+	residual := uint64(last) - uint64(first) + 1
+	if skip >= first && skip <= last {
+		residual--
+	}
+	if residual > maxCausalResidualProofRun {
+		return false
+	}
+	for tid := uint64(first); tid <= uint64(last); tid++ {
+		id := uint32(tid)
+		if id != skip && !causalSetIsRetired(views, n, id) {
+			return false
+		}
+	}
+	return true
+}
+
+// causalViewResidualLessOrEqual is the exact cold path for an unrelated or
+// newer source root. Anchors and published point heads are immutable for a
+// pinned version, so they can be checked without materializing a VectorClock.
+func causalViewResidualLessOrEqualSet(left CausalView, right *[CausalRootCapacity]CausalView, n int, skip uint32) bool {
+	if !left.Valid() {
+		return true
+	}
+	ok := true
+	left.segment.anchor.RangeRetired(func(first, last uint32) bool {
+		ok = causalSetDominatesRetiredRun(right, n, first, last, skip)
+		return ok
+	})
+	if !ok {
+		return false
+	}
+	left.segment.anchor.RangeRuns(func(first, last, clock uint32) bool {
+		ok = causalSetDominatesFiniteRun(right, n, first, last, clock, skip)
+		return ok
+	})
+	if !ok {
+		return false
+	}
+	for tid := range left.segment.denseHeads {
+		logicalTID := left.segment.denseBase + uint32(tid)
+		index, _ := left.segment.denseHeads[tid].load()
+		if index == 0 || logicalTID == skip {
+			continue
+		}
+		clock := left.Get(logicalTID)
+		if !causalSetIsRetired(right, n, logicalTID) && clock > causalSetGet(right, n, logicalTID) {
+			return false
+		}
+	}
+	for i := range left.segment.cells {
+		key := left.segment.cells[i].key.Load()
+		if key == 0 {
+			continue
+		}
+		tid := uint32(key - 1)
+		if tid != skip && !causalSetIsRetired(right, n, tid) && left.Get(tid) > causalSetGet(right, n, tid) {
+			return false
+		}
+	}
+	return true
+}
+
+// JoinCausal is the unrestricted counterpart to TryJoinCausal. On inline-set
+// overflow all retained roots are materialized exactly before the incoming root
+// is adopted; no causal metadata is dropped.
+func (vc *VectorClock) JoinCausal(view CausalView) {
+	if vc.TryJoinCausal(view) {
+		return
+	}
+	vc.materializeCausal()
+	if !vc.TryJoinCausal(view) {
+		runtimeThrow("race detector joined a released causal clock view")
 	}
 }
 
@@ -566,6 +1056,18 @@ func sparseRangesLessOrEqual(left []finiteRun, floor uint32, right []finiteRun, 
 }
 
 func (vc *VectorClock) LessOrEqual(other *VectorClock) bool {
+	if vc.causal.Valid() || other.causal.Valid() {
+		left, right := vc.CloneDetached(), other.CloneDetached()
+		left.materializeCausal()
+		right.materializeCausal()
+		result := clockLessOrEqualClock(left, right)
+		left.Release()
+		right.Release()
+		return result
+	}
+	if vc.base != nil || other.base != nil {
+		return clockLessOrEqualClock(vc, other)
+	}
 	// +infinity is dominated only by +infinity. Check marker coverage
 	// independently from finite uint32 values so MaxUint32 remains a valid
 	// (albeit non-incrementable) finite component.
@@ -600,6 +1102,54 @@ func (vc *VectorClock) LessOrEqual(other *VectorClock) bool {
 	return sparseRangesLessOrEqual(vc.sparseRuns, uint32(otherEnd), other.sparseRuns, other.retired)
 }
 
+func clockLessOrEqualClock(left, right *VectorClock) bool {
+	if left == right {
+		return true
+	}
+	if left.causal.Valid() || right.causal.Valid() {
+		leftCopy, rightCopy := left.Clone(), right.Clone()
+		leftCopy.materializeCausal()
+		rightCopy.materializeCausal()
+		result := clockLessOrEqualClock(leftCopy, rightCopy)
+		leftCopy.Release()
+		rightCopy.Release()
+		return result
+	}
+	ok := true
+	left.RangeRetired(func(first, last uint32) bool {
+		for pos, limit := uint64(first), uint64(last)+1; pos < limit; {
+			retired, _, next := right.logicalSegment(pos)
+			if !retired {
+				ok = false
+				return false
+			}
+			if next > limit {
+				next = limit
+			}
+			pos = next
+		}
+		return true
+	})
+	if !ok {
+		return false
+	}
+	left.RangeRuns(func(first, last, clock uint32) bool {
+		for pos, limit := uint64(first), uint64(last)+1; pos < limit; {
+			retired, value, next := right.logicalSegment(pos)
+			if !retired && value < clock {
+				ok = false
+				return false
+			}
+			if next > limit {
+				next = limit
+			}
+			pos = next
+		}
+		return true
+	})
+	return ok
+}
+
 func sparseRunsLessOrEqual(left, right []finiteRun, rightRetired []RetiredRange) bool {
 	return sparseRangesLessOrEqual(left, 0, right, rightRetired)
 }
@@ -607,6 +1157,25 @@ func sparseRunsLessOrEqual(left, right []finiteRun, rightRetired []RetiredRange)
 // PruneLessOrEqual removes each finite component already observed by observed.
 // It never imports observed's finite components or retirement metadata.
 func (vc *VectorClock) PruneLessOrEqual(observed *VectorClock) {
+	vc.materializeRoots()
+	if observed.base != nil || observed.causal.Valid() {
+		// Promoted ordinary-read frontiers contain only a handful of actual read
+		// events, while the observing goroutine may carry a process-wide causal
+		// root. Prune that small event set directly through point lookup before
+		// materializing the root. The bounded scan preserves the generic pruning
+		// ceiling; wider frontiers retain the canonical exact fallback below.
+		if vc.pruneSmallOwnedFiniteAgainstLogical(observed) {
+			return
+		}
+		// Pruning observes but must not change the representation or sharing of
+		// its argument. The existing sparse pruning engine consumes owned runs,
+		// so materialize a private temporary when necessary.
+		copy := observed.CloneDetached()
+		copy.materializeRoots()
+		defer copy.Release()
+		observed = copy
+	}
+	vc.detachDenseTail()
 	for tid := uint32(0); tid <= uint32(vc.maxDense); tid++ {
 		if clock := vc.clocks[tid]; clock != 0 && clock <= observed.Get(tid) {
 			vc.clocks[tid] = 0
@@ -679,6 +1248,128 @@ func (vc *VectorClock) PruneLessOrEqual(observed *VectorClock) {
 	vc.sparseRuns = out
 }
 
+// PruneEventSetLessOrEqual is the exact pruning seam for a clock whose finite
+// coordinates are independent events rather than a causal snapshot. Promoted
+// ordinary-read frontiers use one finite coordinate per logical reader (the
+// canonical storage may coalesce adjacent equal epochs), so their semantic
+// coordinates can be scanned directly against an arbitrarily wide observing
+// clock without materializing its immutable causal roots. This API is for
+// event sets, not manufactured wide ranges. Partial composite inputs retain
+// PruneLessOrEqual's fully general fallback.
+func (vc *VectorClock) PruneEventSetLessOrEqual(observed *VectorClock) {
+	if vc == nil || observed == nil {
+		return
+	}
+	if vc.base != nil || vc.causal.Valid() || len(vc.retired) != 0 {
+		vc.PruneLessOrEqual(observed)
+		return
+	}
+	allSingleton := true
+	for _, run := range vc.sparseRuns {
+		if run.First != run.Last {
+			allSingleton = false
+			break
+		}
+	}
+	total, kept := uint64(0), uint64(0)
+	vc.rangeOwnedRuns(func(first, last, clock uint32) bool {
+		total += uint64(last) - uint64(first) + 1
+		for tid := uint64(first); tid <= uint64(last); tid++ {
+			id := uint32(tid)
+			if !observed.IsRetired(id) && observed.Get(id) < clock {
+				kept++
+			}
+		}
+		return true
+	})
+	if kept == total {
+		return
+	}
+	if kept == 0 {
+		for i := uint32(0); i <= uint32(vc.maxDense); i++ {
+			vc.clocks[i] = 0
+		}
+		vc.maxDense = 0
+		vc.detachDenseTail()
+		clear(vc.denseTail)
+		vc.denseTail = vc.denseTail[:0]
+		clear(vc.sparseRuns)
+		vc.sparseRuns = vc.sparseRuns[:0]
+		return
+	}
+	if !allSingleton {
+		vc.PruneLessOrEqual(observed)
+		return
+	}
+	for tid := uint32(0); tid <= uint32(vc.maxDense); tid++ {
+		if clock := vc.clocks[tid]; clock != 0 && (observed.IsRetired(tid) || observed.Get(tid) >= clock) {
+			vc.clocks[tid] = 0
+		}
+	}
+	for vc.maxDense != 0 && vc.clocks[vc.maxDense] == 0 {
+		vc.maxDense--
+	}
+	vc.detachDenseTail()
+	for i, clock := range vc.denseTail {
+		tid := uint32(DenseThreads + i)
+		if clock != 0 && (observed.IsRetired(tid) || observed.Get(tid) >= clock) {
+			vc.denseTail[i] = 0
+		}
+	}
+	out := vc.sparseRuns[:0]
+	for _, run := range vc.sparseRuns {
+		if !observed.IsRetired(run.First) && observed.Get(run.First) < run.Clock {
+			out = append(out, run)
+		}
+	}
+	clear(vc.sparseRuns[len(out):])
+	vc.sparseRuns = out
+}
+
+func (vc *VectorClock) pruneSmallOwnedFiniteAgainstLogical(observed *VectorClock) bool {
+	if vc == nil || observed == nil {
+		return vc == nil
+	}
+	type point struct {
+		tid, clock uint32
+	}
+	var keep [maxCausalResidualProofRun]point
+	keepN := 0
+	checked := uint64(0)
+	complete := true
+	vc.rangeOwnedRuns(func(first, last, clock uint32) bool {
+		width := uint64(last) - uint64(first) + 1
+		if width > maxCausalResidualProofRun-checked {
+			complete = false
+			return false
+		}
+		checked += width
+		for tid := uint64(first); tid <= uint64(last); tid++ {
+			id := uint32(tid)
+			if !observed.IsRetired(id) && observed.Get(id) < clock {
+				keep[keepN] = point{tid: id, clock: clock}
+				keepN++
+			}
+		}
+		return true
+	})
+	if !complete {
+		return false
+	}
+	for i := uint32(0); i <= uint32(vc.maxDense); i++ {
+		vc.clocks[i] = 0
+	}
+	vc.maxDense = 0
+	vc.detachDenseTail()
+	clear(vc.denseTail)
+	vc.denseTail = vc.denseTail[:0]
+	vc.sparseRuns = vc.sparseRuns[:0]
+	for i := 0; i < keepN; i++ {
+		vc.Set(keep[i].tid, keep[i].clock)
+	}
+	return true
+}
+
 func (vc *VectorClock) pruneSparseAgainstDenseTail(observed *VectorClock) {
 	end := observed.denseTailEnd()
 	if len(observed.denseTail) == 0 || len(vc.sparseRuns) == 0 || uint64(vc.sparseRuns[0].First) >= end {
@@ -733,6 +1424,14 @@ func (vc *VectorClock) Increment(tid uint32) {
 	if vc.IsRetired(tid) {
 		runtimeThrow("race detector incremented retired logical goroutine ID")
 	}
+	if vc.base != nil || vc.causal.Valid() {
+		clock := vc.Get(tid)
+		if clock == ^uint32(0) {
+			runtimeThrow("race detector logical clock overflow")
+		}
+		vc.Set(tid, clock+1)
+		return
+	}
 	if tid < DenseThreads {
 		if vc.clocks[tid] == ^uint32(0) {
 			runtimeThrow("race detector logical clock overflow")
@@ -747,6 +1446,7 @@ func (vc *VectorClock) Increment(tid uint32) {
 		if vc.denseTail[offset] == ^uint32(0) {
 			runtimeThrow("race detector logical clock overflow")
 		}
+		vc.detachDenseTail()
 		vc.denseTail[offset]++
 		return
 	}
@@ -808,20 +1508,44 @@ func (vc *VectorClock) Get(tid uint32) uint32 {
 	if vc.IsRetired(tid) {
 		return ^uint32(0)
 	}
+	baseClock := uint32(0)
+	if vc.base != nil {
+		baseClock = snapshotGet(vc.base.finite, tid)
+	}
+	if causalClock := vc.causal.Get(tid); causalClock > baseClock {
+		baseClock = causalClock
+	}
 	if tid < DenseThreads {
-		return vc.clocks[tid]
+		if vc.clocks[tid] > baseClock {
+			return vc.clocks[tid]
+		}
+		return baseClock
 	}
 	if offset := uint64(tid) - DenseThreads; offset < uint64(len(vc.denseTail)) {
-		return vc.denseTail[offset]
+		if vc.denseTail[offset] > baseClock {
+			return vc.denseTail[offset]
+		}
+		return baseClock
 	}
 	idx := vc.searchSparseRun(tid)
 	if idx < len(vc.sparseRuns) && vc.sparseRuns[idx].First <= tid {
-		return vc.sparseRuns[idx].Clock
+		if vc.sparseRuns[idx].Clock > baseClock {
+			return vc.sparseRuns[idx].Clock
+		}
 	}
-	return 0
+	return baseClock
 }
 
 func (vc *VectorClock) Set(tid, clock uint32) {
+	if vc.base != nil || vc.causal.Valid() {
+		old := vc.Get(tid)
+		if vc.IsRetired(tid) || old == clock {
+			return
+		}
+		if clock < old {
+			vc.materializeRoots()
+		}
+	}
 	// Retirement is immutable. In particular, Set(tid, 0) clears only finite
 	// state and cannot resurrect a never-reused logical identity.
 	if vc.IsRetired(tid) {
@@ -840,11 +1564,13 @@ func (vc *VectorClock) Set(tid, clock uint32) {
 	}
 	offset := uint64(tid) - DenseThreads
 	if offset < uint64(len(vc.denseTail)) {
+		vc.detachDenseTail()
 		vc.denseTail[offset] = clock
 		return
 	}
 	if offset == uint64(len(vc.denseTail)) && len(vc.denseTail) != 0 && clock != 0 &&
 		(len(vc.sparseRuns) == 0 || vc.sparseRuns[0].First > tid) {
+		vc.detachDenseTail()
 		vc.denseTail = append(vc.denseTail, clock)
 		return
 	}
@@ -883,6 +1609,119 @@ func (vc *VectorClock) Set(tid, clock uint32) {
 	}
 	vc.replaceSparseRun(idx, 1, replacement[:n])
 	vc.maybePromoteDenseTail()
+}
+
+// PrepareKnownMonotonicSet reserves the only mutable storage which
+// SetKnownMonotonicAlive can need. The caller must invoke it before the
+// all-or-nothing operation whose commit will publish a larger finite value at
+// tid, and must not mutate vc between prepare and commit.
+//
+// The logical value is intentionally not read here. RaceContext owns a
+// process-lifetime TID and keeps its cached epoch equal to that coordinate, so
+// walking immutable bases and causal roots merely to rediscover the cached
+// value is redundant. Two spare runs cover the worst case: replacing one
+// interior coordinate of a canonical sparse run with three runs.
+func (vc *VectorClock) PrepareKnownMonotonicSet(tid uint32) {
+	if tid < DenseThreads {
+		return
+	}
+	if uint64(tid)-DenseThreads < uint64(len(vc.denseTail)) {
+		vc.detachDenseTail()
+		return
+	}
+	required := len(vc.sparseRuns) + 2
+	if cap(vc.sparseRuns) >= required {
+		return
+	}
+	capacity := required * 2
+	if capacity < 4 {
+		capacity = 4
+	}
+	next := make([]finiteRun, len(vc.sparseRuns), capacity)
+	copy(next, vc.sparseRuns)
+	vc.sparseRuns = next
+}
+
+// CanSetKnownMonotonicAlive reports whether the trusted commit seam can update
+// tid without allocating. Non-blocking synchronization paths use it before
+// making any semantic mutation; a false result conservatively selects the
+// canonical path, whose preflight reserves the required sparse-run capacity.
+func (vc *VectorClock) CanSetKnownMonotonicAlive(tid uint32) bool {
+	if vc == nil {
+		return false
+	}
+	if tid < DenseThreads {
+		return true
+	}
+	if uint64(tid)-DenseThreads < uint64(len(vc.denseTail)) {
+		return !vc.denseTailShared
+	}
+	idx := vc.searchSparseRun(tid)
+	if idx == len(vc.sparseRuns) || vc.sparseRuns[idx].First > tid {
+		return len(vc.sparseRuns) < cap(vc.sparseRuns)
+	}
+	run := vc.sparseRuns[idx]
+	if run.First == tid && run.Last == tid {
+		return true
+	}
+	extra := 0
+	if run.First < tid {
+		extra++
+	}
+	if tid < run.Last {
+		extra++
+	}
+	return len(vc.sparseRuns)+extra <= cap(vc.sparseRuns)
+}
+
+// SetKnownMonotonicAlive publishes a preflighted increase of one live logical
+// coordinate without consulting immutable roots or retirement metadata. It is
+// the allocation-free commit half of PrepareKnownMonotonicSet.
+//
+// The caller must prove that clock is strictly greater than vc.Get(tid), that
+// tid is not retired, and that vc has not been mutated since prepare. Those
+// conditions let this method update only the owned overlay: its larger value
+// necessarily dominates every retained root at tid. Unlike Set, this method
+// deliberately skips optional dense-tail promotion so commit cannot allocate.
+func (vc *VectorClock) SetKnownMonotonicAlive(tid, clock uint32) {
+	if tid < DenseThreads {
+		vc.clocks[tid] = clock
+		if uint16(tid) > vc.maxDense {
+			vc.maxDense = uint16(tid)
+		}
+		return
+	}
+	offset := uint64(tid) - DenseThreads
+	if offset < uint64(len(vc.denseTail)) {
+		if vc.denseTailShared {
+			runtimeThrow("race detector mutated shared dense clock without preflight")
+		}
+		vc.denseTail[offset] = clock
+		return
+	}
+	idx := vc.searchSparseRun(tid)
+	if idx == len(vc.sparseRuns) || vc.sparseRuns[idx].First > tid {
+		vc.replaceSparseRun(idx, 0, []finiteRun{{First: tid, Last: tid, Clock: clock}})
+		return
+	}
+	old := vc.sparseRuns[idx]
+	if old.First == tid && old.Last == tid {
+		vc.setSparseSingleton(idx, clock)
+		return
+	}
+	var replacement [3]finiteRun
+	n := 0
+	if old.First < tid {
+		replacement[n] = finiteRun{First: old.First, Last: tid - 1, Clock: old.Clock}
+		n++
+	}
+	replacement[n] = finiteRun{First: tid, Last: tid, Clock: clock}
+	n++
+	if tid < old.Last {
+		replacement[n] = finiteRun{First: tid + 1, Last: old.Last, Clock: old.Clock}
+		n++
+	}
+	vc.replaceSparseRun(idx, 1, replacement[:n])
 }
 
 func (vc *VectorClock) searchSparseRun(tid uint32) int {
@@ -957,6 +1796,12 @@ func appendFiniteRun(runs []finiteRun, r finiteRun) []finiteRun {
 
 // IsRetired reports whether tid has immutable +infinity causal metadata.
 func (vc *VectorClock) IsRetired(tid uint32) bool {
+	if vc.causal.IsRetired(tid) {
+		return true
+	}
+	if vc.base != nil && snapshotGet(vc.base.retired, tid) != 0 {
+		return true
+	}
 	lo, hi := 0, len(vc.retired)
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
@@ -983,6 +1828,7 @@ func (vc *VectorClock) RetireRanges(ranges []RetiredRange) {
 	if len(ranges) == 0 {
 		return
 	}
+	vc.materializeRoots()
 	for i, r := range ranges {
 		if r.First == 0 || r.First > r.Last || (i != 0 && r.First < ranges[i-1].First) {
 			runtimeThrow("race detector received invalid retired TID ranges")
@@ -1043,6 +1889,7 @@ func (vc *VectorClock) RetireRanges(ranges []RetiredRange) {
 }
 
 func (vc *VectorClock) dropRetiredFiniteEntries() {
+	vc.detachDenseTail()
 	for _, r := range vc.retired {
 		first, last := r.First, r.Last
 		if first < DenseThreads {
@@ -1139,6 +1986,17 @@ func retiredSubset(left, right []RetiredRange) bool {
 // Immutable retirement markers are visited only by RangeRetired. Iteration
 // stops when visit returns false.
 func (vc *VectorClock) Range(visit func(tid, clock uint32) bool) {
+	if vc.base != nil || vc.causal.Valid() {
+		vc.RangeRuns(func(first, last, clock uint32) bool {
+			for tid := uint64(first); tid <= uint64(last); tid++ {
+				if !visit(uint32(tid), clock) {
+					return false
+				}
+			}
+			return true
+		})
+		return
+	}
 	for tid := uint32(0); tid <= uint32(vc.maxDense); tid++ {
 		if clock := vc.clocks[tid]; clock != 0 && !visit(tid, clock) {
 			return
@@ -1162,6 +2020,155 @@ func (vc *VectorClock) Range(visit func(tid, clock uint32) bool) {
 // contains adjacent TIDs with the same clock. Retired markers are intentionally
 // excluded and are available through RangeRetired.
 func (vc *VectorClock) RangeRuns(visit func(first, last, clock uint32) bool) {
+	if vc.causal.Valid() {
+		copy := vc.CloneDetached()
+		copy.materializeCausal()
+		copy.RangeRuns(visit)
+		copy.Release()
+		return
+	}
+	if vc.base != nil {
+		vc.rangeLogicalRuns(visit)
+		return
+	}
+	vc.rangeOwnedRuns(visit)
+}
+
+const clockCoordinateEnd = uint64(1) << 32
+
+func (vc *VectorClock) ownedFiniteSegment(pos uint64) (uint32, uint64) {
+	if pos >= clockCoordinateEnd {
+		return 0, clockCoordinateEnd
+	}
+	if pos < DenseThreads {
+		value := vc.clocks[pos]
+		next := pos + 1
+		for next < DenseThreads && vc.clocks[next] == value {
+			next++
+		}
+		return value, next
+	}
+	tailEnd := vc.denseTailEnd()
+	if pos < tailEnd {
+		value := vc.denseTail[pos-DenseThreads]
+		next := pos + 1
+		for next < tailEnd && vc.denseTail[next-DenseThreads] == value {
+			next++
+		}
+		return value, next
+	}
+	idx := vc.searchSparseRun(uint32(pos))
+	if idx < len(vc.sparseRuns) && uint64(vc.sparseRuns[idx].First) <= pos {
+		return vc.sparseRuns[idx].Clock, uint64(vc.sparseRuns[idx].Last) + 1
+	}
+	if idx < len(vc.sparseRuns) {
+		return 0, uint64(vc.sparseRuns[idx].First)
+	}
+	return 0, clockCoordinateEnd
+}
+
+func retiredSliceSegment(retired []RetiredRange, pos uint64) (bool, uint64) {
+	if pos >= clockCoordinateEnd {
+		return false, clockCoordinateEnd
+	}
+	lo, hi := 0, len(retired)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if uint64(retired[mid].Last) < pos {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == len(retired) {
+		return false, clockCoordinateEnd
+	}
+	r := retired[lo]
+	if pos < uint64(r.First) {
+		return false, uint64(r.First)
+	}
+	return true, uint64(r.Last) + 1
+}
+
+// logicalSegment returns the exact logical value at pos and the next possible
+// transition across the immutable base and mutable overlay.
+func (vc *VectorClock) logicalSegment(pos uint64) (bool, uint32, uint64) {
+	owned, ownedNext := vc.ownedFiniteSegment(pos)
+	base, baseNext := uint32(0), clockCoordinateEnd
+	baseRetired, baseRetiredNext := uint32(0), clockCoordinateEnd
+	if vc.base != nil {
+		base, baseNext = snapshotSegment(vc.base.finite, pos)
+		baseRetired, baseRetiredNext = snapshotSegment(vc.base.retired, pos)
+	}
+	ownedRetired, ownedRetiredNext := retiredSliceSegment(vc.retired, pos)
+	causal, causalRetired := uint32(0), false
+	causalNext := clockCoordinateEnd
+	if vc.causal.Valid() && pos < clockCoordinateEnd {
+		causalRetired = vc.causal.IsRetired(uint32(pos))
+		causal = vc.causal.Get(uint32(pos))
+		// CausalView intentionally exposes point lookup on the pinned path.
+		// Cold range/comparison entry points materialize it once; retain this
+		// exact one-coordinate fallback so no internal caller can ignore it.
+		causalNext = pos + 1
+	}
+	next := ownedNext
+	if baseNext < next {
+		next = baseNext
+	}
+	if baseRetiredNext < next {
+		next = baseRetiredNext
+	}
+	if ownedRetiredNext < next {
+		next = ownedRetiredNext
+	}
+	if causalNext < next {
+		next = causalNext
+	}
+	if baseRetired != 0 || ownedRetired || causalRetired {
+		return true, 0, next
+	}
+	if base > owned {
+		owned = base
+	}
+	if causal > owned {
+		owned = causal
+	}
+	return false, owned, next
+}
+
+func (vc *VectorClock) rangeLogicalRuns(visit func(first, last, clock uint32) bool) {
+	pos := uint64(0)
+	haveRun := false
+	var first, last, runClock uint32
+	for pos < clockCoordinateEnd {
+		retired, clock, next := vc.logicalSegment(pos)
+		if next <= pos {
+			runtimeThrow("race detector vector-clock logical iterator stalled")
+		}
+		if !retired && clock != 0 {
+			a, b := uint32(pos), uint32(next-1)
+			if haveRun && last != ^uint32(0) && last+1 == a && runClock == clock {
+				last = b
+			} else {
+				if haveRun && !visit(first, last, runClock) {
+					return
+				}
+				first, last, runClock, haveRun = a, b, clock, true
+			}
+		} else if haveRun {
+			if !visit(first, last, runClock) {
+				return
+			}
+			haveRun = false
+		}
+		pos = next
+	}
+	if haveRun {
+		visit(first, last, runClock)
+	}
+}
+
+func (vc *VectorClock) rangeOwnedRuns(visit func(first, last, clock uint32) bool) {
 	var first, last, runClock uint32
 	haveRun := false
 	emit := func(nextFirst, nextLast, clock uint32) bool {
@@ -1182,6 +2189,38 @@ func (vc *VectorClock) RangeRuns(visit func(first, last, clock uint32) bool) {
 	}
 	for i, clock := range vc.denseTail {
 		if clock != 0 && !emit(uint32(DenseThreads+i), uint32(DenseThreads+i), clock) {
+			return
+		}
+	}
+	for _, run := range vc.sparseRuns {
+		if !emit(run.First, run.Last, run.Clock) {
+			return
+		}
+	}
+	if haveRun {
+		visit(first, last, runClock)
+	}
+}
+
+// rangeProjectionRuns visits the owned finite overlay except denseTail. A
+// ReleaseProjection retains that backing directly under the dense-tail COW
+// contract, so enumerating it here would recreate a wide frontier as runs.
+func (vc *VectorClock) rangeProjectionRuns(visit func(first, last, clock uint32) bool) {
+	var first, last, runClock uint32
+	haveRun := false
+	emit := func(nextFirst, nextLast, clock uint32) bool {
+		if haveRun && last != ^uint32(0) && nextFirst == last+1 && clock == runClock {
+			last = nextLast
+			return true
+		}
+		if haveRun && !visit(first, last, runClock) {
+			return false
+		}
+		first, last, runClock, haveRun = nextFirst, nextLast, clock, true
+		return true
+	}
+	for tid := uint32(0); tid <= uint32(vc.maxDense); tid++ {
+		if clock := vc.clocks[tid]; clock != 0 && !emit(tid, tid, clock) {
 			return
 		}
 	}
@@ -1217,6 +2256,10 @@ func (vc *VectorClock) JoinCanonicalRanges(ranges []FiniteRange) {
 }
 
 func (vc *VectorClock) joinCanonicalRanges(ranges []FiniteRange) {
+	if vc.base != nil {
+		vc.JoinSnapshot(newSnapshot(snapshotBuildFinite(ranges), nil))
+		return
+	}
 	var sparse []FiniteRange
 	if len(vc.retired) == 0 {
 		sparse = vc.joinUnretiredDenseRanges(ranges)
@@ -1231,6 +2274,7 @@ func (vc *VectorClock) joinDenseTailRanges(ranges []FiniteRange) []FiniteRange {
 	if len(vc.denseTail) == 0 {
 		return ranges
 	}
+	vc.detachDenseTail()
 	end := vc.denseTailEnd()
 	for i, r := range ranges {
 		if uint64(r.First) >= end {
@@ -1317,6 +2361,46 @@ func (vc *VectorClock) JoinRange(first, last, clock uint32) {
 
 // RangeRetired visits immutable +infinity ranges in ascending order.
 func (vc *VectorClock) RangeRetired(visit func(first, last uint32) bool) {
+	if vc.causal.Valid() {
+		copy := vc.CloneDetached()
+		copy.materializeCausal()
+		copy.RangeRetired(visit)
+		copy.Release()
+		return
+	}
+	if vc.base != nil {
+		pos := uint64(0)
+		for pos < clockCoordinateEnd {
+			base, baseNext := snapshotSegment(vc.base.retired, pos)
+			owned, ownedNext := retiredSliceSegment(vc.retired, pos)
+			next := baseNext
+			if ownedNext < next {
+				next = ownedNext
+			}
+			if base != 0 || owned {
+				first := pos
+				for next < clockCoordinateEnd {
+					b, bn := snapshotSegment(vc.base.retired, next)
+					o, on := retiredSliceSegment(vc.retired, next)
+					if b == 0 && !o {
+						break
+					}
+					next = bn
+					if on < next {
+						next = on
+					}
+				}
+				if !visit(uint32(first), uint32(next-1)) {
+					return
+				}
+			}
+			if next <= pos {
+				runtimeThrow("race detector vector-clock retirement iterator stalled")
+			}
+			pos = next
+		}
+		return
+	}
 	for _, r := range vc.retired {
 		if !visit(r.First, r.Last) {
 			return
@@ -1325,6 +2409,29 @@ func (vc *VectorClock) RangeRetired(visit func(first, last uint32) bool) {
 }
 
 func (vc *VectorClock) GetMaxTID() uint32 {
+	if vc.causal.Valid() {
+		copy := vc.CloneDetached()
+		copy.materializeCausal()
+		max := copy.GetMaxTID()
+		copy.Release()
+		return max
+	}
+	if vc.base != nil {
+		max := vc.ownedMaxTID()
+		for _, root := range [2]*snapshotNode{vc.base.finite, vc.base.retired} {
+			for root != nil && root.right != nil {
+				root = root.right
+			}
+			if root != nil && root.last > max {
+				max = root.last
+			}
+		}
+		return max
+	}
+	return vc.ownedMaxTID()
+}
+
+func (vc *VectorClock) ownedMaxTID() uint32 {
 	max := uint32(vc.maxDense)
 	if len(vc.denseTail) != 0 {
 		for i := len(vc.denseTail) - 1; i >= 0; i-- {
@@ -1349,6 +2456,64 @@ func (vc *VectorClock) CopyFrom(other *VectorClock) {
 	}
 	vc.Reset()
 	vc.copyFromZero(other)
+}
+
+// CopyFromDetached replaces vc with other while retaining private ownership of
+// the dense tail. Unlike CopyFrom it never makes other copy-on-write.
+func (vc *VectorClock) CopyFromDetached(other *VectorClock) {
+	if vc == other {
+		return
+	}
+	vc.Reset()
+	vc.copyFromZeroWithDenseOwnership(other, true)
+}
+
+// CanCopyFrom reports whether TryCopyFrom can replace vc with other without
+// growing any owned buffer. It does not inspect or mutate semantic contents;
+// immutable snapshot roots never require owned capacity.
+func (vc *VectorClock) CanCopyFrom(other *VectorClock) bool {
+	return vc != nil && other != nil &&
+		cap(vc.sparseRuns) >= len(other.sparseRuns) &&
+		cap(vc.retired) >= len(other.retired)
+}
+
+// CanCopyFromDetached reports whether TryCopyFromDetached can replace vc
+// without growing any privately owned buffer.
+func (vc *VectorClock) CanCopyFromDetached(other *VectorClock) bool {
+	return vc != nil && other != nil && !vc.denseTailShared &&
+		cap(vc.denseTail) >= len(other.denseTail) &&
+		cap(vc.sparseRuns) >= len(other.sparseRuns) &&
+		cap(vc.retired) >= len(other.retired)
+}
+
+// TryCopyFrom is CopyFrom with an allocation-free, all-or-nothing contract.
+// Immutable roots and the copy-on-write dense tail are shared; sparse and
+// retirement buffers remain privately owned.
+func (vc *VectorClock) TryCopyFrom(other *VectorClock) bool {
+	if vc == other {
+		return true
+	}
+	if !vc.CanCopyFrom(other) {
+		return false
+	}
+	vc.Reset()
+	vc.copyFromZero(other)
+	return true
+}
+
+// TryCopyFromDetached is CopyFromDetached with an allocation-free,
+// all-or-nothing contract. It is suitable for inactive immutable publication
+// slots: the destination remains private and the live source remains mutable.
+func (vc *VectorClock) TryCopyFromDetached(other *VectorClock) bool {
+	if vc == other {
+		return true
+	}
+	if !vc.CanCopyFromDetached(other) {
+		return false
+	}
+	vc.Reset()
+	vc.copyFromZeroWithDenseOwnership(other, true)
+	return true
 }
 
 func (vc *VectorClock) String() string {

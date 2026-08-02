@@ -8,7 +8,7 @@ package runtime
 
 import (
 	"internal/runtime/atomic"
-	_ "unsafe" // for go:linkname
+	"unsafe" // for go:linkname and the ordinary fast-path state ABI
 )
 
 // Kolkov detector state.
@@ -124,6 +124,29 @@ func kolkovGetGoid() int64 {
 
 // Linkname imports from runtime/race/kolkov/api package.
 // These functions are implemented in the Kolkov API and exported to runtime.
+
+// kolkovApiTryReadFast and kolkovApiTryWriteFast are the only ordinary-access
+// calls made directly from a user goroutine. Status values mirror
+// shadowmem.OrdinaryFastResult: 0 is miss, 1 is handled, and 2 is handled with
+// an authoritative state pointer suitable for exact read-cache publication.
+
+//go:linkname kolkovApiTryReadFast runtime/race/kolkov/api.raceTryReadFast
+func kolkovApiTryReadFast(addr, size, pc, racectx uintptr) (state unsafe.Pointer, status uint8)
+
+//go:linkname kolkovApiTryWriteFast runtime/race/kolkov/api.raceTryWriteFast
+func kolkovApiTryWriteFast(addr, size, pc, racectx uintptr) bool
+
+//go:linkname kolkovApiMaterializeOrdinaryScalar runtime/race/kolkov/api.raceMaterializeOrdinaryScalar
+func kolkovApiMaterializeOrdinaryScalar(addr, size, racectx uintptr) bool
+
+//go:linkname kolkovApiTryAcquireFast runtime/race/kolkov/api.raceTryAcquireFast
+func kolkovApiTryAcquireFast(addr, racectx uintptr) bool
+
+//go:linkname kolkovApiTryReleaseFast runtime/race/kolkov/api.raceTryReleaseFast
+func kolkovApiTryReleaseFast(addr, racectx uintptr) bool
+
+//go:linkname kolkovApiTryReleaseMergeFast runtime/race/kolkov/api.raceTryReleaseMergeFast
+func kolkovApiTryReleaseMergeFast(addr, racectx uintptr) bool
 
 //go:linkname kolkovApiOnRead runtime/race/kolkov/api.raceread
 func kolkovApiOnRead(addr, pc uintptr)

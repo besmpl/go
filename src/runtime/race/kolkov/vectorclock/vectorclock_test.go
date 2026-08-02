@@ -1716,6 +1716,66 @@ func BenchmarkVectorClockIncrementSparseSingleton(b *testing.B) {
 	}
 }
 
+func TestKnownMonotonicSetExactRepresentations(t *testing.T) {
+	t.Run("interior sparse run", func(t *testing.T) {
+		vc := New()
+		const tid = uint32(DenseThreads + 101)
+		vc.JoinRange(tid-1, tid+1, 7)
+		vc.PrepareKnownMonotonicSet(tid)
+		vc.SetKnownMonotonicAlive(tid, 8)
+		for id, want := range map[uint32]uint32{tid - 1: 7, tid: 8, tid + 1: 7} {
+			if got := vc.Get(id); got != want {
+				t.Fatalf("clock[%d] = %d, want %d", id, got, want)
+			}
+		}
+	})
+
+	t.Run("immutable base overlay", func(t *testing.T) {
+		vc := New()
+		const tid = uint32(DenseThreads + 10_001)
+		vc.Set(tid, 11)
+		vc.Set(17, 5)
+		vc.Freeze()
+		vc.PrepareKnownMonotonicSet(tid)
+		vc.SetKnownMonotonicAlive(tid, 12)
+		if got := vc.Get(tid); got != 12 {
+			t.Fatalf("base-backed clock = %d, want 12", got)
+		}
+		if got := vc.Get(17); got != 5 {
+			t.Fatalf("unrelated base clock = %d, want 5", got)
+		}
+	})
+}
+
+func TestKnownMonotonicSetCommitDoesNotAllocate(t *testing.T) {
+	vc := New()
+	const tid = uint32(DenseThreads + 50_000)
+	vc.Set(tid, 1)
+	clock := uint32(1)
+	allocs := testing.AllocsPerRun(1000, func() {
+		vc.PrepareKnownMonotonicSet(tid)
+		clock++
+		vc.SetKnownMonotonicAlive(tid, clock)
+	})
+	if allocs != 0 {
+		t.Fatalf("prepared monotonic commits allocated: %v allocs/run", allocs)
+	}
+}
+
+func BenchmarkVectorClockKnownMonotonicSparseSingleton(b *testing.B) {
+	vc := New()
+	const tid = uint32(DenseThreads + 50_000)
+	vc.Set(tid, 1)
+	clock := uint32(1)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		vc.PrepareKnownMonotonicSet(tid)
+		clock++
+		vc.SetKnownMonotonicAlive(tid, clock)
+	}
+}
+
 func BenchmarkVectorClockSetSparseSingletonMonotonicJump(b *testing.B) {
 	for _, benchmark := range []struct {
 		name string

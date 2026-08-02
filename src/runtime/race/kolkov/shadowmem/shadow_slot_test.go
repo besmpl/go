@@ -219,3 +219,25 @@ func TestShadowSlotLockGroupsLocksEachEquivalenceGroupOnce(t *testing.T) {
 		t.Fatal("partial transaction redirected the wrong lanes")
 	}
 }
+
+func TestShadowSlotRevisionBracketsEveryMembershipTransaction(t *testing.T) {
+	var slot ShadowSlot
+	if got := slot.mu.state.Load(); got != 0 {
+		t.Fatalf("initial revision = %d, want 0", got)
+	}
+
+	state := slot.Isolate(0)
+	if got := slot.mu.state.Load(); got != 2 {
+		t.Fatalf("revision after first isolate = %d, want 2", got)
+	}
+	state.UnlockAccess()
+
+	// Even a transaction which retains the exact mapping advances the revision.
+	// Runtime certificates may miss conservatively, but can never survive a
+	// slot transaction whose semantic visitor could redirect membership.
+	state = slot.Isolate(0)
+	if got := slot.mu.state.Load(); got != 4 {
+		t.Fatalf("revision after retained isolate = %d, want 4", got)
+	}
+	state.UnlockAccess()
+}

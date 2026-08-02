@@ -40,6 +40,11 @@ func (pt *PageTableShadow) GetSlot(addr uintptr) *ShadowSlot {
 	return pt.fallback.GetSlot(addr)
 }
 
+// PromotedReadCapability is unavailable without the versioned direct slot.
+func (pt *PageTableShadow) PromotedReadCapability(_ uintptr, _ uintptr, _ uint32, _ *VarState) *PromotedReadCapability {
+	return nil
+}
+
 // MaterializeReadHintSlot is unavailable without the direct page-table layout.
 func (pt *PageTableShadow) MaterializeReadHintSlot(_ uintptr) bool {
 	return false
@@ -58,6 +63,16 @@ func (pt *PageTableShadow) TryCompactWrite(_ uintptr, _ epoch.Epoch, _ *vectorcl
 // TryCompactRead is unavailable without the direct page-table block layout.
 func (pt *PageTableShadow) TryCompactRead(_ uintptr, _ epoch.Epoch, _ *vectorclock.VectorClock, _ uintptr) CompactReadResult {
 	return CompactReadMiss
+}
+
+// TryOrdinaryRead is unavailable without the direct page-table layout.
+func (pt *PageTableShadow) TryOrdinaryRead(_ uintptr, _ uintptr, _ epoch.Epoch, _ *vectorclock.VectorClock, _ uintptr) (OrdinaryFastResult, *VarState) {
+	return OrdinaryFastMiss, nil
+}
+
+// TryOrdinaryWrite is unavailable without the direct page-table layout.
+func (pt *PageTableShadow) TryOrdinaryWrite(_ uintptr, _ uintptr, _ epoch.Epoch, _ *vectorclock.VectorClock, _ uintptr) bool {
+	return false
 }
 
 // AccessRange uses the exact slot protocol on architectures without the

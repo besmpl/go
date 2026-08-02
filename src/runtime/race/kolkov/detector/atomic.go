@@ -45,6 +45,7 @@ type atomicPCClassCacheEntry struct {
 
 var atomicPCClassCache [atomicPCClassCacheSlots]atomicPCClassCacheEntry
 var plainPCClassCache [atomicPCClassCacheSlots]atomicPCClassCacheEntry
+var internalRMWPCClassCache [atomicPCClassCacheSlots]atomicPCClassCacheEntry
 
 // atomicInternalMutexPC keeps symbolization off the steady atomic path. The two
 // independently atomic class slots make every cache hit pair-consistent without
@@ -69,6 +70,37 @@ func atomicInternalMutexPC(pc uintptr) bool {
 		entry.userPC.Store(pc)
 	}
 	return internal
+}
+
+// atomicInternalRMWFastPC identifies internal/sync Mutex's private atomics.
+// RWMutex and WaitGroup already bracket their implementation atomics with
+// race.Disable and reach the numeric bridge through sync/atomic method wrappers,
+// so neither family belongs in this PC classifier.
+func atomicInternalRMWFastPC(pc uintptr) bool {
+	if pc <= 0x10000 {
+		return false
+	}
+	entry := &internalRMWPCClassCache[(pc>>4)&(atomicPCClassCacheSlots-1)]
+	if entry.userPC.Load() == pc {
+		return false
+	}
+	if entry.internalPC.Load() == pc {
+		return true
+	}
+	internal := pcHasFunctionPrefix(pc, "internal/sync.(*Mutex).")
+	if internal {
+		entry.internalPC.Store(pc)
+	} else {
+		entry.userPC.Store(pc)
+	}
+	return internal
+}
+
+// AtomicInternalRMWPC reports whether pc belongs to an internal/sync Mutex
+// atomic whose synchronization is modeled by Mutex's explicit race
+// Acquire/Release annotations. Access history is still retained.
+func AtomicInternalRMWPC(pc uintptr) bool {
+	return atomicInternalRMWFastPC(pc)
 }
 
 func rwMutexMarkerPC(pc uintptr) bool {
@@ -100,6 +132,11 @@ func pcHasFunctionPrefix(pc uintptr, prefix string) bool {
 
 const atomicReleaseDeltaCapacity = 64
 
+const (
+	atomicReleasePromotionCoordinateThreshold = 64
+	atomicReleaseSnapshotCheckPeriod          = 64
+)
+
 type atomicReleaseDelta struct {
 	version uint64
 	tid     uint32
@@ -123,20 +160,94 @@ func newAtomicReleaseStream() uint64 {
 	}
 }
 
-// atomicRelease retains an exact canonical snapshot plus a bounded suffix of
-// monotonic point updates. Once refs reaches zero, atomicState may recycle the
+// atomicRelease starts with an exact canonical checkpoint plus a bounded suffix
+// of monotonic point updates. Fragmented long-lived streams promote to an exact
+// immutable causal lineage. Once refs reaches zero, atomicState may recycle the
 // object and its buffers, but every reuse receives a new non-ABA stream.
 type atomicRelease struct {
 	arena    *AtomicHistoryArena
 	runs     *atomicReleaseRange
 	retired  *atomicReleaseRange
+	snapshot *vectorclock.ClockSnapshot
+	// lineage is the authoritative exact release image after promotion. view
+	// owns one pin of its current version; the lineage itself owns the open
+	// segment independently. Canonical ranges remain a dominated migration
+	// checkpoint and are not updated on the promoted steady path.
+	lineage *vectorclock.ClockLineage
+	view    vectorclock.CausalView
+	// imports retain unrelated immutable roots which are part of the current
+	// promoted release image. Together with view they form one exact logical
+	// release; version covers changes to any member of this composite.
+	imports [vectorclock.CausalRootCapacity - 1]vectorclock.CausalView
+	importN uint8
+	// deferred is the exact replaceable weak-publication checkpoint. It keeps
+	// immutable bases, roots, and a shared COW dense frontier structural rather
+	// than rebuilding the primary lineage's flat anchor.
+	deferred *vectorclock.ReleaseProjection
 	deltas   [atomicReleaseDeltaCapacity]atomicReleaseDelta
 	freeNext *atomicRelease
 	stream   uint64
 	version  uint64
-	refs     uint8
-	deltaN   uint8
-	deltaAt  uint8
+	// structureVersion changes only when non-primary promoted-release state
+	// changes. A strong context binding at the same structure version already
+	// owns those immutable components and need only advance the primary view.
+	structureVersion uint32
+	refs             uint8
+	deltaN           uint8
+	deltaAt          uint8
+}
+
+// atomicReleaseCausalSet returns borrowed views for the exact current promoted
+// release. The release transaction lock keeps their ownership alive. Only the
+// returned prefix is initialized; every consumer is count-bounded so the hot
+// publication path need not clear unused pointer-bearing slots.
+func atomicReleaseCausalSet(release *atomicRelease, dst *[vectorclock.CausalRootCapacity]vectorclock.CausalView) int {
+	if release == nil || !release.view.Valid() {
+		return 0
+	}
+	dst[0] = release.view
+	n := 1 + int(release.importN)
+	copy(dst[1:n], release.imports[:release.importN])
+	return n
+}
+
+func clearAtomicReleaseImports(release *atomicRelease) {
+	for i := uint8(0); i < release.importN; i++ {
+		release.imports[i].Release()
+	}
+	clear(release.imports[:])
+	release.importN = 0
+}
+
+func clearAtomicReleaseDeferred(release *atomicRelease) {
+	if release == nil || release.deferred == nil {
+		return
+	}
+	release.deferred.Release()
+	release.deferred = nil
+}
+
+// addAtomicReleaseRoot normalizes one borrowed root into roots. False means
+// that the exact union exceeds the fixed promoted-release capacity.
+func addAtomicReleaseRoot(roots *[vectorclock.CausalRootCapacity]vectorclock.CausalView, n *int, incoming vectorclock.CausalView) bool {
+	if !incoming.Valid() {
+		return true
+	}
+	for i := 0; i < *n; i++ {
+		if !roots[i].SameFamily(incoming) {
+			continue
+		}
+		if incoming.Version() > roots[i].Version() {
+			roots[i] = incoming
+		}
+		return true
+	}
+	if *n == len(roots) {
+		return false
+	}
+	roots[*n] = incoming
+	*n = *n + 1
+	return true
 }
 
 // atomicState is deliberately separate from VarState's ordinary FastTrack
@@ -150,10 +261,36 @@ type atomicState struct {
 	freeNext *atomicState
 	// mu remains held across the hardware access. Distinct histories involved
 	// in one mixed-width operation are locked in stable pointer order.
-	mu     spinlock
-	base   uintptr
-	reads  atomicHistory
-	writes atomicHistory
+	mu spinlock
+	// rmwQueue serializes public-RMW waiter registration with exact-fast
+	// ownership transfer. rmwOwner is true while mu is owned by an exact-fast
+	// transaction, including while ownership is reserved for one woken waiter.
+	// A waiter retains its AtomicFastPath in its token while sleeping, which
+	// freezes both this state and the descriptor generation.
+	rmwQueue spinlock
+	rmwSema  uint32
+	// rmwSpinnerEpoch is a one-bit doorbell. The retained spinner waits on the
+	// user G while it is zero; every exact-fast owner completion stores one.
+	// Resume consumes that one under rmwQueue before competing for mu again.
+	rmwSpinnerEpoch    uint32
+	rmwWaiters         uint32
+	rmwSpinnerTID      uint32
+	rmwSpinnerMisses   uint8
+	rmwCohortOps       uint16
+	rmwForceSpinner    bool
+	rmwPromoteParked   bool
+	rmwPromotedOwner   bool
+	rmwWakeCompetitors uint32
+	rmwGrantTID        uint32
+	rmwOwner           bool
+	rmwOwnerPolite     bool
+	rmwGranted         bool
+	rmwRecentOwners    [4]uint32
+	rmwRecentAt        uint8
+	rmwRecentN         uint8
+	base               uintptr
+	reads              atomicHistory
+	writes             atomicHistory
 	// plainReads retains exact scalar-reader attribution once an internal
 	// mutex marker creates the overlay. VarState has only one aggregate read
 	// PC, which is insufficient after concurrent RWMutex marker reads promote.
@@ -182,6 +319,334 @@ type atomicState struct {
 	transactionContext  *goroutine.RaceContext
 	transactionSyncMode int8 // -1 accepts ignored/general completion; 0/1 is exact.
 	transactionActive   bool
+	// directRMWRelease is the exact release proven before hardware. A valid
+	// directRMWAppend owns a promoted lineage's writer guard across hardware;
+	// PrepareAppend performed every allocation/rotation before that boundary.
+	directRMWRelease *atomicRelease
+	directRMWAppend  vectorclock.PreparedCausalAppend
+}
+
+// rmwCohortLimit bounds the number of public exact-fast completions which may
+// pass a registered parked waiter while one retained spinner competes with new
+// arrivals. The owner-side count is deliberately independent of spinner
+// scheduling: a descheduled spinner cannot let the competitive cohort starve
+// the semaphore queue indefinitely.
+//
+// A promotion crosses the user-goroutine scheduler and is several orders of
+// magnitude more expensive than the short exact-fast transaction it protects.
+// Limiting that tax to at most one completion in 4096 preserves a deterministic
+// progress bound without turning a large waiter population into a scheduler
+// benchmark. This is an operation bound, not a time or workload heuristic.
+const (
+	rmwCohortLimit      = uint16(4096)
+	rmwPatientTIDSpread = uint32(128)
+)
+
+// publicRMWPatientLocked classifies only the retry delay. A wide span between
+// the spinner and the current owner is an allocation-free proxy for a large
+// exact-address cohort. Using only the current owner prevents sequential small
+// cohorts with monotonically increasing TIDs from being misclassified as one
+// large cohort. The marker never changes admission, ownership, modification
+// order, or the existing 64-miss/4096-completion progress bounds.
+func (s *atomicState) publicRMWPatientLocked(tid uint32) bool {
+	if s.rmwRecentN == 0 {
+		return false
+	}
+	index := (s.rmwRecentAt + uint8(len(s.rmwRecentOwners)) - 1) % uint8(len(s.rmwRecentOwners))
+	owner := s.rmwRecentOwners[index]
+	if owner > tid {
+		return owner-tid >= rmwPatientTIDSpread
+	}
+	return tid-owner >= rmwPatientTIDSpread
+}
+
+func (s *atomicState) setPublicRMWPatientTokenLocked(tid uint32, token *AtomicToken) {
+	if token == nil {
+		return
+	}
+	token[2] = nil
+	if s.publicRMWPatientLocked(tid) {
+		// token[0] already retains the exact capability and therefore the state;
+		// repeating it is a GC-visible, allocation-free scheduling marker.
+		token[2] = token[0]
+	}
+}
+
+func (s *atomicState) setPublicRMWOwnerLocked(tid uint32) {
+	repeat := false
+	for i := uint8(0); i < s.rmwRecentN; i++ {
+		if s.rmwRecentOwners[i] == tid {
+			repeat = true
+			break
+		}
+	}
+	s.rmwRecentOwners[s.rmwRecentAt] = tid
+	s.rmwRecentAt = (s.rmwRecentAt + 1) % uint8(len(s.rmwRecentOwners))
+	if s.rmwRecentN < uint8(len(s.rmwRecentOwners)) {
+		s.rmwRecentN++
+	}
+	s.rmwOwner = true
+	s.rmwOwnerPolite = repeat
+}
+
+func (s *atomicState) beginExactFastOwner(tid uint32) {
+	s.rmwQueue.lock()
+	if s.rmwOwner || s.rmwGranted {
+		s.rmwQueue.unlock()
+		atomicRuntimeThrow("race detector invalid exact atomic owner state")
+	}
+	s.setPublicRMWOwnerLocked(tid)
+	s.rmwQueue.unlock()
+}
+
+// tryBeginPublicRMW either acquires the exact-fast lock, registers one retained
+// waiter behind an exact-fast owner, or reports a clean retry behind a holder
+// which cannot participate in direct handoff.
+func (s *atomicState) tryBeginPublicRMW(fast *shadowmem.AtomicFastPath, token *AtomicToken, tid uint32) (acquired, spin, polite bool, park *uint32) {
+	if s.mu.tryLock() {
+		s.beginExactFastOwner(tid)
+		return true, false, false, nil
+	}
+	if !s.rmwQueue.tryLock() {
+		return false, false, false, nil
+	}
+	if s.mu.tryLock() {
+		if s.rmwOwner || s.rmwGranted {
+			s.rmwQueue.unlock()
+			atomicRuntimeThrow("race detector invalid exact atomic owner acquisition")
+		}
+		s.setPublicRMWOwnerLocked(tid)
+		s.rmwQueue.unlock()
+		return true, false, false, nil
+	}
+	if !s.rmwOwner {
+		s.rmwQueue.unlock()
+		return false, false, false, nil
+	}
+	if s.rmwSpinnerTID == 0 && !s.rmwGranted && !s.rmwPromoteParked {
+		if iatomic.Load(&s.rmwSpinnerEpoch) != 0 || s.rmwSpinnerMisses != 0 || s.rmwForceSpinner {
+			s.rmwQueue.unlock()
+			atomicRuntimeThrow("race detector invalid atomic RMW spinner enrollment")
+		}
+		s.rmwSpinnerTID = tid
+		token[0] = unsafe.Pointer(fast)
+		s.setPublicRMWPatientTokenLocked(tid, token)
+		park = &s.rmwSpinnerEpoch
+		s.rmwQueue.unlock()
+		return false, true, s.rmwOwnerPolite, park
+	}
+	if s.rmwWaiters == ^uint32(0) {
+		s.rmwQueue.unlock()
+		atomicRuntimeThrow("race detector atomic RMW waiter overflow")
+	}
+	s.rmwWaiters++
+	token[0] = unsafe.Pointer(fast)
+	s.setPublicRMWPatientTokenLocked(tid, token)
+	park = &s.rmwSema
+	s.rmwQueue.unlock()
+	return false, false, false, park
+}
+
+func (s *atomicState) retryPublicRMWSpinner(tid uint32, token *AtomicToken) (acquired, spin, polite bool, park *uint32) {
+	s.rmwQueue.lock()
+	s.setPublicRMWPatientTokenLocked(tid, token)
+	if s.rmwGranted {
+		// A semaphore competitor released by a promoted spinner may be runnable
+		// while a later cohort reserves mu for a different spinner. The wake is
+		// still valid, but it cannot consume that TID-specific grant. Put its
+		// retained capability back on the parked queue; the reserved owner will
+		// hand mu to one parked waiter when it completes.
+		if s.rmwGrantTID != 0 && s.rmwGrantTID != tid {
+			if s.rmwWakeCompetitors == 0 {
+				s.rmwQueue.unlock()
+				atomicRuntimeThrow("race detector invalid forced atomic RMW competitor")
+			}
+			s.rmwWakeCompetitors--
+			if s.rmwWaiters == ^uint32(0) {
+				s.rmwQueue.unlock()
+				atomicRuntimeThrow("race detector atomic RMW waiter overflow")
+			}
+			s.rmwWaiters++
+			park = &s.rmwSema
+			s.rmwQueue.unlock()
+			return false, false, false, park
+		}
+		if !s.rmwOwner || s.mu.state.Load() == 0 {
+			s.rmwQueue.unlock()
+			atomicRuntimeThrow("race detector invalid atomic RMW grant")
+		}
+		promoted := false
+		if s.rmwGrantTID != 0 {
+			if s.rmwGrantTID != tid || s.rmwSpinnerTID != tid || iatomic.Load(&s.rmwSpinnerEpoch) != 1 {
+				s.rmwQueue.unlock()
+				atomicRuntimeThrow("race detector invalid forced atomic RMW grant")
+			}
+			iatomic.Store(&s.rmwSpinnerEpoch, 0)
+			s.rmwSpinnerTID = 0
+			s.rmwSpinnerMisses = 0
+			s.rmwCohortOps = 0
+			s.rmwForceSpinner = false
+			promoted = s.rmwPromoteParked
+			s.rmwPromoteParked = false
+		} else if s.rmwSpinnerTID != 0 || iatomic.Load(&s.rmwSpinnerEpoch) != 0 {
+			s.rmwQueue.unlock()
+			atomicRuntimeThrow("race detector invalid parked atomic RMW grant")
+		}
+		s.rmwGranted = false
+		s.rmwGrantTID = 0
+		s.setPublicRMWOwnerLocked(tid)
+		s.rmwPromotedOwner = promoted
+		s.rmwQueue.unlock()
+		return true, false, false, nil
+	}
+	if s.rmwSpinnerTID != tid {
+		if s.rmwWakeCompetitors == 0 {
+			s.rmwQueue.unlock()
+			atomicRuntimeThrow("race detector invalid atomic RMW resume")
+		}
+		s.rmwWakeCompetitors--
+		if s.mu.tryLock() {
+			if s.rmwOwner || s.rmwGranted {
+				s.rmwQueue.unlock()
+				atomicRuntimeThrow("race detector invalid atomic RMW competitor acquisition")
+			}
+			s.setPublicRMWOwnerLocked(tid)
+			s.rmwQueue.unlock()
+			return true, false, false, nil
+		}
+		if s.rmwSpinnerTID == 0 && !s.rmwGranted && !s.rmwPromoteParked {
+			if iatomic.Load(&s.rmwSpinnerEpoch) != 0 || s.rmwSpinnerMisses != 0 || s.rmwForceSpinner {
+				s.rmwQueue.unlock()
+				atomicRuntimeThrow("race detector invalid atomic RMW competitor enrollment")
+			}
+			s.rmwSpinnerTID = tid
+			park = &s.rmwSpinnerEpoch
+			s.rmwQueue.unlock()
+			return false, true, s.rmwOwnerPolite, park
+		}
+		if s.rmwWaiters == ^uint32(0) {
+			s.rmwQueue.unlock()
+			atomicRuntimeThrow("race detector atomic RMW waiter overflow")
+		}
+		s.rmwWaiters++
+		park = &s.rmwSema
+		s.rmwQueue.unlock()
+		return false, false, false, park
+	}
+	if iatomic.Load(&s.rmwSpinnerEpoch) != 1 {
+		s.rmwQueue.unlock()
+		atomicRuntimeThrow("race detector invalid atomic RMW spinner")
+	}
+	park = &s.rmwSpinnerEpoch
+	if s.mu.tryLock() {
+		if s.rmwOwner {
+			s.rmwQueue.unlock()
+			atomicRuntimeThrow("race detector invalid atomic RMW spinner acquisition")
+		}
+		iatomic.Store(&s.rmwSpinnerEpoch, 0)
+		s.rmwSpinnerTID = 0
+		s.rmwSpinnerMisses = 0
+		s.rmwCohortOps = 0
+		s.rmwForceSpinner = false
+		s.setPublicRMWOwnerLocked(tid)
+		s.rmwQueue.unlock()
+		return true, false, false, nil
+	}
+	// The doorbell corresponds to one completed ownership epoch. Consume it
+	// before counting the steal so repeated Resume calls cannot inflate misses.
+	iatomic.Store(&s.rmwSpinnerEpoch, 0)
+	if s.rmwSpinnerMisses < 64 {
+		s.rmwSpinnerMisses++
+	}
+	if s.rmwSpinnerMisses == 64 {
+		s.rmwForceSpinner = true
+	}
+	s.rmwQueue.unlock()
+	return false, true, s.rmwOwnerPolite, park
+}
+
+// endExactFastOwner reserves the logically-held mu for exactly one waiter.
+// The returned semaphore must be released after leaving systemstack. With no
+// registered waiter, it performs the ordinary unlock.
+func (s *atomicState) endExactFastOwner() (wake *uint32) {
+	s.rmwQueue.lock()
+	if s.rmwGranted || s.mu.state.Load() == 0 {
+		s.rmwQueue.unlock()
+		atomicRuntimeThrow("race detector invalid exact atomic owner completion")
+	}
+	// A forced spinner with parked waiters becomes a one-operation bridge back
+	// to unlocked competition. Do not reserve mu for a parked waiter here: that
+	// would make every following owner directly grant the next semaphore waiter
+	// before a spinner can enroll, degenerating into one scheduler handoff per
+	// hardware operation. If nobody enrolled as spinner during this operation,
+	// wake one waiter as an unreserved competitor. Its Resume either acquires mu,
+	// becomes the spinner behind a new owner, or rejoins the parked queue.
+	if s.rmwPromotedOwner {
+		s.rmwPromotedOwner = false
+		if s.rmwSpinnerTID == 0 {
+			s.rmwOwner = false
+			s.rmwOwnerPolite = false
+			s.rmwCohortOps = 0
+			s.mu.unlock()
+			if s.rmwWaiters != 0 {
+				s.rmwWaiters--
+				if s.rmwWakeCompetitors == ^uint32(0) {
+					s.rmwQueue.unlock()
+					atomicRuntimeThrow("race detector atomic RMW competitor overflow")
+				}
+				s.rmwWakeCompetitors++
+				wake = &s.rmwSema
+			}
+			s.rmwQueue.unlock()
+			return wake
+		}
+	}
+	if s.rmwSpinnerTID != 0 {
+		if s.rmwWaiters != 0 {
+			if s.rmwCohortOps < rmwCohortLimit {
+				s.rmwCohortOps++
+			}
+			if s.rmwCohortOps == rmwCohortLimit {
+				s.rmwForceSpinner = true
+			}
+		} else {
+			s.rmwCohortOps = 0
+		}
+		if s.rmwForceSpinner {
+			s.rmwOwner = true
+			s.rmwGranted = true
+			s.rmwGrantTID = s.rmwSpinnerTID
+			s.rmwPromoteParked = s.rmwWaiters != 0
+			iatomic.Store(&s.rmwSpinnerEpoch, 1)
+			s.rmwQueue.unlock()
+			return nil
+		}
+		s.rmwOwner = false
+		s.rmwOwnerPolite = false
+		s.mu.unlock()
+		iatomic.Store(&s.rmwSpinnerEpoch, 1)
+		s.rmwQueue.unlock()
+		return nil
+	}
+	if !s.rmwOwner {
+		s.mu.unlock()
+		s.rmwQueue.unlock()
+		return nil
+	}
+	if s.rmwWaiters != 0 {
+		s.rmwWaiters--
+		s.rmwGranted = true
+		s.rmwCohortOps = 0
+		wake = &s.rmwSema
+		s.rmwQueue.unlock()
+		return wake
+	}
+	s.rmwOwner = false
+	s.rmwOwnerPolite = false
+	s.rmwCohortOps = 0
+	s.mu.unlock()
+	s.rmwQueue.unlock()
+	return nil
 }
 
 //go:nocheckptr
@@ -238,6 +703,9 @@ func (s *atomicState) endTransaction() {
 	if !s.transactionActive {
 		atomicRuntimeThrow("race detector atomic transaction imbalance")
 	}
+	if s.directRMWRelease != nil || s.directRMWAppend.Valid() {
+		atomicRuntimeThrow("race detector retained direct RMW publication proof")
+	}
 	s.transactionAddr, s.transactionSize, s.transactionContext = 0, 0, nil
 	s.transactionSyncMode, s.transactionActive = 0, false
 }
@@ -270,6 +738,18 @@ func (s *atomicState) registerReadFrontier(ctx *goroutine.RaceContext, mask uint
 			node.clock.Store(uint32(ctx.GetEpoch()))
 			return node
 		}
+	}
+	frontier := &s.reads.user
+	if internal {
+		frontier = &s.reads.internal
+	}
+	// This locked load is the exact semantic point at which ctx.C may replace
+	// older folded reads. Apply the canonical history's geometric compaction
+	// policy before moving the new witness to its lock-free frontier. Deferring
+	// the proof until cache eviction would be unsound: synchronization after the
+	// load may add foreign clocks which did not happen before this read.
+	if _, exists := frontier.find(ctx.TID); !exists && frontier.shouldPruneBeforeInsert() {
+		pruneAtomicAccess(&s.reads, ctx, mask, internal)
 	}
 	node := spare
 	if node != nil {
@@ -418,6 +898,12 @@ func (s *atomicState) releaseMembership(release *atomicRelease) uint8 {
 }
 
 func releaseHasForeignMetadata(release *atomicRelease, own uint32) bool {
+	if release.lineage != nil {
+		// Promoted imports deliberately use the conservative foreign path. A
+		// lineage point lookup cannot prove that no other coordinate exists,
+		// and scanning it would recreate the quadratic work it replaces.
+		return true
+	}
 	for run := release.runs; run != nil; run = run.next {
 		if run.first != own || run.last != own {
 			return true
@@ -513,6 +999,29 @@ func retireAtomicReleaseRanges(clock *vectorclock.VectorClock, head *atomicRelea
 	clock.RetireRanges(ranges)
 }
 
+func joinAtomicReleaseCausalSet(clock *vectorclock.VectorClock, release *atomicRelease) {
+	if release != nil && release.deferred != nil {
+		release.deferred.JoinInto(clock)
+	}
+	var roots [vectorclock.CausalRootCapacity]vectorclock.CausalView
+	n := atomicReleaseCausalSet(release, &roots)
+	if clock.TryJoinCausalSet(&roots, n) {
+		return
+	}
+	// Capacity overflow is a cold exact path. JoinCausal materializes as needed
+	// rather than discarding any member of the composite release.
+	for i := 0; i < n; i++ {
+		clock.JoinCausal(roots[i])
+	}
+}
+
+func atomicReleaseDominatesResidual(clock *vectorclock.VectorClock, release *atomicRelease, roots *[vectorclock.CausalRootCapacity]vectorclock.CausalView, n int, ownTID uint32) bool {
+	if release != nil && release.deferred != nil {
+		return clock.ResidualLessOrEqualReleaseProjection(roots, n, release.deferred, ownTID)
+	}
+	return clock.ResidualLessOrEqualCausalSet(roots, n, ownTID)
+}
+
 // acquire imports each unique current release once. Exact current-version
 // cache hits are O(1); older hits replay a complete bounded delta suffix, and
 // every other case joins the exact canonical checkpoint.
@@ -540,8 +1049,43 @@ func (s *atomicState) acquire(ctx *goroutine.RaceContext, mask uint8) {
 		seen[seenCount] = release
 		seenCount++
 		membership := s.releaseMembership(release)
-		seenVersion, wasStrong, cacheHit := ctx.LookupAtomicRelease(unsafe.Pointer(release), release.stream, membership)
+		seenVersion, seenStructure, wasStrong, cacheHit := ctx.LookupAtomicReleaseStructure(unsafe.Pointer(release), release.stream, membership)
 		if cacheHit && seenVersion == release.version {
+			if release.lineage != nil && !wasStrong {
+				var roots [vectorclock.CausalRootCapacity]vectorclock.CausalView
+				n := atomicReleaseCausalSet(release, &roots)
+				if atomicReleaseDominatesResidual(ctx.C, release, &roots, n, ctx.TID) {
+					// Another synchronization invalidated the generation proof but
+					// added no residual metadata beyond this unchanged release. Restore
+					// the exact strong binding without joining or advancing anything.
+					ctx.RecordAtomicReleaseStructure(unsafe.Pointer(release), release.stream, release.version, release.structureVersion, membership, true)
+				}
+			}
+			continue
+		}
+
+		if release.lineage != nil {
+			if cacheHit && wasStrong && seenStructure == release.structureVersion {
+				// A strong prior binding with unchanged non-primary structure
+				// already owns the deferred projection and imported roots. Only
+				// the append-only primary view can have advanced, so importing that
+				// view is the exact delta instead of replaying the wide base.
+				ctx.NoteForeignImport()
+				ctx.C.JoinCausal(release.view)
+				ctx.RecordAtomicReleaseStructure(unsafe.Pointer(release), release.stream, release.version, release.structureVersion, membership, true)
+				continue
+			}
+			var roots [vectorclock.CausalRootCapacity]vectorclock.CausalView
+			n := atomicReleaseCausalSet(release, &roots)
+			strong := wasStrong || atomicReleaseDominatesResidual(ctx.C, release, &roots, n, ctx.TID)
+			// Invalidate every other strong publication proof before recording
+			// this exact release. This conservative ordering avoids a lineage
+			// scan while keeping a current release proof strong for the following
+			// RMW publication only when the exact pre-import residual was already
+			// dominated by this release.
+			ctx.NoteForeignImport()
+			joinAtomicReleaseCausalSet(ctx.C, release)
+			ctx.RecordAtomicReleaseStructure(unsafe.Pointer(release), release.stream, release.version, release.structureVersion, membership, strong)
 			continue
 		}
 
@@ -551,17 +1095,21 @@ func (s *atomicState) acquire(ctx *goroutine.RaceContext, mask uint8) {
 				if foreign {
 					ctx.NoteForeignImport()
 				}
-				ctx.RecordAtomicRelease(unsafe.Pointer(release), release.stream, release.version, membership, wasStrong)
+				ctx.RecordAtomicReleaseStructure(unsafe.Pointer(release), release.stream, release.version, release.structureVersion, membership, wasStrong)
 				continue
 			}
 		}
 
-		joinAtomicReleaseRanges(ctx.C, release.runs)
-		retireAtomicReleaseRanges(ctx.C, release.retired)
+		if release.snapshot != nil {
+			ctx.C.JoinSnapshot(release.snapshot)
+		} else {
+			joinAtomicReleaseRanges(ctx.C, release.runs)
+			retireAtomicReleaseRanges(ctx.C, release.retired)
+		}
 		if releaseHasForeignMetadata(release, ctx.TID) {
 			ctx.NoteForeignImport()
 		}
-		ctx.RecordAtomicRelease(unsafe.Pointer(release), release.stream, release.version, membership, wasStrong || freshOnlyOwn)
+		ctx.RecordAtomicReleaseStructure(unsafe.Pointer(release), release.stream, release.version, release.structureVersion, membership, wasStrong || freshOnlyOwn)
 	}
 }
 
@@ -600,6 +1148,9 @@ func (s *atomicState) allocateRelease() *atomicRelease {
 }
 
 func snapshotAtomicRelease(release *atomicRelease, ctx *goroutine.RaceContext) {
+	if release.lineage != nil {
+		atomicRuntimeThrow("race detector rebuilt promoted atomic release")
+	}
 	release.arena.freeRangeList(release.runs)
 	release.arena.freeRangeList(release.retired)
 	release.runs, release.retired = nil, nil
@@ -621,6 +1172,130 @@ func snapshotAtomicRelease(release *atomicRelease, ctx *goroutine.RaceContext) {
 	})
 	release.deltaN = 0
 	release.deltaAt = 0
+	if release.snapshot != nil {
+		// Canonical arena ranges remain authoritative. Rebuild the immutable
+		// selector from those ranges rather than retaining any incidental
+		// metadata the publishing context may have acquired after its cached
+		// proof was recorded.
+		release.snapshot = freezeAtomicReleaseCanonical(release)
+	} else {
+		maybePromoteAtomicRelease(release, ctx)
+	}
+}
+
+// initializeAtomicReleaseComposite captures a context which already consists
+// of a small retained causal-root set plus its own live coordinate without
+// materializing those shared roots into eager per-TID ranges. This is the
+// important second-synchronization-object case: a goroutine which acquired one
+// wide atomic release can publish another exact release in O(root count)
+// rather than copying the first release's entire cohort.
+//
+// False requests the existing exact canonical snapshot fallback. Every bound
+// here is only an accelerator bound: no root or residual coordinate is dropped.
+func initializeAtomicReleaseComposite(release *atomicRelease, ctx *goroutine.RaceContext) bool {
+	if release == nil || ctx == nil || ctx.C == nil || release.lineage != nil || release.snapshot != nil {
+		return false
+	}
+	var roots [vectorclock.CausalRootCapacity]vectorclock.CausalView
+	n := ctx.C.BorrowCausalRoots(&roots)
+	// One slot is required for this release's independently appendable primary
+	// lineage. A full context root set takes the canonical exact fallback.
+	if n == 0 || n >= vectorclock.CausalRootCapacity ||
+		!ctx.C.ResidualLessOrEqualCausalSet(&roots, n, ctx.TID) {
+		return false
+	}
+
+	var imports [vectorclock.CausalRootCapacity - 1]vectorclock.CausalView
+	for i := 0; i < n; i++ {
+		duplicate, ok := roots[i].Duplicate()
+		if !ok {
+			for j := 0; j < i; j++ {
+				imports[j].Release()
+			}
+			return false
+		}
+		imports[i] = duplicate
+	}
+
+	owned := vectorclock.New()
+	owned.Set(ctx.TID, uint32(ctx.GetEpoch()))
+	lineage := vectorclock.NewClockLineage(owned)
+	owned.Release()
+	view := lineage.Pin()
+	if !view.Valid() {
+		lineage.Release()
+		for i := 0; i < n; i++ {
+			imports[i].Release()
+		}
+		return false
+	}
+
+	// All fallible construction and retains completed. Replace the dominated
+	// canonical checkpoint, then attach the new primary view to its publisher.
+	release.arena.freeRangeList(release.runs)
+	release.arena.freeRangeList(release.retired)
+	release.runs, release.retired = nil, nil
+	release.lineage, release.view = lineage, view
+	copy(release.imports[:n], imports[:n])
+	release.importN = uint8(n)
+	bumpAtomicReleaseStructureVersion(release)
+	release.deltaN, release.deltaAt = 0, 0
+	if !ctx.C.TryJoinCausal(view) {
+		atomicRuntimeThrow("race detector failed to attach composite atomic release")
+	}
+	return true
+}
+
+func freezeAtomicReleaseCanonical(release *atomicRelease) *vectorclock.ClockSnapshot {
+	clock := vectorclock.NewFromPool()
+	joinAtomicReleaseRanges(clock, release.runs)
+	retireAtomicReleaseRanges(clock, release.retired)
+	snapshot := clock.Freeze()
+	clock.Release()
+	return snapshot
+}
+
+func atomicReleaseHasPromotionCoordinates(release *atomicRelease) bool {
+	remaining := uint64(atomicReleasePromotionCoordinateThreshold)
+	consume := func(first, last uint32) bool {
+		width := uint64(last) - uint64(first) + 1
+		if width >= remaining {
+			return true
+		}
+		remaining -= width
+		return false
+	}
+	for run := release.runs; run != nil; run = run.next {
+		if consume(run.first, run.last) {
+			return true
+		}
+	}
+	for run := release.retired; run != nil; run = run.next {
+		if consume(run.first, run.last) {
+			return true
+		}
+	}
+	return false
+}
+
+func maybePromoteAtomicRelease(release *atomicRelease, ctx *goroutine.RaceContext) {
+	_ = ctx // retained in the private selector seam used by focused tests
+	if release.lineage != nil || release.snapshot != nil || release.version%atomicReleaseSnapshotCheckPeriod != 0 {
+		return
+	}
+	if atomicReleaseHasPromotionCoordinates(release) {
+		// Build the immutable lineage image from the exact canonical ranges,
+		// then drop the temporary persistent snapshot. Promoted point updates
+		// never rebuild a persistent tree.
+		snapshot := freezeAtomicReleaseCanonical(release)
+		release.lineage = vectorclock.NewClockLineageFromSnapshot(snapshot)
+		release.view = release.lineage.Pin()
+		if !release.view.Valid() {
+			atomicRuntimeThrow("race detector failed to pin promoted atomic release")
+		}
+		bumpAtomicReleaseStructureVersion(release)
+		release.deltaN, release.deltaAt = 0, 0
+	}
 }
 
 // pointMaxAtomicRelease applies one monotonic coordinate update to canonical
@@ -703,6 +1378,13 @@ func bumpAtomicReleaseVersion(release *atomicRelease) uint64 {
 	return release.version
 }
 
+func bumpAtomicReleaseStructureVersion(release *atomicRelease) {
+	if release.structureVersion == ^uint32(0) {
+		atomicRuntimeThrow("race detector atomic-release structure version overflow")
+	}
+	release.structureVersion++
+}
+
 func appendAtomicReleaseDelta(release *atomicRelease, version uint64, tid, clock uint32) {
 	release.deltas[release.deltaAt] = atomicReleaseDelta{version: version, tid: tid, clock: clock}
 	release.deltaAt = (release.deltaAt + 1) % atomicReleaseDeltaCapacity
@@ -724,6 +1406,137 @@ func (s *atomicState) exactReleaseForMask(mask uint8) (*atomicRelease, uint8) {
 	return release, membership
 }
 
+func (s *atomicState) maskHasPromotedRelease(mask uint8) bool {
+	for lane := uint8(0); lane < AtomicTokenSlots; lane++ {
+		if mask&(uint8(1)<<lane) != 0 {
+			if release := s.releases[lane]; release != nil && release.lineage != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// publishPromotedComposite attempts the exact bounded weak-publication path.
+// It imports unrelated context roots without rebuilding the primary lineage.
+// False requests the existing exact reanchor fallback.
+func publishPromotedComposite(release *atomicRelease, ctx *goroutine.RaceContext) bool {
+	var roots [vectorclock.CausalRootCapacity]vectorclock.CausalView
+	n := atomicReleaseCausalSet(release, &roots)
+	var contextRoots [vectorclock.CausalRootCapacity]vectorclock.CausalView
+	contextN := ctx.C.BorrowCausalRoots(&contextRoots)
+	for i := 0; i < contextN; i++ {
+		if release.deferred != nil && release.deferred.DominatesCausal(contextRoots[i]) {
+			continue
+		}
+		if !addAtomicReleaseRoot(&roots, &n, contextRoots[i]) {
+			return false
+		}
+	}
+	// Causal roots alone are insufficient: mutable/base finite coordinates and
+	// retirement metadata must also be contained in the proposed union.
+	if !atomicReleaseDominatesResidual(ctx.C, release, &roots, n, ctx.TID) {
+		return false
+	}
+
+	// Retain every new family before mutating the release. Existing imported
+	// ownership can then advance in place, making the commit failure-free.
+	var additions [vectorclock.CausalRootCapacity - 1]vectorclock.CausalView
+	var additionSet [vectorclock.CausalRootCapacity - 1]bool
+	for i := 1; i < n; i++ {
+		found := false
+		for j := uint8(0); j < release.importN; j++ {
+			if release.imports[j].SameFamily(roots[i]) {
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+		owned, ok := roots[i].Duplicate()
+		if !ok {
+			for j := range additions {
+				additions[j].Release()
+			}
+			return false
+		}
+		additions[i-1], additionSet[i-1] = owned, true
+	}
+
+	prepared, _ := release.lineage.PrepareAppend(ctx.TID, uint32(ctx.GetEpoch()))
+	if !prepared.Valid() {
+		for i := range additions {
+			additions[i].Release()
+		}
+		atomicRuntimeThrow("race detector failed to prepare promoted atomic release append")
+	}
+
+	changed := false
+	structureChanged := false
+	for i := 1; i < n; i++ {
+		advanced := false
+		for j := uint8(0); j < release.importN; j++ {
+			if !release.imports[j].SameFamily(roots[i]) {
+				continue
+			}
+			if roots[i].Version() > release.imports[j].Version() {
+				if !release.imports[j].AdvanceTo(roots[i]) {
+					prepared.Abort()
+					atomicRuntimeThrow("race detector failed to advance promoted atomic release import")
+				}
+				changed = true
+				structureChanged = true
+			}
+			advanced = true
+			break
+		}
+		if advanced {
+			continue
+		}
+		if !additionSet[i-1] || release.importN == uint8(len(release.imports)) {
+			prepared.Abort()
+			atomicRuntimeThrow("race detector lost prepared atomic release import")
+		}
+		release.imports[release.importN] = additions[i-1]
+		additions[i-1] = vectorclock.CausalView{}
+		release.importN++
+		changed = true
+		structureChanged = true
+	}
+	for i := range additions {
+		additions[i].Release()
+	}
+
+	oldPrimaryVersion := release.view.Version()
+	lineageVersion, appended := prepared.CommitOwned(&release.view)
+	if !release.view.Valid() || release.view.Version() != lineageVersion {
+		atomicRuntimeThrow("race detector lost promoted atomic release view")
+	}
+	changed = changed || appended || lineageVersion != oldPrimaryVersion
+
+	// The source context already owns every family in the normalized union.
+	// Advance it to the release's newly appended primary view without lowering
+	// its independently pinned imported histories.
+	n = atomicReleaseCausalSet(release, &roots)
+	if !ctx.C.TryJoinCausalSet(&roots, n) {
+		// The residual proof may have discharged context families through the
+		// deferred projection without removing their older inline pins. If those
+		// pins fill the fixed root set, advance through the unrestricted exact
+		// path rather than treating representation capacity as a semantic error.
+		for i := 0; i < n; i++ {
+			ctx.C.JoinCausal(roots[i])
+		}
+	}
+	if changed {
+		if structureChanged {
+			bumpAtomicReleaseStructureVersion(release)
+		}
+		bumpAtomicReleaseVersion(release)
+	}
+	return true
+}
+
 // publishRelease uses a point update only from a current strong cache proof. A
 // weak current proof permits a monotonic full checkpoint in the same stream;
 // every other store replaces the release with a new stream and exact snapshot.
@@ -731,35 +1544,115 @@ func (s *atomicState) publishRelease(ctx *goroutine.RaceContext, mask uint8) {
 	if release, membership := s.exactReleaseForMask(mask); release != nil {
 		seenVersion, strong, ok := ctx.LookupAtomicRelease(unsafe.Pointer(release), release.stream, membership)
 		if ok && seenVersion == release.version {
-			if strong {
+			pointProof := strong
+			if pointProof {
 				// RaceContext keeps Epoch equal to C[TID]. Reading the cached
 				// epoch avoids a sparse-vector search for the owning coordinate
 				// on every strong release update.
 				clock := uint32(ctx.GetEpoch())
-				if pointMaxAtomicRelease(release, ctx.TID, clock) {
+				if release.lineage != nil {
+					lineageVersion, changed := release.lineage.AppendOwned(&release.view, ctx.TID, clock)
+					if !release.view.Valid() || release.view.Version() != lineageVersion {
+						atomicRuntimeThrow("race detector lost promoted atomic release view")
+					}
+					if changed {
+						bumpAtomicReleaseVersion(release)
+					}
+					// The appended view is dominated by ctx: it adds only ctx's
+					// already-owned coordinate to the exact release it acquired.
+					// Advance ctx's pin too, otherwise its own Get would walk an
+					// ever-longer historical same-TID chain after every publication.
+					ctx.C.JoinCausal(release.view)
+				} else if release.snapshot != nil {
+					// Once promoted, the immutable snapshot is the authoritative
+					// current release. Updating it directly avoids a linear search of
+					// the checkpoint ranges on every random-TID RMW. The arena ranges
+					// remain an older dominated checkpoint; a weak publication rebuilds
+					// both representations from the complete source context.
+					next := release.snapshot.PointMax(ctx.TID, clock)
+					if next != release.snapshot {
+						release.snapshot = next
+						version := bumpAtomicReleaseVersion(release)
+						appendAtomicReleaseDelta(release, version, ctx.TID, clock)
+					}
+				} else if pointMaxAtomicRelease(release, ctx.TID, clock) {
 					version := bumpAtomicReleaseVersion(release)
 					appendAtomicReleaseDelta(release, version, ctx.TID, clock)
+					maybePromoteAtomicRelease(release, ctx)
 				}
-				ctx.RecordAtomicRelease(unsafe.Pointer(release), release.stream, release.version, membership, true)
+				ctx.RecordAtomicReleaseStructure(unsafe.Pointer(release), release.stream, release.version, release.structureVersion, membership, true)
+				return
+			}
+			if release.lineage != nil {
+				if publishPromotedComposite(release, ctx) {
+					ctx.RecordAtomicReleaseStructure(unsafe.Pointer(release), release.stream, release.version, release.structureVersion, membership, true)
+					return
+				}
+				// A current weak cache entry still proves that the existing release
+				// is below ctx.C; weakness only means ctx imported additional foreign
+				// state. Retain that complete image structurally and replace the prior
+				// projection instead of flattening the process-wide frontier into a
+				// new lineage anchor. The primary lineage remains independently
+				// appendable for later strong owner-only publications.
+				projection := vectorclock.PinReleaseProjectionForPreparedOwner(ctx.C, ctx.TID)
+				nextDeferred := new(vectorclock.ReleaseProjection)
+				*nextDeferred = projection
+				oldDeferred := release.deferred
+				release.deferred = nextDeferred
+				clearAtomicReleaseImports(release)
+				bumpAtomicReleaseStructureVersion(release)
+				bumpAtomicReleaseVersion(release)
+				release.deltaN, release.deltaAt = 0, 0
+				if oldDeferred != nil {
+					oldDeferred.Release()
+				}
+				ctx.RecordAtomicReleaseStructure(unsafe.Pointer(release), release.stream, release.version, release.structureVersion, membership, true)
 				return
 			}
 			bumpAtomicReleaseVersion(release)
-			snapshotAtomicRelease(release, ctx)
-			ctx.RecordAtomicRelease(unsafe.Pointer(release), release.stream, release.version, membership, true)
+			if !initializeAtomicReleaseComposite(release, ctx) {
+				snapshotAtomicRelease(release, ctx)
+			}
+			ctx.RecordAtomicReleaseStructure(unsafe.Pointer(release), release.stream, release.version, release.structureVersion, membership, true)
 			return
 		}
 	}
 
+	// Replacements of a promoted release stay on the scalable representation,
+	// but start a new incomparable family: a non-acquiring store must not make
+	// the superseded release a causal predecessor. Unpromoted addresses retain
+	// the compact canonical small path.
+	replaceWithLineage := s.maskHasPromotedRelease(mask)
 	s.retireReleases(mask)
 	release := s.allocateRelease()
-	snapshotAtomicRelease(release, ctx)
+	if initializeAtomicReleaseComposite(release, ctx) {
+		// The shared roots and new primary lineage already form the exact source.
+	} else if replaceWithLineage {
+		// A replacement is intentionally incomparable with the superseded
+		// stream, but need not flatten its wide source. Keep a tiny independently
+		// appendable owner lineage and retain the exact source as a deferred
+		// projection.
+		projection := vectorclock.PinReleaseProjectionForPreparedOwner(ctx.C, ctx.TID)
+		release.deferred = new(vectorclock.ReleaseProjection)
+		*release.deferred = projection
+		owned := vectorclock.New()
+		owned.Set(ctx.TID, uint32(ctx.GetEpoch()))
+		release.lineage = vectorclock.NewClockLineage(owned)
+		owned.Release()
+		release.view = release.lineage.Pin()
+		if !release.view.Valid() {
+			atomicRuntimeThrow("race detector failed to pin replacement atomic release")
+		}
+	} else {
+		snapshotAtomicRelease(release, ctx)
+	}
 	release.refs = uint8(countMaskBits(mask))
 	for lane := uint8(0); lane < AtomicTokenSlots; lane++ {
 		if mask&(uint8(1)<<lane) != 0 {
 			s.releases[lane] = release
 		}
 	}
-	ctx.RecordAtomicRelease(unsafe.Pointer(release), release.stream, release.version, mask, true)
+	ctx.RecordAtomicReleaseStructure(unsafe.Pointer(release), release.stream, release.version, release.structureVersion, mask, true)
 }
 
 func countMaskBits(mask uint8) int {
@@ -883,7 +1776,9 @@ func recordAtomicAccess(history *atomicHistory, ctx *goroutine.RaceContext, pc u
 		return
 	}
 
-	pruneAtomicAccess(history, ctx, mask, internal)
+	if frontier.shouldPruneBeforeInsert() {
+		pruneAtomicAccess(history, ctx, mask, internal)
+	}
 	access := &frontier.insert(history.arena, ctx.TID).access
 	for lane := uint8(0); lane < AtomicTokenSlots; lane++ {
 		if mask&(uint8(1)<<lane) != 0 {
@@ -917,7 +1812,7 @@ func firstConcurrentAtomicClass(history *atomicHistoryClass, ctx *goroutine.Race
 // mutex implementation witness, even when the user witness is on a later lane.
 // captureAtomic may suppress the latter; choosing it first could otherwise hide
 // a genuine same-operation conflict. Within one reporting class, lane order is
-// deterministic while map iteration may choose any conflicting thread.
+// deterministic while frontier order may choose any conflicting thread.
 func firstConcurrentAtomic(history atomicHistory, ctx *goroutine.RaceContext, mask uint8) (epoch.Epoch, uintptr, uint8, bool) {
 	if prev, pc, lane, conflict := firstConcurrentAtomicClass(&history.user, ctx, mask); conflict {
 		return prev, pc, lane, true
@@ -1039,27 +1934,248 @@ type atomicTokenGroup struct {
 // non-empty token must be completed according to AtomicToken's matching and
 // exactly-once contract.
 func (d *Detector) AtomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, acquire bool, token *AtomicToken) {
-	d.atomicBegin(addr, size, ctx, acquire, false, false, true, true, -1, false, token)
+	d.atomicBegin(addr, size, ctx, acquire, false, false, true, true, -1, false, token, nil, nil, nil)
 }
 
 // AtomicBeginRMW starts an enabled read-modify-write or compare-and-swap
-// transaction. An aligned, exact-mask operation may reuse an existing enrolled
-// capability, but an RMW never enrolls a new one. A miss therefore takes the
-// general transaction and permanently escapes any incompatible capability.
+// transaction. An aligned, exact-mask operation may reuse or enroll a retained
+// capability. Mixed-width and otherwise ineligible misses retain the general
+// transaction and permanently escape any incompatible capability.
 // Failed compare-and-swaps must complete through AtomicEndMode with write=false;
 // every AtomicBeginRMW token must be completed with synchronize=true.
 func (d *Detector) AtomicBeginRMW(addr, size uintptr, ctx *goroutine.RaceContext, acquire bool, token *AtomicToken) {
-	d.atomicBegin(addr, size, ctx, acquire, true, false, true, true, 1, false, token)
+	d.atomicBegin(addr, size, ctx, acquire, true, true, true, true, 1, false, token, nil, nil, nil)
 }
 
 // AtomicBeginRMWCooperative starts the public runtime RMW transaction. It is
 // identical to AtomicBeginRMW except when an exact retained capability exists
-// and another transaction holds its state lock: in that one case it releases
-// the capability without producing a token or changing detector state and asks
-// the user-goroutine wrapper to yield before retrying. Capability misses and
-// general or mixed-width transactions retain the authoritative blocking path.
-func (d *Detector) AtomicBeginRMWCooperative(addr, size uintptr, ctx *goroutine.RaceContext, acquire bool, token *AtomicToken) (retry bool) {
-	return d.atomicBegin(addr, size, ctx, acquire, true, false, true, true, 1, true, token)
+// and another public RMW owns its state lock: it retains the capability,
+// retains the first contender as a user-G spinner and parks later contenders.
+// The spinner and current owner may compete between operations; bounded misses
+// force the existing reserved handoff. Contention with a non-handoff owner or
+// the bounded registration lock remains a clean retry. Eligible misses enroll
+// through canonical setup; general shapes retain the blocking path.
+func (d *Detector) AtomicBeginRMWCooperative(addr, size uintptr, ctx *goroutine.RaceContext, acquire bool, token *AtomicToken) (retry, spin, polite bool, park *uint32) {
+	retry = d.atomicBegin(addr, size, ctx, acquire, true, true, true, true, 1, true, token, &park, &spin, &polite)
+	return retry, spin, polite, park
+}
+
+// AtomicResumeRMW consumes ownership reserved by the preceding cooperative
+// Begin after the runtime has acquired its returned semaphore on the user G.
+// The retained token is still the ordinary exact-fast token shape.
+func (d *Detector) AtomicResumeRMW(addr, size uintptr, ctx *goroutine.RaceContext, acquire bool, token *AtomicToken) (retry, spin, polite bool, park *uint32) {
+	if ctx == nil || !validAtomicAccess(addr, size) {
+		atomicRuntimeThrow("race detector invalid atomic RMW resume")
+	}
+	fast := atomicFastToken(token)
+	mask, exact := plainAtomicFastMask(addr, size)
+	if fast == nil || !exact || fast.Mask() != mask || fast.Overlay() == nil {
+		atomicRuntimeThrow("race detector invalid atomic RMW resume token")
+	}
+	ctx.ValidateClockAdvance()
+	state := (*atomicState)(fast.Overlay())
+	acquired, retrySpin, retryPolite, retryPark := state.retryPublicRMWSpinner(ctx.TID, token)
+	if !acquired {
+		return true, retrySpin, retryPolite, retryPark
+	}
+	state.arena.pin()
+	syncMode := int8(0)
+	if acquire {
+		syncMode = 1
+	}
+	state.beginTransaction(addr, size, ctx, syncMode)
+	state.beginWriter()
+	if acquire {
+		state.acquire(ctx, mask)
+		ctx.PreflightClockAdvance()
+	}
+	return false, false, false, nil
+}
+
+func atomicHistoryMaskEmpty(history *atomicHistory, mask uint8) bool {
+	empty := true
+	check := func(frontier *atomicHistoryClass) {
+		frontier.visit(func(entry *atomicHistoryEntry) bool {
+			for lane := uint8(0); lane < AtomicTokenSlots; lane++ {
+				if mask&(uint8(1)<<lane) != 0 && entry.access.clocks[lane] != 0 {
+					empty = false
+					return false
+				}
+			}
+			return true
+		})
+	}
+	check(&history.user)
+	if empty {
+		check(&history.internal)
+	}
+	return empty
+}
+
+// releasePointMaxCannotAllocate proves the exact strong-release update used by
+// direct success is an in-place singleton update. End deliberately falls back
+// before hardware when a range split or immutable-snapshot update could
+// allocate, or when the periodic snapshot selector would promote this release.
+func releasePointMaxCannotAllocate(release *atomicRelease, ctx *goroutine.RaceContext) bool {
+	if release == nil || release.lineage != nil || release.snapshot != nil || release.version == ^uint64(0) {
+		return false
+	}
+	clock := uint32(ctx.GetEpoch())
+	for run := release.runs; run != nil; run = run.next {
+		if ctx.TID < run.first || ctx.TID > run.last {
+			continue
+		}
+		if run.clock >= clock {
+			return true
+		}
+		if run.first != ctx.TID || run.last != ctx.TID {
+			return false
+		}
+		return (release.version+1)%atomicReleaseSnapshotCheckPeriod != 0 ||
+			!atomicReleaseHasPromotionCoordinates(release)
+	}
+	return false
+}
+
+func (s *atomicState) directRMWReady(ctx *goroutine.RaceContext, mask uint8, reportInternal, synchronize bool) (*atomicRelease, bool) {
+	frontier := &s.writes.user
+	if reportInternal {
+		frontier = &s.writes.internal
+	}
+	if _, ok := frontier.find(ctx.TID); !ok || !atomicHistoryMaskEmpty(&s.plainWrites, mask) {
+		return nil, false
+	}
+	if !synchronize {
+		return nil, true
+	}
+	release, membership := s.exactReleaseForMask(mask)
+	if release == nil || membership != mask {
+		return nil, false
+	}
+	seenVersion, strong, ok := ctx.LookupAtomicRelease(unsafe.Pointer(release), release.stream, membership)
+	if !ok || !strong || seenVersion != release.version {
+		return nil, false
+	}
+	if release.lineage != nil {
+		return release, true
+	}
+	if !releasePointMaxCannotAllocate(release, ctx) {
+		return nil, false
+	}
+	return release, true
+}
+
+// AtomicBeginInternalRMWCooperative attempts the retained same-owner tier used
+// by internal/sync Mutex atomics and synchronized public RMWs whose context has
+// activated the bounded exact-capability cache. A direct hit still
+// retains the immutable AtomicFastPath and state.mu across hardware. Public
+// hits additionally enter the normal cooperative owner protocol before the
+// proof is checked. Synchronizing hits require an exact current strong-release
+// proof; non-synchronizing Mutex hits use their own cache mode and never import
+// or publish release metadata.
+//
+// direct is true only when successful-write completion is allocation- and
+// report-free. A failed CAS must still be completed canonically with the
+// returned token; the hardware operation is never replayed.
+func (d *Detector) AtomicBeginInternalRMWCooperative(addr, size uintptr, ctx *goroutine.RaceContext, pc uintptr, synchronize bool, token *AtomicToken) (retry, direct, spin, polite bool, park *uint32) {
+	if token == nil {
+		return false, false, false, false, nil
+	}
+	for i := range token {
+		token[i] = nil
+	}
+	mask, exact := plainAtomicFastMask(addr, size)
+	internal := atomicInternalRMWFastPC(pc)
+	public := ctx != nil && synchronize && ctx.AtomicRMWCacheActive && !internal
+	eligible := ctx != nil && exact && (internal || public)
+	if eligible {
+		if entry, ok := lookupAtomicRMWCache(ctx, addr, mask, synchronize); ok {
+			state := (*atomicState)(entry.State)
+			if entry.StateGeneration != 0 && state.handle.generation == entry.StateGeneration {
+				fast := (*shadowmem.AtomicFastPath)(entry.Fast)
+				if fast.TryRetain(mask) {
+					if fast.Overlay() == entry.State && fast.OrdinaryMask() == 0 {
+						if public {
+							acquired, retrySpin, retryPolite, retryPark := state.tryBeginPublicRMW(fast, token, ctx.TID)
+							if !acquired {
+								if retryPark == nil && !retrySpin {
+									fast.Release()
+								}
+								return true, false, retrySpin, retryPolite, retryPark
+							}
+						} else if !state.mu.tryLock() {
+							fast.Release()
+							return true, false, false, false, nil
+						}
+						if state.handle.generation != entry.StateGeneration {
+							atomicRuntimeThrow("race detector lost retained RMW generation")
+						}
+						reportInternal := atomicInternalMutexPC(pc)
+						release, directReady := state.directRMWReady(ctx, mask, reportInternal, synchronize)
+						if directReady {
+							if synchronize {
+								ctx.PreflightClockAdvance()
+							}
+							var appendProof vectorclock.PreparedCausalAppend
+							if release != nil && release.lineage != nil {
+								appendProof, _ = release.lineage.PrepareAppend(ctx.TID, uint32(ctx.GetEpoch()))
+								if !appendProof.Valid() {
+									atomicRuntimeThrow("race detector failed to prepare direct RMW release")
+								}
+							}
+							state.arena.pin()
+							syncMode := int8(0)
+							if synchronize {
+								syncMode = 1
+							}
+							state.beginTransaction(addr, size, ctx, syncMode)
+							state.beginWriter()
+							state.directRMWRelease = release
+							state.directRMWAppend = appendProof
+							token[0] = unsafe.Pointer(fast)
+							return false, true, false, false, nil
+						}
+						if public {
+							// Ownership and the immutable descriptor are already retained.
+							// Complete the proof miss through the ordinary exact transition
+							// rather than dropping out of and re-entering the waiter queue.
+							state.arena.pin()
+							state.beginTransaction(addr, size, ctx, 1)
+							state.beginWriter()
+							state.acquire(ctx, mask)
+							ctx.PreflightClockAdvance()
+							token[0] = unsafe.Pointer(fast)
+							return false, false, false, false, nil
+						}
+						state.mu.unlock()
+					}
+					fast.Release()
+				}
+			}
+		}
+
+		// The canonical private miss may enroll or reuse an exact capability in
+		// either synchronization mode. This is the only path that can seed a new
+		// private same-owner entry, and it retains all mixed-history/release
+		// semantics.
+		if public {
+			retry, spin, polite, park = d.AtomicBeginRMWCooperative(addr, size, ctx, true, token)
+			return retry, false, spin, polite, park
+		}
+		syncMode := int8(0)
+		if synchronize {
+			syncMode = 1
+		}
+		retry = d.atomicBegin(addr, size, ctx, synchronize, true, true, true, synchronize, syncMode, true, token, nil, nil, nil)
+		return retry, false, false, false, nil
+	}
+
+	if synchronize {
+		retry, spin, polite, park = d.AtomicBeginRMWCooperative(addr, size, ctx, true, token)
+		return retry, false, spin, polite, park
+	}
+	d.AtomicBegin(addr, size, ctx, false, token)
+	return false, false, false, false, nil
 }
 
 // AtomicBeginPlain starts an aligned plain Load or Store transaction.
@@ -1084,14 +2200,14 @@ func (d *Detector) AtomicBeginPlain(addr, size uintptr, ctx *goroutine.RaceConte
 	if synchronize {
 		syncMode = 1
 	}
-	d.atomicBegin(addr, size, ctx, acquire, synchronize, synchronize, true, synchronize, syncMode, false, token)
+	d.atomicBegin(addr, size, ctx, acquire, synchronize, synchronize, true, synchronize, syncMode, false, token, nil, nil, nil)
 }
 
 // AtomicBeginLoad is the trusted enabled public-Load fallback. Unlike the
 // general Plain entry point its operation kind is known before hardware access,
 // so it need not perturb the writer revision and invalidate other readers.
 func (d *Detector) AtomicBeginLoad(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken) {
-	d.atomicBegin(addr, size, ctx, true, true, true, false, false, 1, false, token)
+	d.atomicBegin(addr, size, ctx, true, true, true, false, false, 1, false, token, nil, nil, nil)
 }
 
 // AtomicBeginLoadCooperative is the enabled public-Load fallback. It asks the
@@ -1099,14 +2215,14 @@ func (d *Detector) AtomicBeginLoad(addr, size uintptr, ctx *goroutine.RaceContex
 // capability's state lock is contended. Capability misses, enrollment, and
 // general transactions remain on the authoritative blocking path.
 func (d *Detector) AtomicBeginLoadCooperative(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken) (retry bool) {
-	return d.atomicBegin(addr, size, ctx, true, true, true, false, false, 1, true, token)
+	return d.atomicBegin(addr, size, ctx, true, true, true, false, false, 1, true, token, nil, nil, nil)
 }
 
 // AtomicBeginStoreCooperative is the enabled public-Store transaction. Like
 // AtomicBeginLoadCooperative, only retained exact-capability lock contention is
 // returned to the user goroutine; misses and enrollment continue to block.
 func (d *Detector) AtomicBeginStoreCooperative(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken) (retry bool) {
-	return d.atomicBegin(addr, size, ctx, false, true, true, true, true, 1, true, token)
+	return d.atomicBegin(addr, size, ctx, false, true, true, true, true, 1, true, token, nil, nil, nil)
 }
 
 func deactivateAtomicLoadEntry(entry goroutine.AtomicLoadCacheEntry) *atomicReadFrontier {
@@ -1250,6 +2366,94 @@ func DeactivateAtomicLoadCache(ctx *goroutine.RaceContext) {
 		}
 	}
 	ctx.AtomicLoadCacheNext = 0
+	deactivateAtomicRMWCache(ctx)
+}
+
+func releaseAtomicRMWCacheEntry(entry goroutine.AtomicRMWCacheEntry) {
+	if entry.State == nil {
+		return
+	}
+	state := (*atomicState)(entry.State)
+	// A quiescent Reset invalidates every old arena ownership reference without
+	// visiting external contexts. Do not release a slot that a new generation
+	// may already have reused.
+	if entry.StateGeneration == 0 || state.handle.generation != entry.StateGeneration {
+		return
+	}
+	state.arena.releaseState(state)
+}
+
+func deactivateAtomicRMWCache(ctx *goroutine.RaceContext) {
+	for i := range ctx.AtomicRMWCache {
+		entry := ctx.AtomicRMWCache[i]
+		ctx.AtomicRMWCache[i] = goroutine.AtomicRMWCacheEntry{}
+		releaseAtomicRMWCacheEntry(entry)
+	}
+	ctx.AtomicRMWCacheNext = 0
+	ctx.AtomicRMWCacheActive = false
+}
+
+func lookupAtomicRMWCache(ctx *goroutine.RaceContext, addr uintptr, mask uint8, synchronize bool) (goroutine.AtomicRMWCacheEntry, bool) {
+	for i := range ctx.AtomicRMWCache {
+		entry := ctx.AtomicRMWCache[i]
+		if entry.Fast != nil && entry.State != nil && entry.Addr == addr && entry.Mask == mask && entry.Synchronize == synchronize {
+			return entry, true
+		}
+	}
+	return goroutine.AtomicRMWCacheEntry{}, false
+}
+
+// retainAtomicRMWCacheCandidate reserves the state ownership which will back a
+// newly published cache entry. It is called while the exact transaction still
+// owns state.mu and the AtomicFastPath capability, so the state cannot retire
+// between validation and the retain. Matching entries already own that retain.
+func retainAtomicRMWCacheCandidate(ctx *goroutine.RaceContext, addr uintptr, mask uint8, synchronize bool, state *atomicState) (retained bool) {
+	if old, ok := lookupAtomicRMWCache(ctx, addr, mask, synchronize); ok &&
+		old.State == unsafe.Pointer(state) && old.StateGeneration == state.handle.generation {
+		return false
+	}
+	state.arena.retainState(state)
+	return true
+}
+
+func recordAtomicRMWCache(ctx *goroutine.RaceContext, addr uintptr, mask uint8, synchronize bool, fast *shadowmem.AtomicFastPath, state *atomicState, retained bool) {
+	index := -1
+	for i := range ctx.AtomicRMWCache {
+		entry := &ctx.AtomicRMWCache[i]
+		if entry.Addr == addr && entry.Mask == mask && entry.Synchronize == synchronize {
+			index = i
+			break
+		}
+		if index < 0 && entry.State == nil {
+			index = i
+		}
+	}
+	if index < 0 {
+		index = int(ctx.AtomicRMWCacheNext % goroutine.AtomicRMWCacheSlots)
+		ctx.AtomicRMWCacheNext = (ctx.AtomicRMWCacheNext + 1) % goroutine.AtomicRMWCacheSlots
+	}
+	old := ctx.AtomicRMWCache[index]
+	if old.State == unsafe.Pointer(state) && old.StateGeneration == state.handle.generation {
+		// The existing entry already owns the state reference. A defensive extra
+		// reservation can arise only if an entry changed between preparation and
+		// publication on the same owner; release it rather than leaking ownership.
+		if retained {
+			state.arena.releaseState(state)
+		}
+		retained = false
+	}
+	ctx.AtomicRMWCache[index] = goroutine.AtomicRMWCacheEntry{
+		Fast: unsafe.Pointer(fast), State: unsafe.Pointer(state), Addr: addr,
+		StateGeneration: state.handle.generation, Mask: mask, Synchronize: synchronize,
+	}
+	if old.State != nil && (old.State != unsafe.Pointer(state) || old.StateGeneration != state.handle.generation) {
+		releaseAtomicRMWCacheEntry(old)
+	}
+	if !retained && old.State == nil {
+		// record is reached with either a pre-existing matching retain or a newly
+		// reserved one. Anything else is a trusted-detector programming error.
+		atomicRuntimeThrow("race detector internal RMW cache ownership imbalance")
+	}
 }
 
 // AtomicBeginLoadFast attempts the cache-only exact Load path. It retains the
@@ -1375,7 +2579,7 @@ func (d *Detector) AtomicEndLoadFast(ctx *goroutine.RaceContext, token *AtomicTo
 // partially covered ordinary groups, locks each resulting equivalence group,
 // attaches the detector overlay while those locks are held, then locks distinct
 // atomic histories in stable pointer order across the hardware operation.
-func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, acquire, reuseFast, enrollFast, writer, advance bool, syncMode int8, cooperative bool, token *AtomicToken) (retry bool) {
+func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, acquire, reuseFast, enrollFast, writer, advance bool, syncMode int8, cooperative bool, token *AtomicToken, parkOut **uint32, spinOut, politeOut *bool) (retry bool) {
 	if token == nil {
 		return false
 	}
@@ -1387,9 +2591,10 @@ func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, a
 	}
 	if advance {
 		// Validate exhaustion before the hardware access, release import, writer
-		// revision, or history publication. End validates the same successor and
-		// commits it only after all authoritative state is visible.
-		ctx.PreflightClockAdvance()
+		// revision, or history publication. Allocation-capable representation
+		// preparation happens again after the final release import and before the
+		// hardware boundary.
+		ctx.ValidateClockAdvance()
 	}
 
 	firstBase := addr &^ uintptr(7)
@@ -1397,11 +2602,61 @@ func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, a
 	fastMask, exactFastShape := plainAtomicFastMask(addr, size)
 	exactFastShape = exactFastShape && firstBase == lastBase
 	if reuseFast && exactFastShape {
+		// Synchronized public RMWs seed the same bounded context cache as the
+		// private direct tier. A cached immutable descriptor can retain itself,
+		// avoiding the page-table and slot lookup while keeping the complete
+		// canonical history/release transition in AtomicEnd.
+		if cooperative && parkOut != nil && acquire && writer && advance && syncMode == 1 && ctx.AtomicRMWCacheActive {
+			if entry, ok := lookupAtomicRMWCache(ctx, addr, fastMask, true); ok {
+				state := (*atomicState)(entry.State)
+				if entry.StateGeneration != 0 && state.handle.generation == entry.StateGeneration {
+					fast := (*shadowmem.AtomicFastPath)(entry.Fast)
+					if fast.TryRetain(fastMask) {
+						if fast.Overlay() == entry.State && fast.OrdinaryMask() == 0 {
+							acquired, spin, polite, park := state.tryBeginPublicRMW(fast, token, ctx.TID)
+							if !acquired {
+								if parkOut != nil {
+									*parkOut = park
+									*spinOut = spin
+									*politeOut = polite
+								}
+								if park == nil && !spin {
+									fast.Release()
+								}
+								return true
+							}
+							state.arena.pin()
+							state.beginTransaction(addr, size, ctx, syncMode)
+							state.beginWriter()
+							state.acquire(ctx, fastMask)
+							ctx.PreflightClockAdvance()
+							token[0] = unsafe.Pointer(fast)
+							return false
+						}
+						fast.Release()
+					}
+				}
+			}
+		}
 		if slot := d.slotMemory.GetSlot(addr); slot != nil {
 			if fast := slot.TryAtomicFast(fastMask); fast != nil {
 				state := (*atomicState)(fast.Overlay())
 				if cooperative {
-					if !state.mu.tryLock() {
+					if parkOut != nil {
+						acquired, spin, polite, park := state.tryBeginPublicRMW(fast, token, ctx.TID)
+						if !acquired {
+							if acquire && writer && advance && syncMode == 1 {
+								ctx.AtomicRMWCacheActive = true
+							}
+							*parkOut = park
+							*spinOut = spin
+							*politeOut = polite
+							if park == nil && !spin {
+								fast.Release()
+							}
+							return true
+						}
+					} else if !state.mu.tryLock() {
 						fast.Release()
 						return true
 					}
@@ -1419,6 +2674,9 @@ func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, a
 				// loads without adding a serialization edge.
 				if acquire {
 					state.acquire(ctx, fastMask)
+				}
+				if advance {
+					ctx.PreflightClockAdvance()
 				}
 				token[0] = unsafe.Pointer(fast)
 				return false
@@ -1525,6 +2783,9 @@ func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, a
 		if fast := firstSlot.TryAtomicFast(fastMask); fast != nil {
 			state := (*atomicState)(fast.Overlay())
 			state.mu.lock()
+			if parkOut != nil {
+				state.beginExactFastOwner(ctx.TID)
+			}
 			state.arena.pin()
 			state.beginTransaction(addr, size, ctx, syncMode)
 			if writer {
@@ -1535,6 +2796,9 @@ func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, a
 			}
 			if acquire {
 				state.acquire(ctx, fastMask)
+			}
+			if advance {
+				ctx.PreflightClockAdvance()
 			}
 			for i := range token {
 				token[i] = nil
@@ -1556,6 +2820,9 @@ func (d *Detector) atomicBegin(addr, size uintptr, ctx *goroutine.RaceContext, a
 			states[i].state.acquire(ctx, states[i].mask)
 		}
 	}
+	if advance {
+		ctx.PreflightClockAdvance()
+	}
 	return false
 }
 
@@ -1567,8 +2834,8 @@ func (d *Detector) AtomicEnd(addr, size uintptr, ctx *goroutine.RaceContext, tok
 
 // AtomicEndLoad completes the locked fallback for a public enabled Load and
 // seeds the exact cache/frontier when the transaction retained a capability.
-func (d *Detector) AtomicEndLoad(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken, pc uintptr) {
-	d.atomicEndMode(addr, size, ctx, token, pc, false, true, true)
+func (d *Detector) AtomicEndLoad(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken, pc uintptr) *uint32 {
+	return d.atomicEndMode(addr, size, ctx, token, pc, false, true, true)
 }
 
 // AtomicEndMode publishes one transition per unique overlay membership and
@@ -1578,13 +2845,121 @@ func (d *Detector) AtomicEndLoad(addr, size uintptr, ctx *goroutine.RaceContext,
 // but no release is published and the context clock does not advance. Enabled
 // read-like operations weaken ordinary read-cache entries without advancing the
 // owning clock; enabled writes publish a release and then advance it.
-func (d *Detector) AtomicEndMode(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken, pc uintptr, write, synchronize bool) {
-	d.atomicEndMode(addr, size, ctx, token, pc, write, synchronize, false)
+func (d *Detector) AtomicEndMode(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken, pc uintptr, write, synchronize bool) *uint32 {
+	return d.atomicEndMode(addr, size, ctx, token, pc, write, synchronize, false)
 }
 
-func (d *Detector) atomicEndMode(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken, pc uintptr, write, synchronize, cacheLoad bool) {
+// AtomicEndInternalRMW completes the specialized private/public RMW begin.
+// Successful direct writes use only the preflighted in-place transition.
+// Failed CAS reads always take canonical completion with the already-executed
+// hardware result; they are never replayed merely to preserve the fast-tier
+// proof.
+func (d *Detector) AtomicEndInternalRMW(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken, pc uintptr, write, synchronize, direct bool) *uint32 {
+	if direct {
+		if write {
+			return d.atomicEndRMWDirect(addr, size, ctx, token, pc, synchronize)
+		}
+		// The retained capability and state lock are exactly the canonical fast
+		// token shape. Completing it as a read preserves all history while the
+		// hardware CAS result remains authoritative.
+		fast := atomicFastToken(token)
+		if fast == nil {
+			atomicRuntimeThrow("race detector invalid failed direct RMW token")
+		}
+		state := (*atomicState)(fast.Overlay())
+		if state.directRMWAppend.Valid() {
+			state.directRMWAppend.Abort()
+		}
+		state.directRMWRelease = nil
+		return d.atomicEndMode(addr, size, ctx, token, pc, false, synchronize, false)
+	}
+
+	var fast *shadowmem.AtomicFastPath
+	var state *atomicState
+	var retained bool
+	mask, exact := plainAtomicFastMask(addr, size)
+	if write && exact && ((synchronize && ctx.AtomicRMWCacheActive) || atomicInternalRMWFastPC(pc)) {
+		fast = atomicFastToken(token)
+		if fast != nil && fast.Mask() == mask && fast.OrdinaryMask() == 0 {
+			state = (*atomicState)(fast.Overlay())
+			retained = retainAtomicRMWCacheCandidate(ctx, addr, mask, synchronize, state)
+		}
+	}
+	wake := d.atomicEndMode(addr, size, ctx, token, pc, write, synchronize, false)
+	if state != nil {
+		recordAtomicRMWCache(ctx, addr, mask, synchronize, fast, state, retained)
+	}
+	return wake
+}
+
+func (d *Detector) atomicEndRMWDirect(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken, pc uintptr, synchronize bool) *uint32 {
+	if token == nil || ctx == nil {
+		atomicRuntimeThrow("race detector invalid direct RMW completion")
+	}
+	fast := atomicFastToken(token)
+	if fast == nil || fast.OrdinaryMask() != 0 || (!atomicInternalRMWFastPC(pc) && !(synchronize && ctx.AtomicRMWCacheActive)) {
+		atomicRuntimeThrow("race detector invalid direct RMW token")
+	}
+	state := (*atomicState)(fast.Overlay())
+	state.validateTransaction(addr, size, ctx, synchronize)
+	mask := fast.Mask()
+	reportInternal := atomicInternalMutexPC(pc)
+	// Begin proved the complete direct transition while holding state.mu, then
+	// retained both that lock and the immutable descriptor across hardware. The
+	// suspended RaceContext cannot change in between, so repeating the history
+	// and release scans here would revalidate state which is structurally frozen.
+	next := uint64(0)
+	if synchronize {
+		next = ctx.ValidateClockAdvance()
+	}
+	state.pruneReadFrontiers(ctx, mask)
+	pruneAtomicAccess(&state.reads, ctx, mask, reportInternal)
+	recordAtomicAccess(&state.writes, ctx, pc, mask, reportInternal)
+	if synchronize {
+		release := state.directRMWRelease
+		if release == nil {
+			atomicRuntimeThrow("race detector lost direct RMW release proof")
+		}
+		if state.directRMWAppend.Valid() {
+			lineageVersion, changed := state.directRMWAppend.CommitOwned(&release.view)
+			if !release.view.Valid() || release.view.Version() != lineageVersion {
+				atomicRuntimeThrow("race detector lost prepared direct RMW release view")
+			}
+			if changed {
+				bumpAtomicReleaseVersion(release)
+			}
+			// The prepared append adds only ctx's already-owned current
+			// coordinate to the exact strong release imported by Begin.
+			ctx.C.JoinCausal(release.view)
+			ctx.RecordAtomicReleaseStructure(unsafe.Pointer(release), release.stream, release.version, release.structureVersion, mask, true)
+		} else {
+			// Direct readiness proved the affected ordinary-write frontier empty,
+			// and the retained descriptor prevents an ordinary access from entering
+			// before completion. Publish the already-proven compact release directly.
+			state.publishRelease(ctx, mask)
+		}
+	} else {
+		state.retireReleases(mask)
+	}
+	state.directRMWRelease = nil
+	state.endWriter()
+	state.endTransaction()
+	wake := state.endExactFastOwner()
+	state.arena.unpin()
+	if synchronize {
+		ctx.CommitClockAdvance(next)
+	}
+	ctx.InvalidateReadRange(addr, size)
+	for i := range token {
+		token[i] = nil
+	}
+	fast.Release()
+	return wake
+}
+
+func (d *Detector) atomicEndMode(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken, pc uintptr, write, synchronize, cacheLoad bool) *uint32 {
 	if token == nil || token[0] == nil {
-		return
+		return nil
 	}
 	if ctx == nil || !validAtomicAccess(addr, size) {
 		atomicRuntimeThrow("race detector invalid atomic transaction completion")
@@ -1592,13 +2967,12 @@ func (d *Detector) atomicEndMode(addr, size uintptr, ctx *goroutine.RaceContext,
 	if pc == 0 {
 		pc = captureCallerPC()
 	}
+	if fast := atomicFastToken(token); fast != nil {
+		return d.atomicEndPlainFast(addr, size, ctx, token, fast, pc, write, synchronize, cacheLoad)
+	}
 	var next uint64
 	if synchronize && write {
-		next = ctx.PreflightClockAdvance()
-	}
-	if fast := atomicFastToken(token); fast != nil {
-		d.atomicEndPlainFast(addr, size, ctx, token, fast, pc, write, synchronize, cacheLoad)
-		return
+		next = ctx.ValidateClockAdvance()
 	}
 	current := ctx.GetEpoch()
 	internal := atomicInternalMutexPC(pc)
@@ -1695,6 +3069,7 @@ func (d *Detector) atomicEndMode(addr, size uintptr, ctx *goroutine.RaceContext,
 		groups[i].state.UnlockAccess()
 	}
 	pending.report(d)
+	return nil
 }
 
 func atomicFastToken(token *AtomicToken) *shadowmem.AtomicFastPath {
@@ -1708,10 +3083,10 @@ func atomicFastToken(token *AtomicToken) *shadowmem.AtomicFastPath {
 // capability freezes every covered ordinary group until Release. Enrollment
 // admits at most one non-empty group, which is checked with the same predicates
 // as the locked path after the exact atomic frontier/release transition.
-func (d *Detector) atomicEndPlainFast(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken, fast *shadowmem.AtomicFastPath, pc uintptr, write, synchronize, cacheLoad bool) {
+func (d *Detector) atomicEndPlainFast(addr, size uintptr, ctx *goroutine.RaceContext, token *AtomicToken, fast *shadowmem.AtomicFastPath, pc uintptr, write, synchronize, cacheLoad bool) *uint32 {
 	var next uint64
 	if synchronize && write {
-		next = ctx.PreflightClockAdvance()
+		next = ctx.ValidateClockAdvance()
 	}
 	state := (*atomicState)(fast.Overlay())
 	state.validateTransaction(addr, size, ctx, synchronize)
@@ -1775,7 +3150,7 @@ func (d *Detector) atomicEndPlainFast(addr, size uintptr, ctx *goroutine.RaceCon
 	if loadFrontier != nil {
 		recordAtomicLoadCache(ctx, fast, state, loadFrontier, state.writerRevision.Load(), mask, pc, internal)
 	}
-	state.mu.unlock()
+	wake := state.endExactFastOwner()
 	state.arena.unpin()
 
 	if synchronize {
@@ -1793,6 +3168,7 @@ func (d *Detector) atomicEndPlainFast(addr, size uintptr, ctx *goroutine.RaceCon
 	}
 	fast.Release()
 	pending.report(d)
+	return wake
 }
 
 // atomicTokenGroups and atomicTokenStates decode a runtime-constructed opaque

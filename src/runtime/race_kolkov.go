@@ -149,12 +149,14 @@ func raceKolkovOptionInt32(value string) (int32, bool) {
 //
 // shadowSlot layout:
 //
-//	offset 0: states[0] (8 * atomic.Pointer[VarState], each 8 bytes)
+//	offset 0:  states[0] (8 * atomic.Pointer[VarState], each 8 bytes)
+//	offset 64: mu.state (odd/even atomic.Uint64 membership revision)
 //
 // VarState layout (from shadowmem/varstate.go):
 //
-//	offset 0:  W (atomic.Uint64, 8 bytes) — write epoch
-//	offset 40: readerState (atomic.Uint32, 4 bytes) — reader count
+//	offset 0:   W (atomic.Uint64, 8 bytes) — write epoch
+//	offset 40:  readerState (atomic.Uint32, 4 bytes) — reader count
+//	offset 120: atomicState (atomic.Pointer, 8 bytes) — mixed-access sidecar
 //
 // RaceContext ABI-sensitive prefix on 64-bit targets (from
 // goroutine/context.go):
@@ -164,6 +166,13 @@ func raceKolkovOptionInt32(value string) (int32, bool) {
 //	offset 24: ReadCache[0] (4 uintptr entries)
 //	offset 56: ReadCacheStates[0] (4 unsafe.Pointer entries)
 //	offset 88: ReadCacheWidths[0] (4 uint8 entries)
+//	offset 355: WriteCacheWidth (uint8)
+//	offset 360: WriteCacheAddr (uintptr)
+//	offset 368: WriteCacheState (unsafe.Pointer)
+//	offset 376: WriteCacheSlot (unsafe.Pointer)
+//	offset 384: WriteCacheVersion (uint64)
+//	offset 392: ReadCacheGeneration (uint64)
+//	offset 400: WriteCacheReadGeneration (uint64)
 const (
 	ptL1Shift       = 21
 	ptL1Size        = 65536
@@ -202,7 +211,10 @@ const (
 
 	shadowHashMultiplier = uint64(0x9E3779B97F4A7C15)
 
+	shadowSlotVersionOffset            = 8 * goarch.PtrSize // offset of ShadowSlot.mu.state
 	vsWOffset                          = 0                  // offset of W in VarState
+	vsReaderStateOffset                = 40                 // offset of readerState in VarState
+	vsAtomicStateOffset                = 120                // offset of atomicState in VarState
 	ctxReadCacheInvalidatedClockOffset = 4                  // offset of ReadCacheInvalidatedClock in RaceContext
 	ctxEpochOffset                     = 8 + goarch.PtrSize // TID + marker + C
 	ctxReadCacheOffset                 = ctxEpochOffset + 8 // offset of ReadCache[0] in RaceContext
@@ -211,10 +223,20 @@ const (
 	ctxReadStateOffset                 = ctxReadCacheOffset + ctxReadCacheSlots*goarch.PtrSize
 	ctxReadWidthOffset                 = ctxReadStateOffset + ctxReadCacheSlots*goarch.PtrSize
 	ctxReadWeakWidth                   = uint8(1 << 7)
+	ctxWriteCacheWidthOffset           = 355
+	ctxWriteCacheAddrOffset            = 360
+	ctxWriteCacheStateOffset           = 368
+	ctxWriteCacheSlotOffset            = 376
+	ctxWriteCacheVersionOffset         = 384
+	ctxReadCacheGenerationOffset       = 392
+	ctxWriteCacheReadGenerationOffset  = 400
 
 	// PageTableShadow has this layout only on amd64 and arm64. Other supported
 	// race architectures use a fallback-only stub and must take the slow path.
 	raceInlineShadowSupported = goarch.IsAmd64 | goarch.IsArm64
+
+	ordinaryFastMiss             = uint8(0)
+	ordinaryFastHandledCacheable = uint8(2)
 )
 
 // ReadCache is owned by its RaceContext. Ordinary accesses happen only while
@@ -309,6 +331,47 @@ func raceShadowState(shadowPtr, addr uintptr) unsafe.Pointer {
 	return atomic.Loadp(unsafe.Add(cellPtr, externalBlockHistoryStateOff))
 }
 
+// raceShadowMaterializedSlot returns the authoritative per-byte pointer array
+// for addr's word. Compact and block-default histories deliberately miss: only
+// a materialized slot can prove that one sized scalar owns every covered lane.
+//
+//go:nosplit
+func raceShadowMaterializedSlot(shadowPtr, addr uintptr) unsafe.Pointer {
+	if raceInlineShadowSupported == 0 || shadowPtr == 0 {
+		return nil
+	}
+	base := atomic.LoadAcquintptr((*uintptr)(unsafe.Pointer(shadowPtr)))
+	if base == 0 {
+		return nil
+	}
+	offset := addr - base
+	if offset < ptTotalCoverage {
+		pagePtr := atomic.Loadp(unsafe.Pointer(shadowPtr + ptPagesOffset + (offset>>ptL1Shift)*goarch.PtrSize))
+		if pagePtr == nil {
+			return nil
+		}
+		blockIdx := (offset >> shadowBlockShift) & shadowBlockMask
+		slotsPtr := atomic.Loadp(unsafe.Add(pagePtr, blockIdx*goarch.PtrSize))
+		if slotsPtr == nil {
+			return nil
+		}
+		wordIdx := (offset >> 3) & shadowBlockWordMask
+		return atomic.Loadp(unsafe.Add(slotsPtr, wordIdx*goarch.PtrSize))
+	}
+
+	blockBase := addr &^ (uintptr(1)<<externalBlockShift - 1)
+	cellPtr := raceExternalBlockCell(shadowPtr, blockBase)
+	if cellPtr == nil {
+		return nil
+	}
+	slotsPtr := atomic.Loadp(unsafe.Add(cellPtr, externalBlockCellSlotsOffset))
+	if slotsPtr == nil {
+		return nil
+	}
+	wordIdx := (addr >> 3) & externalBlockWordMask
+	return atomic.Loadp(unsafe.Add(slotsPtr, wordIdx*goarch.PtrSize))
+}
+
 // raceFirstModuleStaticData reports whether addr belongs to mutable static
 // storage in the executable's first module. These sections live for the
 // process lifetime, so an exact redundant-read cache entry cannot be revived
@@ -343,6 +406,159 @@ func raceFirstModuleStaticDataRange(addr, size uintptr) bool {
 		datap.data <= addr && last < datap.edata ||
 		datap.bss <= addr && last < datap.ebss ||
 		datap.noptrbss <= addr && last < datap.enoptrbss
+}
+
+// raceCaptureSameEpochWrite installs a retained same-writer certificate for an
+// exact, word-local scalar. Heap and stack lifetimes are safe here: State and
+// Slot are GC-visible roots, while the even slot revision and complete lane
+// mapping bind the capability to the authoritative shadow generation. Clear,
+// copy-on-write, stack retirement, and allocator reuse all bracket membership
+// changes by advancing that revision.
+//
+//go:nosplit
+func raceCaptureSameEpochWrite(shadowPtr, racectx, addr, size uintptr) bool {
+	lane := addr & 7
+	if size == 0 || size > 8-lane {
+		return false
+	}
+	currentEpoch := atomic.Load64((*uint64)(unsafe.Pointer(racectx + ctxEpochOffset)))
+	if currentEpoch == 0 {
+		return false
+	}
+	slot := raceShadowMaterializedSlot(shadowPtr, addr)
+	if slot == nil {
+		return false
+	}
+	version := atomic.Load64((*uint64)(unsafe.Add(slot, shadowSlotVersionOffset)))
+	if version&1 != 0 {
+		return false
+	}
+	state := atomic.Loadp(unsafe.Add(slot, lane*goarch.PtrSize))
+	if state == nil {
+		return false
+	}
+	for offset := uintptr(0); offset < 8; offset++ {
+		mapped := atomic.Loadp(unsafe.Add(slot, offset*goarch.PtrSize)) == state
+		want := lane <= offset && offset-lane < size
+		if mapped != want {
+			return false
+		}
+	}
+	if atomic.Load64((*uint64)(unsafe.Add(state, vsWOffset))) != currentEpoch ||
+		atomic.Load((*uint32)(unsafe.Add(state, vsReaderStateOffset))) != 0 ||
+		atomic.Loadp(unsafe.Add(state, vsAtomicStateOffset)) != nil ||
+		atomic.Load64((*uint64)(unsafe.Add(slot, shadowSlotVersionOffset))) != version {
+		return false
+	}
+
+	// Invalidate the old discriminator before replacing its rooted pointers,
+	// then publish the address last. The RaceContext owner is the only reader;
+	// atomic pointer stores are required solely for the runtime write barrier.
+	*(*uintptr)(unsafe.Pointer(racectx + ctxWriteCacheAddrOffset)) = 0
+	atomicstorep(unsafe.Pointer(racectx+ctxWriteCacheStateOffset), state)
+	atomicstorep(unsafe.Pointer(racectx+ctxWriteCacheSlotOffset), slot)
+	*(*uint64)(unsafe.Pointer(racectx + ctxWriteCacheVersionOffset)) = version
+	*(*uint64)(unsafe.Pointer(racectx + ctxWriteCacheReadGenerationOffset)) =
+		*(*uint64)(unsafe.Pointer(racectx + ctxReadCacheGenerationOffset))
+	*(*uint8)(unsafe.Pointer(racectx + ctxWriteCacheWidthOffset)) = uint8(size)
+	*(*uintptr)(unsafe.Pointer(racectx + ctxWriteCacheAddrOffset)) = addr
+	return true
+}
+
+// raceCachedSameEpochWrite accepts a previously proved lane-equivalence
+// certificate only while its entire proof remains true. The exact address and
+// width reject stack movement and cache collisions; ReadCacheGeneration rejects
+// a local read publication; Epoch, W, and readerState reject synchronization and
+// foreign memory events; the two revision reads reject concurrent mapping and
+// lifecycle changes. A hit performs no mutation.
+//
+//go:nosplit
+func raceCachedSameEpochWrite(racectx, addr, size uintptr) bool {
+	if raceInlineShadowSupported == 0 {
+		return false
+	}
+	if *(*uintptr)(unsafe.Pointer(racectx + ctxWriteCacheAddrOffset)) != addr ||
+		uintptr(*(*uint8)(unsafe.Pointer(racectx + ctxWriteCacheWidthOffset))) != size {
+		return false
+	}
+	slot := atomic.Loadp(unsafe.Pointer(racectx + ctxWriteCacheSlotOffset))
+	state := atomic.Loadp(unsafe.Pointer(racectx + ctxWriteCacheStateOffset))
+	if slot == nil || state == nil {
+		return false
+	}
+	// Slot revisions cover membership within one PageTable generation. Resolve
+	// the current table as well so a quiescent detector reset, which retires the
+	// complete page directory without visiting old rooted slots, cannot revive a
+	// certificate in the replacement lifecycle.
+	if raceShadowMaterializedSlot(uintptr(kolkovShadowPtr.Load()), addr) != slot {
+		return false
+	}
+	version := *(*uint64)(unsafe.Pointer(racectx + ctxWriteCacheVersionOffset))
+	if version&1 != 0 || atomic.Load64((*uint64)(unsafe.Add(slot, shadowSlotVersionOffset))) != version {
+		return false
+	}
+	if *(*uint64)(unsafe.Pointer(racectx + ctxReadCacheGenerationOffset)) !=
+		*(*uint64)(unsafe.Pointer(racectx + ctxWriteCacheReadGenerationOffset)) {
+		return false
+	}
+	currentEpoch := atomic.Load64((*uint64)(unsafe.Pointer(racectx + ctxEpochOffset)))
+	return currentEpoch != 0 &&
+		atomic.Load64((*uint64)(unsafe.Add(state, vsWOffset))) == currentEpoch &&
+		atomic.Load((*uint32)(unsafe.Add(state, vsReaderStateOffset))) == 0 &&
+		atomic.Loadp(unsafe.Add(state, vsAtomicStateOffset)) == nil &&
+		atomic.Load64((*uint64)(unsafe.Add(slot, shadowSlotVersionOffset))) == version
+}
+
+// raceRecordWriteHint records the first completed write to an exact scalar as
+// probation. Nil roots distinguish the hint from a materialized capability.
+// Publishing the address last keeps both forms safe for the runtime's raw ABI
+// reader and avoids materializing one-shot heap and stack addresses.
+//
+//go:nosplit
+func raceRecordWriteHint(racectx, addr, size uintptr) {
+	if raceInlineShadowSupported == 0 || racectx <= 1 || size == 0 || size > 8-(addr&7) || size > 255 {
+		return
+	}
+	*(*uintptr)(unsafe.Pointer(racectx + ctxWriteCacheAddrOffset)) = 0
+	atomicstorep(unsafe.Pointer(racectx+ctxWriteCacheStateOffset), nil)
+	atomicstorep(unsafe.Pointer(racectx+ctxWriteCacheSlotOffset), nil)
+	*(*uint64)(unsafe.Pointer(racectx + ctxWriteCacheVersionOffset)) = 0
+	*(*uint64)(unsafe.Pointer(racectx + ctxWriteCacheReadGenerationOffset)) =
+		*(*uint64)(unsafe.Pointer(racectx + ctxReadCacheGenerationOffset))
+	*(*uint8)(unsafe.Pointer(racectx + ctxWriteCacheWidthOffset)) = uint8(size)
+	*(*uintptr)(unsafe.Pointer(racectx + ctxWriteCacheAddrOffset)) = addr
+}
+
+// raceRetainCompletedWrite applies the probation policy after exactly one
+// canonical or optimistic write transition completed. The first occurrence
+// records only an address/width hint. A second occurrence materializes the word
+// on g0 if needed, then captures the immutable capability on the user stack so
+// its GC roots are installed with normal write barriers.
+//
+//go:nosplit
+func raceRetainCompletedWrite(gp *g, racectx, addr, size uintptr) {
+	if raceInlineShadowSupported == 0 || racectx <= 1 || size == 0 || size > 8-(addr&7) || size > 255 {
+		return
+	}
+	if *(*uintptr)(unsafe.Pointer(racectx + ctxWriteCacheAddrOffset)) != addr ||
+		uintptr(*(*uint8)(unsafe.Pointer(racectx + ctxWriteCacheWidthOffset))) != size {
+		raceRecordWriteHint(racectx, addr, size)
+		return
+	}
+	shadowPtr := uintptr(kolkovShadowPtr.Load())
+	if raceCaptureSameEpochWrite(shadowPtr, racectx, addr, size) {
+		return
+	}
+	gp.raceguard++
+	systemstack(func() {
+		kolkovApiMaterializeOrdinaryScalar(addr, size, racectx)
+	})
+	gp.raceguard--
+	if !raceCaptureSameEpochWrite(shadowPtr, racectx, addr, size) {
+		// Preserve probation, but never retain stale roots after a failed
+		// materialization/revalidation attempt.
+		raceRecordWriteHint(racectx, addr, size)
+	}
 }
 
 // raceClearReadCache invalidates per-context redundant-read elimination before
@@ -395,6 +611,160 @@ func raceInvalidateReadCacheRange(racectx, addr, size uintptr) {
 			widths[i] = 0
 		}
 	}
+}
+
+// raceRecordFastRead publishes the authoritative generation returned by the
+// detector only for cacheable ordinary completions. The pointer is installed
+// first, with the runtime write barrier, so the address discriminator can never
+// expose a new entry paired with a prior slot's generation.
+//
+//go:nosplit
+func raceRecordFastRead(racectx, addr, size uintptr, state unsafe.Pointer) {
+	preferred := (addr >> 3) & ctxReadCacheMask
+	index := preferred
+	cache := (*[ctxReadCacheSlots]uintptr)(unsafe.Pointer(racectx + ctxReadCacheOffset))
+	if cache[preferred] != addr {
+		// Preserve the direct-mapped slot as the common case, but use an empty
+		// existing slot for a detector-qualified miss before evicting it. Runtime
+		// lookups probe the preferred slot first and then these three overflow
+		// entries. This keeps one-address reads unchanged while allowing the
+		// fixed cache to retain small address sets that hash to one slot.
+		for i := uintptr(0); i < ctxReadCacheSlots; i++ {
+			if cache[i] == addr {
+				index = i
+				break
+			}
+		}
+		if index == preferred && cache[preferred] != 0 {
+			secondary := (preferred + 1) & ctxReadCacheMask
+			if cache[secondary] == 0 {
+				index = secondary
+			} else {
+				foundEmpty := false
+				for i := uintptr(0); i < ctxReadCacheSlots; i++ {
+					if cache[i] == 0 {
+						index = i
+						foundEmpty = true
+						break
+					}
+				}
+				if !foundEmpty {
+					// A test process and real applications can leave all four slots
+					// populated with an older working set. Give a direct-map collision
+					// one deterministic overflow victim instead of repeatedly evicting
+					// its peer from the preferred slot.
+					index = secondary
+				}
+			}
+		}
+	}
+	atomicstorep(unsafe.Pointer(racectx+ctxReadStateOffset+index*goarch.PtrSize), state)
+	*(*uint8)(unsafe.Pointer(racectx + ctxReadWidthOffset + index)) = uint8(size)
+	generation := *(*uint64)(unsafe.Pointer(racectx + ctxReadCacheGenerationOffset)) + 1
+	if generation == 0 {
+		// The only retained generation consumer is the static write
+		// certificate. Invalidate it before restarting the counter.
+		*(*uintptr)(unsafe.Pointer(racectx + ctxWriteCacheAddrOffset)) = 0
+		generation = 1
+	}
+	*(*uint64)(unsafe.Pointer(racectx + ctxReadCacheGenerationOffset)) = generation
+	cache[index] = addr
+}
+
+// raceCachedReadTertiaryIndex probes the two slots outside the preferred
+// two-way pair. Callers retain direct loads for the preferred and secondary
+// slots; reaching this bounded fallback is uncommon.
+//
+//go:nosplit
+func raceCachedReadTertiaryIndex(racectx, addr, preferred, secondary uintptr, width uint8) uintptr {
+	cache := (*[ctxReadCacheSlots]uintptr)(unsafe.Pointer(racectx + ctxReadCacheOffset))
+	widths := (*[ctxReadCacheSlots]uint8)(unsafe.Pointer(racectx + ctxReadWidthOffset))
+	for i := uintptr(0); i < ctxReadCacheSlots; i++ {
+		if i != preferred && i != secondary && cache[i] == addr && widths[i] == width {
+			return i
+		}
+	}
+	return ctxReadCacheSlots
+}
+
+// raceFastPathAllowed rejects the fork-child interval, where the runtime
+// deliberately poisons the current goroutine's stack guard. The canonical
+// bridge switches to g0 before entering detector code; a direct optimistic
+// bridge may contain an ordinary split-stack check and therefore must miss
+// before any detector mutation while stackguard0 is stackFork.
+//
+//go:nosplit
+func raceFastPathAllowed(gp *g) bool {
+	return gp != nil && gp.stackguard0 != stackFork
+}
+
+// Stack generations are retired by the allocator-side canonical clear before
+// reuse. Keep direct optimistic memory/synchronization transactions off the
+// current stack so that lifecycle boundary remains the sole authority for
+// reused stack addresses.
+//
+//go:nosplit
+func raceFastAddressAllowed(gp *g, addr, size uintptr) bool {
+	if !raceFastPathAllowed(gp) || size == 0 || size-1 > ^uintptr(0)-addr {
+		return false
+	}
+	last := addr + size - 1
+	return last < gp.stack.lo || addr >= gp.stack.hi
+}
+
+// Synchronization addresses may live on the current stack. Unlike ordinary
+// history, the context cache roots the immutable SyncVar identity, and the
+// direct bridge is nosplit until the cache has resolved that exact address.
+// Fork-child and g0/gsignal callers remain excluded by their surrounding
+// runtime guards.
+//
+//go:nosplit
+func raceFastSyncAddressAllowed(gp *g, addr uintptr) bool {
+	return raceFastPathAllowed(gp) && addr != 0
+}
+
+// The optimistic detector transactions use non-blocking internal locks on the
+// user goroutine. Pinning the current M makes the whole transaction an unsafe
+// point: the goroutine cannot be stopped while it owns a detector lock and
+// thereby strand a system-stack detector callback during stop-the-world.
+// These paths are allocation-free; a miss releases the pin before entering the
+// canonical system-stack callback.
+func raceTryReadDirect(addr, size, pc, racectx uintptr) (unsafe.Pointer, uint8) {
+	mp := acquirem()
+	state, status := kolkovApiTryReadFast(addr, size, pc, racectx)
+	releasem(mp)
+	return state, status
+}
+
+func raceTryWriteDirect(addr, size, pc, racectx uintptr) bool {
+	mp := acquirem()
+	ok := kolkovApiTryWriteFast(addr, size, pc, racectx)
+	releasem(mp)
+	return ok
+}
+
+//go:nosplit
+func raceTryAcquireDirect(addr, racectx uintptr) bool {
+	mp := acquirem()
+	ok := kolkovApiTryAcquireFast(addr, racectx)
+	releasem(mp)
+	return ok
+}
+
+//go:nosplit
+func raceTryReleaseDirect(addr, racectx uintptr) bool {
+	mp := acquirem()
+	ok := kolkovApiTryReleaseFast(addr, racectx)
+	releasem(mp)
+	return ok
+}
+
+//go:nosplit
+func raceTryReleaseMergeDirect(addr, racectx uintptr) bool {
+	mp := acquirem()
+	ok := kolkovApiTryReleaseMergeFast(addr, racectx)
+	releasem(mp)
+	return ok
 }
 
 // raceRangesOverlap reports whether two validated, non-empty half-open ranges
@@ -689,23 +1059,29 @@ func racewritepc(addr unsafe.Pointer, callpc, pc uintptr) {
 		return
 	}
 	racectx := gp.racectx
-	raceInvalidateReadCache(racectx, uintptr(addr))
+	writeAddr := uintptr(addr)
+	if racectx > 1 && raceCachedSameEpochWrite(racectx, writeAddr, 1) {
+		return
+	}
+	raceInvalidateReadCache(racectx, writeAddr)
 	gp.raceguard++
 	if racectx > 1 {
 		systemstack(func() {
-			kolkovOnWriteCtx(uintptr(addr), pc, racectx)
+			kolkovOnWriteCtx(writeAddr, pc, racectx)
 		})
 	} else {
 		var newCtx uintptr
 		systemstack(func() {
-			newCtx = kolkovOnWriteSlow(uintptr(addr), pc)
+			newCtx = kolkovOnWriteSlow(writeAddr, pc)
 		})
 		if newCtx > 1 {
 			gp.racectx = newCtx
 			kolkovCacheShadowPtr()
+			racectx = newCtx
 		}
 	}
 	gp.raceguard--
+	raceRetainCompletedWrite(gp, racectx, writeAddr, 1)
 }
 
 //go:linkname race_ReadPC internal/race.ReadPC
@@ -1035,6 +1411,9 @@ func raceacquire(addr unsafe.Pointer) {
 		return
 	}
 	racectx := gp.racectx
+	if racectx > 1 && raceFastSyncAddressAllowed(gp, uintptr(addr)) && raceTryAcquireDirect(uintptr(addr), racectx) {
+		return
+	}
 	gp.raceguard++
 	if racectx > 1 {
 		systemstack(func() {
@@ -1129,6 +1508,9 @@ func racerelease(addr unsafe.Pointer) {
 		return
 	}
 	racectx := gp.racectx
+	if racectx > 1 && raceFastSyncAddressAllowed(gp, uintptr(addr)) && raceTryReleaseDirect(uintptr(addr), racectx) {
+		return
+	}
 	gp.raceguard++
 	if racectx > 1 {
 		systemstack(func() {
@@ -1218,6 +1600,9 @@ func racereleasemerge(addr unsafe.Pointer) {
 		return
 	}
 	racectx := gp.racectx
+	if racectx > 1 && raceFastSyncAddressAllowed(gp, uintptr(addr)) && raceTryReleaseMergeDirect(uintptr(addr), racectx) {
+		return
+	}
 	gp.raceguard++
 	if racectx > 1 {
 		systemstack(func() {
@@ -1283,7 +1668,7 @@ func racefingo() {
 // per @randall77 guidance: no assembly needed, use sys.GetCallerPC().
 
 // racereadSlowPath contains the closure and systemstack state needed only when
-// the inline FastTrack checks miss. Keeping it out of raceread prevents those
+// both direct FastTrack tiers miss. Keeping it out of raceread prevents those
 // cold-path captures from inflating every compiler-generated read hook's frame.
 //
 //go:noinline
@@ -1291,19 +1676,6 @@ func racefingo() {
 func racereadSlowPath(addr, pc uintptr) {
 	gp := getg()
 	racectx := gp.racectx
-	if racectx > 1 {
-		// Cache misses can still avoid systemstack when this goroutine wrote the
-		// location in the current FastTrack epoch.
-		shadowPtr := uintptr(kolkovShadowPtr.Load())
-		if vsPtr := raceShadowState(shadowPtr, addr); vsPtr != nil {
-			currentEpoch := *(*uint64)(unsafe.Pointer(racectx + ctxEpochOffset))
-			if atomic.Load64((*uint64)(unsafe.Add(vsPtr, vsWOffset))) == currentEpoch &&
-				raceShadowState(shadowPtr, addr) == vsPtr {
-				return
-			}
-		}
-	}
-
 	gp.raceguard++
 	if racectx > 1 {
 		systemstack(func() {
@@ -1359,9 +1731,20 @@ func raceread(addr uintptr) {
 	// slow path. Cache collisions only reduce optimization coverage.
 	if racectx > 1 {
 		index := raceReadCacheIndex(addr)
-		slot := (*uintptr)(unsafe.Pointer(racectx + ctxReadCacheOffset + index*goarch.PtrSize))
+		cachedAddr := *(*uintptr)(unsafe.Pointer(racectx + ctxReadCacheOffset + index*goarch.PtrSize))
 		cachedWidth := *(*uint8)(unsafe.Pointer(racectx + ctxReadWidthOffset + index))
-		if *slot == addr && cachedWidth == 1 {
+		if cachedAddr != addr || cachedWidth != 1 {
+			preferred := index
+			secondary := (preferred + 1) & ctxReadCacheMask
+			secondaryAddr := *(*uintptr)(unsafe.Pointer(racectx + ctxReadCacheOffset + secondary*goarch.PtrSize))
+			secondaryWidth := *(*uint8)(unsafe.Pointer(racectx + ctxReadWidthOffset + secondary))
+			if secondaryAddr == addr && secondaryWidth == 1 {
+				index = secondary
+			} else {
+				index = raceCachedReadTertiaryIndex(racectx, addr, preferred, secondary, 1)
+			}
+		}
+		if index != ctxReadCacheSlots {
 			invalidated := atomic.Load((*uint32)(unsafe.Pointer(racectx + ctxReadCacheInvalidatedClockOffset)))
 			if invalidated != 0 {
 				currentEpoch := atomic.Load64((*uint64)(unsafe.Pointer(racectx + ctxEpochOffset)))
@@ -1384,6 +1767,27 @@ func raceread(addr uintptr) {
 	}
 cacheMiss:
 	pc := sys.GetCallerPC()
+	if racectx > 1 && raceFastAddressAllowed(gp, addr, 1) {
+		// Preserve the O(1) same-writer probe that predates the general
+		// ordinary fast bridge. TryOrdinaryRead can then spend its broader
+		// membership scan only on accesses this narrow tier cannot prove.
+		shadowPtr := uintptr(kolkovShadowPtr.Load())
+		if vsPtr := raceShadowState(shadowPtr, addr); vsPtr != nil {
+			currentEpoch := *(*uint64)(unsafe.Pointer(racectx + ctxEpochOffset))
+			if atomic.Load64((*uint64)(unsafe.Add(vsPtr, vsWOffset))) == currentEpoch &&
+				raceShadowState(shadowPtr, addr) == vsPtr {
+				return
+			}
+		}
+
+		state, status := raceTryReadDirect(addr, 1, pc, racectx)
+		if status != ordinaryFastMiss {
+			if status == ordinaryFastHandledCacheable && state != nil {
+				raceRecordFastRead(racectx, addr, 1, state)
+			}
+			return
+		}
+	}
 	racereadSlowPath(addr, pc)
 }
 
@@ -1398,11 +1802,29 @@ func racereadn(addr, size uintptr) {
 		return
 	}
 	racectx := gp.racectx
+	// A retained same-epoch write with no represented reader also proves this
+	// context's read is the FastTrack W.tid==T no-op. Do not publish a redundant
+	// read entry: preserving the certificate lets the paired write remain a
+	// no-op too, which is the common read/modify/write scalar loop.
+	if racectx > 1 && raceCachedSameEpochWrite(racectx, addr, size) {
+		return
+	}
 	if racectx > 1 {
 		index := raceReadCacheIndex(addr)
 		cachedAddr := *(*uintptr)(unsafe.Pointer(racectx + ctxReadCacheOffset + index*goarch.PtrSize))
 		cachedWidth := *(*uint8)(unsafe.Pointer(racectx + ctxReadWidthOffset + index))
-		if cachedAddr == addr && cachedWidth == uint8(size) {
+		if cachedAddr != addr || cachedWidth != uint8(size) {
+			preferred := index
+			secondary := (preferred + 1) & ctxReadCacheMask
+			secondaryAddr := *(*uintptr)(unsafe.Pointer(racectx + ctxReadCacheOffset + secondary*goarch.PtrSize))
+			secondaryWidth := *(*uint8)(unsafe.Pointer(racectx + ctxReadWidthOffset + secondary))
+			if secondaryAddr == addr && secondaryWidth == uint8(size) {
+				index = secondary
+			} else {
+				index = raceCachedReadTertiaryIndex(racectx, addr, preferred, secondary, uint8(size))
+			}
+		}
+		if index != ctxReadCacheSlots {
 			invalidated := atomic.Load((*uint32)(unsafe.Pointer(racectx + ctxReadCacheInvalidatedClockOffset)))
 			if invalidated != 0 {
 				currentEpoch := atomic.Load64((*uint64)(unsafe.Pointer(racectx + ctxEpochOffset)))
@@ -1427,6 +1849,15 @@ cacheMiss:
 		return
 	}
 	pc := sys.GetCallerPC()
+	if racectx > 1 && raceFastAddressAllowed(gp, addr, size) {
+		state, status := raceTryReadDirect(addr, size, pc, racectx)
+		if status != ordinaryFastMiss {
+			if status == ordinaryFastHandledCacheable && state != nil {
+				raceRecordFastRead(racectx, addr, size, state)
+			}
+			return
+		}
+	}
 	racereadnSlowPath(addr, size, pc)
 }
 
@@ -1476,7 +1907,6 @@ func racereadnSlowPath(addr, size, pc uintptr) {
 //
 //go:nosplit
 func racewrite(addr uintptr) {
-	pc := sys.GetCallerPC()
 	gp := getg()
 	if gp == nil || gp.m == nil || gp.m.curg == nil {
 		return
@@ -1491,7 +1921,19 @@ func racewrite(addr uintptr) {
 		return
 	}
 	racectx := gp.racectx
+	// The retained proof is checked before caller-PC capture and read-cache
+	// scanning. This is the warmed heap/stack/static FastTrack no-op.
+	if racectx > 1 && raceCachedSameEpochWrite(racectx, addr, 1) {
+		return
+	}
+	pc := sys.GetCallerPC()
 	raceInvalidateReadCache(racectx, addr)
+	if racectx > 1 && raceFastAddressAllowed(gp, addr, 1) {
+		if raceTryWriteDirect(addr, 1, pc, racectx) {
+			raceRetainCompletedWrite(gp, racectx, addr, 1)
+			return
+		}
+	}
 	gp.raceguard++
 	if racectx > 1 {
 		systemstack(func() {
@@ -1505,9 +1947,11 @@ func racewrite(addr uintptr) {
 		if newCtx > 1 {
 			gp.racectx = newCtx
 			kolkovCacheShadowPtr()
+			racectx = newCtx
 		}
 	}
 	gp.raceguard--
+	raceRetainCompletedWrite(gp, racectx, addr, 1)
 }
 
 // racewriten records an exact compiler scalar write. Ordinary FastTrack
@@ -1518,6 +1962,13 @@ func racewrite(addr uintptr) {
 func racewriten(addr, size uintptr) {
 	if !raceAccessRangeValid(addr, size) {
 		return
+	}
+	gp := getg()
+	if gp != nil && gp.m != nil && gp.m.curg != nil && gp == gp.m.curg && gp.raceguard == 0 {
+		racectx := gp.racectx
+		if racectx > 1 && raceCachedSameEpochWrite(racectx, addr, size) {
+			return
+		}
 	}
 	pc := sys.GetCallerPC()
 	racewritenpc(addr, size, pc)
@@ -1535,7 +1986,16 @@ func racewritenpc(addr, size, pc uintptr) {
 		return
 	}
 	racectx := gp.racectx
+	if racectx > 1 && raceCachedSameEpochWrite(racectx, addr, size) {
+		return
+	}
 	raceInvalidateReadCacheRange(racectx, addr, size)
+	if racectx > 1 && raceFastAddressAllowed(gp, addr, size) {
+		if raceTryWriteDirect(addr, size, pc, racectx) {
+			raceRetainCompletedWrite(gp, racectx, addr, size)
+			return
+		}
+	}
 	gp.raceguard++
 	if racectx > 1 {
 		systemstack(func() {
@@ -1549,9 +2009,11 @@ func racewritenpc(addr, size, pc uintptr) {
 		if newCtx > 1 {
 			gp.racectx = newCtx
 			kolkovCacheShadowPtr()
+			racectx = newCtx
 		}
 	}
 	gp.raceguard--
+	raceRetainCompletedWrite(gp, racectx, addr, size)
 }
 
 // racereadrange records a read of the given address range.

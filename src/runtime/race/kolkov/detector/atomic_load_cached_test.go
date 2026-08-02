@@ -570,6 +570,8 @@ func TestAtomicCachedLoadGoEndDeactivationFoldsLatestFrontier(t *testing.T) {
 	if !ok || !d.AtomicEndLoadFast(reader, &token, revision, generation) {
 		t.Fatal("latest cached load did not complete")
 	}
+	wantClock := uint32(reader.GetEpoch())
+	reader.IncrementClock()
 	state := atomicHistoryForTest(t, d, addr)
 	state.mu.lock()
 	canonicalBefore := atomicHistoryCardinality(state.reads)
@@ -582,12 +584,132 @@ func TestAtomicCachedLoadGoEndDeactivationFoldsLatestFrontier(t *testing.T) {
 	folded, foldedOK := atomicHistoryAccess(state.reads, reader.TID)
 	frontiers := state.readFrontiers
 	state.mu.unlock()
-	if !foldedOK || folded.clocks[0] != uint32(reader.GetEpoch()) || frontiers != nil {
-		t.Fatalf("deactivated frontier fold = read=%+v/%v frontiers=%p, want latest canonical witness", folded, foldedOK, frontiers)
+	if !foldedOK || folded.clocks[0] != wantClock || frontiers != nil {
+		t.Fatalf("deactivated frontier fold = read=%+v/%v frontiers=%p, want cached witness clock %d", folded, foldedOK, frontiers, wantClock)
 	}
 	d.OnWrite(addr, writer, pc+1)
 	if got := d.RacesDetected(); got != 1 {
 		t.Fatalf("post-go-end writer saw %d races, want folded cached read", got)
+	}
+}
+
+func TestAtomicCachedLoadEnrollmentPrunesHBDominatedFoldedCohort(t *testing.T) {
+	d := NewDetector()
+	parent := goroutine.Alloc(70_053)
+	const (
+		addr       = uintptr(0x51740)
+		pc         = uintptr(0x8154)
+		cohortSize = 64
+		firstTID   = uint32(72_000)
+		secondTID  = uint32(73_000)
+	)
+
+	// Every first-cohort reader is a sibling. Fold all of their cached-load
+	// witnesses, then join their clocks into the parent just as a phase-ending
+	// WaitGroup would before starting the next cohort.
+	readers := make([]*goroutine.RaceContext, cohortSize)
+	for i := uint32(0); i < cohortSize; i++ {
+		readers[i] = goroutine.AllocWithParentClock(firstTID+i, parent.C, 1)
+	}
+	for _, reader := range readers {
+		warmCachedLoadForTest(t, d, addr, reader, pc)
+		DeactivateAtomicLoadCache(reader)
+		parent.C.Join(reader.C)
+		reader.C.Release()
+	}
+	state := atomicHistoryForTest(t, d, addr)
+	state.mu.lock()
+	for i := uint32(0); i < cohortSize; i++ {
+		if _, ok := state.reads.user.find(firstTID + i); !ok {
+			state.mu.unlock()
+			t.Fatalf("first-cohort TID %d was not folded", firstTID+i)
+		}
+	}
+	state.mu.unlock()
+
+	// Second-cohort siblings all inherit the joined first cohort. Their first
+	// locked loads enroll cached frontiers at the exact read-time clocks;
+	// geometric pruning must eventually discard every dominated old witness
+	// while retaining the mutually concurrent current cohort.
+	for i := uint32(0); i < cohortSize; i++ {
+		reader := goroutine.AllocWithParentClock(secondTID+i, parent.C, 1)
+		warmCachedLoadForTest(t, d, addr, reader, pc)
+		DeactivateAtomicLoadCache(reader)
+		reader.C.Release()
+	}
+	state.mu.lock()
+	defer state.mu.unlock()
+	for i := uint32(0); i < cohortSize; i++ {
+		if _, ok := state.reads.user.find(firstTID + i); ok {
+			t.Fatalf("HB-dominated first-cohort TID %d survived enrollment pruning", firstTID+i)
+		}
+		if _, ok := state.reads.user.find(secondTID + i); !ok {
+			t.Fatalf("concurrent second-cohort TID %d was pruned", secondTID+i)
+		}
+	}
+}
+
+func TestAtomicCachedLoadEnrollmentRetainsConcurrentFoldedReaders(t *testing.T) {
+	d := NewDetector()
+	parent := goroutine.Alloc(70_054)
+	const (
+		addr       = uintptr(0x51760)
+		pc         = uintptr(0x8156)
+		cohortSize = 64
+		firstTID   = uint32(74_000)
+	)
+
+	// Sequential test execution does not create HB: every reader inherits the
+	// same parent clock and none imports a sibling. Enrollment pruning must
+	// retain all of these concurrent witnesses.
+	for i := uint32(0); i < cohortSize; i++ {
+		reader := goroutine.AllocWithParentClock(firstTID+i, parent.C, 1)
+		warmCachedLoadForTest(t, d, addr, reader, pc)
+		DeactivateAtomicLoadCache(reader)
+		reader.C.Release()
+	}
+	state := atomicHistoryForTest(t, d, addr)
+	state.mu.lock()
+	defer state.mu.unlock()
+	if got := state.reads.user.live; got != cohortSize {
+		t.Fatalf("concurrent folded history size = %d, want %d", got, cohortSize)
+	}
+	for i := uint32(0); i < cohortSize; i++ {
+		if _, ok := state.reads.user.find(firstTID + i); !ok {
+			t.Fatalf("concurrent folded TID %d was pruned", firstTID+i)
+		}
+	}
+}
+
+func TestAtomicCachedLoadTeardownDoesNotPruneFromPostLoadAcquire(t *testing.T) {
+	d := NewDetector()
+	parent := goroutine.Alloc(70_055)
+	older := goroutine.AllocWithParentClock(75_000, parent.C, 1)
+	current := goroutine.AllocWithParentClock(75_001, parent.C, 1)
+	const (
+		addr = uintptr(0x51770)
+		pc   = uintptr(0x8157)
+	)
+
+	warmCachedLoadForTest(t, d, addr, older, pc)
+	DeactivateAtomicLoadCache(older)
+	warmCachedLoadForTest(t, d, addr, current, pc)
+
+	// The older read was concurrent with current's cached load. Importing the
+	// older context afterward cannot retroactively make it happen before that
+	// load, so teardown must not use current's later clock to prune the witness.
+	current.C.Join(older.C)
+	current.NoteForeignImport()
+	DeactivateAtomicLoadCache(current)
+
+	state := atomicHistoryForTest(t, d, addr)
+	state.mu.lock()
+	defer state.mu.unlock()
+	if _, ok := state.reads.user.find(older.TID); !ok {
+		t.Fatal("post-load acquire caused teardown to prune a concurrent older read")
+	}
+	if _, ok := state.reads.user.find(current.TID); !ok {
+		t.Fatal("current cached read was not folded at teardown")
 	}
 }
 

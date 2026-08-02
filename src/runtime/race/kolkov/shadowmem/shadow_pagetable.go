@@ -228,6 +228,15 @@ func materializeSlotLocked(view blockView, wordIdx uintptr, clearMask uint8) (*S
 	if slot := view.loadSlot(wordIdx); slot != nil {
 		return slot, false
 	}
+	if compact := view.history.compact.Load(); compact != nil {
+		if palette := compact.palette.Load(); palette != nil {
+			// A fast palette reader publishes without the block lock. Close
+			// admission and drain enrolled publishers before taking the exact
+			// descriptor snapshot below, so a successful read cannot disappear
+			// behind the authoritative slot publication.
+			palette.disableFastReads()
+		}
+	}
 
 	slot := &ShadowSlot{}
 	compact := view.history.compact.Load()
@@ -279,6 +288,29 @@ func materializeSlotLocked(view blockView, wordIdx uintptr, clearMask uint8) (*S
 	return slots[wordIdx].Load(), false
 }
 
+// preparePaletteMutationLocked closes the lock-free palette read form before a
+// canonical mutation. Tagged words in the selected range are first moved to
+// permanent slots; the caller must then retry through the slot oracle instead
+// of applying the same logical access to compact metadata a second time.
+func preparePaletteMutationLocked(view blockView, compact *compactGroups, firstWord, lastWord uintptr) bool {
+	if compact == nil {
+		return false
+	}
+	palette := compact.palette.Load()
+	if palette == nil {
+		return false
+	}
+	palette.disableFastReads()
+	materialized := false
+	for word := firstWord; word <= lastWord; word++ {
+		if palette.hasFastReadWord(word * shadowSlotLanes) {
+			materializeSlotLocked(view, word, 0)
+			materialized = true
+		}
+	}
+	return materialized
+}
+
 // materializeSlot publishes one word override while holding the block lock.
 func materializeSlot(view blockView, wordIdx uintptr) *ShadowSlot {
 	if slot := view.loadSlot(wordIdx); slot != nil {
@@ -305,6 +337,17 @@ func (pt *PageTableShadow) GetSlot(addr uintptr) *ShadowSlot {
 		return nil
 	}
 	return view.loadSlot((addr >> 3) & rangeBlockWordMask)
+}
+
+// PromotedReadCapability returns a stable per-TID certificate only for an
+// already-materialized exact scalar group whose current state is expected.
+// Compact/default histories remain on their existing bounded representations.
+func (pt *PageTableShadow) PromotedReadCapability(addr, size uintptr, tid uint32, expected *VarState) *PromotedReadCapability {
+	slot := pt.GetSlot(addr)
+	if slot == nil {
+		return nil
+	}
+	return slot.promotedReadCapability(addr, size, tid, expected)
 }
 
 // MaterializeReadHintSlot publishes the compact word containing addr.
@@ -429,6 +472,251 @@ func (pt *PageTableShadow) Get(addr uintptr) *VarState {
 	return view.history.state.Load()
 }
 
+func ordinaryFastSizeValid(addr, size uintptr) bool {
+	if size != 1 && size != 2 && size != 4 && size != 8 {
+		return false
+	}
+	return size-1 <= ^uintptr(0)-addr && size <= rangeBlockSize-(addr&(rangeBlockSize-1))
+}
+
+func ordinaryFastWordMask(addr, size uintptr) (uint8, bool) {
+	if !ordinaryFastSizeValid(addr, size) || size > shadowSlotLanes-(addr&7) {
+		return 0, false
+	}
+	return uint8(((uint16(1) << size) - 1) << (addr & 7)), true
+}
+
+// compactGroupExactRange reports whether group is exactly the requested
+// scalar equivalence class, with no membership which a canonical transition
+// would have to split by copy-on-write.
+func compactGroupExactRange(group *compactGroup, offset, size uintptr) bool {
+	if group == nil || size == 0 || size > rangeBlockSize-offset {
+		return false
+	}
+	for word := 0; word < compactMembershipWords; word++ {
+		if group.membershipWord(word) != compactRangeWordMask(offset, size, word) {
+			return false
+		}
+	}
+	return true
+}
+
+// compactGroupContainsRange reports whether every byte in the requested range
+// belongs to group. Unlike compactGroupExactRange, unrelated equivalent
+// members are permitted. That weaker proof is sufficient only for a semantic
+// no-op read, which neither changes the shared descriptor nor splits the
+// equivalence class.
+func compactGroupContainsRange(group *compactGroup, offset, size uintptr) bool {
+	if group == nil || size == 0 || size > rangeBlockSize-offset {
+		return false
+	}
+	firstWord := int(offset >> 6)
+	lastWord := int((offset + size - 1) >> 6)
+	for word := firstWord; word <= lastWord; word++ {
+		selected := compactRangeWordMask(offset, size, word)
+		if group.membershipWord(word)&selected != selected {
+			return false
+		}
+	}
+	return true
+}
+
+func ordinaryFastHistoryFromCompact(descriptor compactHistoryDescriptor) ordinaryFastHistory {
+	return ordinaryFastHistory{
+		write:           descriptor.history.write,
+		read:            descriptor.history.read,
+		exclusiveWriter: descriptor.history.exclusiveWriter,
+		writePC:         descriptor.history.writePC,
+		readPC:          descriptor.history.readPC,
+		writeCount:      descriptor.history.writeCount,
+		lifecycle:       descriptor.lifecycle,
+	}
+}
+
+func compactDescriptorFromOrdinaryFast(history ordinaryFastHistory) compactHistoryDescriptor {
+	return compactHistoryDescriptor{
+		history: compactHistoryKey{
+			write:           history.write,
+			read:            history.read,
+			exclusiveWriter: history.exclusiveWriter,
+			writePC:         history.writePC,
+			readPC:          history.readPC,
+			writeCount:      history.writeCount,
+		},
+		lifecycle: history.lifecycle,
+	}
+}
+
+func finishOrdinaryCompactMiss(state *VarState, plan ordinaryFastPlan) bool {
+	state.finishOrdinaryFastPlan(plan, false)
+	state.UnlockAccess()
+	return false
+}
+
+// tryOrdinaryCompact applies a transition to an existing exact sparse compact
+// membership. It never creates a header, group, state, palette shape, or
+// membership. The exact group keeps the same state pointer and allocator
+// lifecycle; the odd revision makes racing page-table lookups fail closed while
+// its ordinary fields and descriptor are published in place.
+func tryOrdinaryCompact(view blockView, addr, size uintptr, current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr, write bool, result **VarState) bool {
+	if !view.history.mu.tryLock() {
+		return false
+	}
+	defer view.history.mu.unlock()
+
+	for cursor, remaining := addr, size; remaining != 0; {
+		if view.loadSlot((cursor>>3)&rangeBlockWordMask) != nil {
+			return false
+		}
+		count := uintptr(8) - (cursor & 7)
+		if count > remaining {
+			count = remaining
+		}
+		cursor += count
+		remaining -= count
+	}
+	compact := view.history.compact.Load()
+	if compact == nil || compact.active.Load() == 0 || compact.palette.Load() != nil {
+		return false
+	}
+	revision := compact.revision.Load()
+	if revision&1 != 0 {
+		return false
+	}
+	offset := compactAnchor(addr)
+	source, overlap := compact.lookupGroup(offset)
+	if overlap || source == nil || source.retired || !source.joinable ||
+		!compactGroupContainsRange(source, offset, size) {
+		return false
+	}
+	exactRange := compactGroupExactRange(source, offset, size)
+	firstWord := int(offset >> 6)
+	lastWord := int((offset + size - 1) >> 6)
+	for word := firstWord; word <= lastWord; word++ {
+		selected := compactRangeWordMask(offset, size, word)
+		if compact.tombstoneWord(word)&selected != 0 {
+			return false
+		}
+		for i := 0; i < compactGroupCapacity; i++ {
+			group := compact.groupLoad(i)
+			if group != nil && group != source && group.membershipWord(word)&selected != 0 {
+				return false
+			}
+		}
+	}
+
+	state := source.state.Load()
+	if state == nil || !state.TryLockAccess() {
+		return false
+	}
+	expected := ordinaryFastHistoryFromCompact(source.descriptor)
+	plan, ok := state.tryOrdinaryFastPlan(current, clock, pc, write, &expected)
+	if !ok {
+		state.UnlockAccess()
+		return false
+	}
+	if compact.revision.Load() != revision || view.history.compact.Load() != compact ||
+		source.state.Load() != state || source.descriptor != compactDescriptorFromOrdinaryFast(plan.before) ||
+		state.atomicState.Load() != nil || state.GetLifecycleID() != plan.before.lifecycle.uint64() ||
+		!compactGroupContainsRange(source, offset, size) {
+		return finishOrdinaryCompactMiss(state, plan)
+	}
+
+	nextDescriptor := compactDescriptorFromOrdinaryFast(plan.after)
+	changed := nextDescriptor != source.descriptor
+	if !exactRange && (write || changed) {
+		return finishOrdinaryCompactMiss(state, plan)
+	}
+	// lookupExact and a prior cacheable no-op permanently expose the current
+	// state pointer. Compact's lifecycle contract makes an exposed state
+	// immutable: a later descriptor transition must use the canonical planner,
+	// which publishes a fresh state before retargeting membership. A semantic
+	// no-op may still reuse and cache the already-immutable generation.
+	if changed && source.exposed.Load() != 0 {
+		return finishOrdinaryCompactMiss(state, plan)
+	}
+	if changed {
+		// Joining an already-published equivalent descriptor is a redirection,
+		// and is deliberately left to the canonical compact planner.
+		for i := 0; i < compactGroupCapacity; i++ {
+			group := compact.groupLoad(i)
+			if group != nil && group != source && !group.retired && group.joinable &&
+				group.state.Load() != nil && group.descriptor == nextDescriptor {
+				return finishOrdinaryCompactMiss(state, plan)
+			}
+		}
+		compact.beginMutation()
+		state.finishOrdinaryFastPlan(plan, true)
+		source.descriptor = nextDescriptor
+		compact.endMutation()
+	} else {
+		state.finishOrdinaryFastPlan(plan, true)
+	}
+	state.UnlockAccess()
+	if result != nil && !changed {
+		// Only a semantic no-op may expose the compact state. Changed compact
+		// transitions remain handled-but-uncached so their state can continue to
+		// participate in allocation-free descriptor reuse.
+		source.exposed.Store(1)
+		*result = state
+	}
+	return true
+}
+
+// TryOrdinaryRead performs one non-blocking optimistic ordinary FastTrack
+// transition below the Tier-0 read cache. It acts only on an already-isolated
+// materialized scalar or an exact existing compact membership.
+func (pt *PageTableShadow) TryOrdinaryRead(addr, size uintptr, current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr) (OrdinaryFastResult, *VarState) {
+	if !ordinaryFastSizeValid(addr, size) {
+		return OrdinaryFastMiss, nil
+	}
+	view, ok := pt.blockFor(addr, false)
+	if !ok {
+		return OrdinaryFastMiss, nil
+	}
+	wordIdx := (addr >> 3) & rangeBlockWordMask
+	if slot := view.loadSlot(wordIdx); slot != nil {
+		mask, exactWord := ordinaryFastWordMask(addr, size)
+		if !exactWord {
+			return OrdinaryFastMiss, nil
+		}
+		return slot.tryOrdinaryFastRead(mask, current, clock, pc)
+	}
+	if size == shadowSlotLanes && addr&(shadowSlotLanes-1) == 0 {
+		if compact := view.history.compact.Load(); compact != nil {
+			if palette := compact.palette.Load(); palette != nil &&
+				palette.tryFastZeroRead(view, compact, addr, current, clock, pc) {
+				return OrdinaryFastHandled, nil
+			}
+		}
+	}
+	var state *VarState
+	if tryOrdinaryCompact(view, addr, size, current, clock, pc, false, &state) {
+		if state != nil {
+			return OrdinaryFastHandledCacheable, state
+		}
+		return OrdinaryFastHandled, nil
+	}
+	return OrdinaryFastMiss, nil
+}
+
+// TryOrdinaryWrite is the write counterpart of TryOrdinaryRead.
+func (pt *PageTableShadow) TryOrdinaryWrite(addr, size uintptr, current epoch.Epoch, clock *vectorclock.VectorClock, pc uintptr) bool {
+	if !ordinaryFastSizeValid(addr, size) {
+		return false
+	}
+	view, ok := pt.blockFor(addr, false)
+	if !ok {
+		return false
+	}
+	wordIdx := (addr >> 3) & rangeBlockWordMask
+	if slot := view.loadSlot(wordIdx); slot != nil {
+		mask, exactWord := ordinaryFastWordMask(addr, size)
+		return exactWord && slot.tryOrdinaryFastWrite(mask, current, clock, pc)
+	}
+	return tryOrdinaryCompact(view, addr, size, current, clock, pc, true, nil)
+}
+
 // TryCompactWrite applies an allocation-free simple FastTrack write transition
 // to an unmaterialized exact start address. It returns false without changing
 // history when the address inherits a block default, the transition is complex,
@@ -446,7 +734,6 @@ func (pt *PageTableShadow) TryCompactWrite(addr uintptr, current epoch.Epoch, cl
 	if view.loadSlot(wordIdx) != nil {
 		return false
 	}
-
 	compact := view.history.compact.Load()
 	if compact == nil {
 		if view.history.state.Load() != nil {
@@ -457,6 +744,8 @@ func (pt *PageTableShadow) TryCompactWrite(addr uintptr, current epoch.Epoch, cl
 		// its active word before the mapping becomes visible, so runtime lookup
 		// either sees the prior default-only state or fails closed.
 		view.history.compact.Store(compact)
+	} else if preparePaletteMutationLocked(view, compact, wordIdx, wordIdx) {
+		return false
 	} else if palette := compact.palette.Load(); palette != nil {
 		if palette.owner(addr) == compactPaletteDefault && view.history.state.Load() != nil {
 			return false
@@ -490,7 +779,6 @@ func (pt *PageTableShadow) TryCompactRead(addr uintptr, current epoch.Epoch, clo
 	if view.loadSlot(wordIdx) != nil {
 		return CompactReadMiss
 	}
-
 	compact := view.history.compact.Load()
 	if compact == nil {
 		if view.history.state.Load() != nil {
@@ -498,6 +786,9 @@ func (pt *PageTableShadow) TryCompactRead(addr uintptr, current epoch.Epoch, clo
 		}
 		compact = newCompactGroups()
 		view.history.compact.Store(compact)
+	}
+	if preparePaletteMutationLocked(view, compact, wordIdx, wordIdx) {
+		return CompactReadMiss
 	}
 	var sourceState *VarState
 	var sourceDescriptor compactHistoryDescriptor
@@ -603,7 +894,8 @@ func accessFullBlock(view blockView, base uintptr, visit func(word uintptr, mask
 		compact = newCompactGroups()
 		view.history.compact.Store(compact)
 	}
-	if compact.palette.Load() != nil {
+	if palette := compact.palette.Load(); palette != nil {
+		palette.disableFastReads()
 		// Dense compaction handles every supported full-block transition before
 		// this generic callback path. A conflict or unsupported state is rare;
 		// make exact word slots first so the established COW visitor remains the

@@ -55,6 +55,10 @@ type compactHistoryDescriptor struct {
 	lifecycle lifecycleID
 }
 
+type compactMembershipPlane struct {
+	words [compactMembershipWords]atomic.Uint64
+}
+
 // compactGroup owns one current VarState at a time and an exact membership
 // bitmap over the 4096 compiler-provided anchor bytes in its application
 // block. A state returned to an unlocked lookup or range visitor is permanently
@@ -69,12 +73,25 @@ type compactGroup struct {
 	// exposed records whether lookupExact has returned the current state to an
 	// unlocked caller. It is reset only when a fresh state pointer is published.
 	exposed atomic.Uint32
-	members [compactMembershipWords]atomic.Uint64
+	// Most ordinary groups describe one scalar or aligned word. Pack an arbitrary
+	// subset of either overlapping 56-lane half, a one-bit half selector, and its
+	// six-bit bitmap-word index into one atomic load. Every aligned scalar fits,
+	// and arbitrary partial clears remain exact without allocation. Only a mask
+	// spanning both extreme octets or multiple words expands into the complete
+	// plane; expanded planes never collapse.
+	members       atomic.Pointer[compactMembershipPlane]
+	inlineMembers atomic.Uint64
 
 	// The fields below are read and written only while the block lock is held.
 	descriptor compactHistoryDescriptor
 	joinable   bool
 	retired    bool
+
+	// initialState shares the group's allocation. Every new group needs one
+	// complete state before publication, so a separate heap object only adds GC
+	// and allocator traffic. Once this generation is exposed, recycling still
+	// publishes a separately allocated immutable replacement as before.
+	initialState VarState
 }
 
 // compactGroups is allocated lazily and then remains attached to its block.
@@ -235,37 +252,132 @@ func compactBit(anchor uintptr) (word int, mask uint64) {
 }
 
 func compactMember(g *compactGroup, anchor uintptr) bool {
+	if g == nil {
+		return false
+	}
 	word, mask := compactBit(anchor)
-	return g != nil && g.members[word].Load()&mask != 0
+	inline := g.inlineMembers.Load()
+	if inline&compactInlineMembershipTag != 0 {
+		return int((inline&compactInlineMembershipWordMask)>>57) == word &&
+			compactInlineMembershipValue(inline)&mask != 0
+	}
+	plane := g.members.Load()
+	return plane != nil && plane.words[word].Load()&mask != 0
+}
+
+const (
+	compactInlineMembershipMask       = uint64(1)<<56 - 1
+	compactInlineMembershipHighWindow = uint64(1) << 56
+	compactInlineMembershipWordMask   = uint64(0x3f) << 57
+	compactInlineMembershipTag        = uint64(1) << 63
+)
+
+func compactInlineMembership(word int, mask uint64) (uint64, bool) {
+	if mask == 0 {
+		return 0, false
+	}
+	if mask>>56 == 0 {
+		return compactInlineMembershipTag | uint64(word)<<57 | mask, true
+	}
+	if mask&0xff == 0 {
+		return compactInlineMembershipTag | uint64(word)<<57 |
+			compactInlineMembershipHighWindow | mask>>8, true
+	}
+	return 0, false
+}
+
+func compactInlineMembershipValue(inline uint64) uint64 {
+	value := inline & compactInlineMembershipMask
+	if inline&compactInlineMembershipHighWindow != 0 {
+		value <<= 8
+	}
+	return value
+}
+
+//go:nosplit
+func (g *compactGroup) membershipWord(word int) uint64 {
+	inline := g.inlineMembers.Load()
+	if inline&compactInlineMembershipTag != 0 {
+		if int((inline&compactInlineMembershipWordMask)>>57) == word {
+			return compactInlineMembershipValue(inline)
+		}
+		return 0
+	}
+	if plane := g.members.Load(); plane != nil {
+		return plane.words[word].Load()
+	}
+	return 0
+}
+
+func compactSetMembershipMask(g *compactGroup, word int, mask uint64) {
+	if mask == 0 {
+		return
+	}
+	inline := g.inlineMembers.Load()
+	if inline&compactInlineMembershipTag == 0 {
+		if plane := g.members.Load(); plane != nil {
+			compactAtomicSet(&plane.words[word], mask)
+			return
+		}
+		if packed, ok := compactInlineMembership(word, mask); ok {
+			g.inlineMembers.Store(packed)
+			return
+		}
+	}
+	if inline&compactInlineMembershipTag != 0 {
+		inlineWord := int((inline & compactInlineMembershipWordMask) >> 57)
+		inlineMask := compactInlineMembershipValue(inline)
+		if inlineWord == word {
+			if packed, ok := compactInlineMembership(word, inlineMask|mask); ok {
+				g.inlineMembers.Store(packed)
+				return
+			}
+		}
+	}
+
+	plane := new(compactMembershipPlane)
+	if inline&compactInlineMembershipTag != 0 {
+		inlineWord := int((inline & compactInlineMembershipWordMask) >> 57)
+		plane.words[inlineWord].Store(compactInlineMembershipValue(inline))
+	}
+	compactAtomicSet(&plane.words[word], mask)
+	// Publish only after both the retained inline membership and the new word
+	// are complete. Clearing the packed tag makes later operations use the plane;
+	// a reader spanning the switch is rejected by the group revision.
+	g.members.Store(plane)
+	g.inlineMembers.Store(0)
 }
 
 func compactSetMember(g *compactGroup, anchor uintptr) {
 	word, mask := compactBit(anchor)
-	for {
-		old := g.members[word].Load()
-		if old&mask != 0 || g.members[word].CompareAndSwap(old, old|mask) {
-			return
+	compactSetMembershipMask(g, word, mask)
+}
+
+func compactClearMembershipMask(g *compactGroup, word int, mask uint64) {
+	inline := g.inlineMembers.Load()
+	if inline&compactInlineMembershipTag != 0 {
+		if int((inline&compactInlineMembershipWordMask)>>57) == word {
+			remaining := compactInlineMembershipValue(inline) &^ mask
+			if remaining == 0 {
+				g.inlineMembers.Store(0)
+			} else {
+				packed, ok := compactInlineMembership(word, remaining)
+				if !ok {
+					runtimeThrow("race detector compact membership clear widened window")
+				}
+				g.inlineMembers.Store(packed)
+			}
 		}
+		return
+	}
+	if plane := g.members.Load(); plane != nil {
+		compactAtomicClear(&plane.words[word], mask)
 	}
 }
 
 func compactClearMember(g *compactGroup, anchor uintptr) {
 	word, mask := compactBit(anchor)
-	for {
-		old := g.members[word].Load()
-		if old&mask == 0 || g.members[word].CompareAndSwap(old, old&^mask) {
-			return
-		}
-	}
-}
-
-func compactClearMembershipMask(g *compactGroup, word int, mask uint64) {
-	for {
-		old := g.members[word].Load()
-		if old&mask == 0 || g.members[word].CompareAndSwap(old, old&^mask) {
-			return
-		}
-	}
+	compactClearMembershipMask(g, word, mask)
 }
 
 func compactAtomicSet(word *atomic.Uint64, mask uint64) {
@@ -298,8 +410,18 @@ func (g *compactGroup) firstAnchor() (uintptr, bool) {
 	if g == nil {
 		return 0, false
 	}
-	for word := range g.members {
-		value := g.members[word].Load()
+	inline := g.inlineMembers.Load()
+	if inline&compactInlineMembershipTag != 0 {
+		word := (inline & compactInlineMembershipWordMask) >> 57
+		value := compactInlineMembershipValue(inline)
+		return uintptr(word*64) + uintptr(bits.TrailingZeros64(value)), true
+	}
+	plane := g.members.Load()
+	if plane == nil {
+		return 0, false
+	}
+	for word := 0; word < compactMembershipWords; word++ {
+		value := plane.words[word].Load()
 		if value != 0 {
 			return uintptr(word*64 + bits.TrailingZeros64(value)), true
 		}
@@ -314,8 +436,17 @@ func (g *compactGroup) empty() bool {
 
 func (g *compactGroup) soleMember(anchor uintptr) bool {
 	want := compactAnchor(anchor)
-	for word := range g.members {
-		value := g.members[word].Load()
+	if g == nil {
+		return false
+	}
+	inline := g.inlineMembers.Load()
+	if inline&compactInlineMembershipTag != 0 {
+		word := (inline & compactInlineMembershipWordMask) >> 57
+		mask := uint64(1) << (want & 63)
+		return word == uint64(want>>6) && compactInlineMembershipValue(inline) == mask
+	}
+	for word := 0; word < compactMembershipWords; word++ {
+		value := g.membershipWord(word)
 		if word == int(want>>6) {
 			value &^= uint64(1) << (want & 63)
 		}
@@ -558,6 +689,13 @@ func compactStateFromDescriptor(descriptor compactHistoryDescriptor) *VarState {
 	return state
 }
 
+func newCompactGroup(descriptor compactHistoryDescriptor) *compactGroup {
+	group := &compactGroup{descriptor: descriptor, joinable: true}
+	initializeCompactState(&group.initialState, descriptor)
+	group.state.Store(&group.initialState)
+	return group
+}
+
 func compactHappensBefore(e epoch.Epoch, clock *vectorclock.VectorClock) bool {
 	return e == 0 || clock != nil && e.HappensBefore(clock)
 }
@@ -761,9 +899,8 @@ func (c *compactGroups) moveDescriptor(anchor uintptr, source *compactGroup, des
 	}
 	group := c.groupLoad(slot)
 	if group == nil {
-		state := compactStateFromDescriptor(descriptor)
-		group = &compactGroup{descriptor: descriptor, joinable: true}
-		group.state.Store(state)
+		group = newCompactGroup(descriptor)
+		state := group.state.Load()
 		compactSetMember(group, anchor)
 		c.activate()
 		c.beginMutation()
@@ -1100,7 +1237,7 @@ func (g *compactGroup) intersects(start, end uintptr) bool {
 	firstWord := int(start >> 6)
 	lastWord := int((end - 1) >> 6)
 	for word := firstWord; word <= lastWord; word++ {
-		value := g.members[word].Load()
+		value := g.membershipWord(word)
 		wordStart := uintptr(word * 64)
 		lo, hi := start, end
 		if lo < wordStart {
@@ -1382,8 +1519,8 @@ func (c *compactGroups) mergeEquivalent() {
 			if source == nil || source.retired || !source.joinable || source.empty() || source.descriptor != destination.descriptor {
 				continue
 			}
-			for word := range source.members {
-				value := source.members[word].Load()
+			for word := 0; word < compactMembershipWords; word++ {
+				value := source.membershipWord(word)
 				for value != 0 {
 					bit := bits.TrailingZeros64(value)
 					anchor := uintptr(word*64 + bit)

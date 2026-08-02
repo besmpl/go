@@ -42,8 +42,9 @@ const detectorSpinlockMaxBackoff = uint32(64)
 
 // spinlock is the runtime-compatible detector lock. Failed acquisition polls
 // before CAS and uses bounded runtime backoff to avoid invalidating the owner’s
-// cache line continuously. runtimeKolkovSpinWait uses bounded procyield, then
-// an OS-thread yield at the saturated delay on g0.
+// cache line continuously. runtimeKolkovSpinWait keeps short production g0
+// locks on bounded procyield; preemptible user-stack callers may yield their G
+// at the saturated delay.
 type spinlock struct {
 	state atomic.Uint32
 }
@@ -417,6 +418,34 @@ func captureCallerPC() uintptr {
 // retrieved from pools.
 //
 //nolint:gocognit,nestif,gocyclo,cyclop // Complex race detection logic requires nested conditionals
+
+// TryOrdinaryWrite attempts the complete conflict-free ordinary FastTrack
+// transition without allocating, waiting, sampling, capturing a PC, or
+// reporting. False is a mutation-free request to execute OnWriteSized exactly
+// once. Runtime callers invalidate their overlapping read-cache entries before
+// this attempt, as they do before the canonical bridge.
+//
+//go:nosplit
+func (d *Detector) TryOrdinaryWrite(addr, size uintptr, ctx *goroutine.RaceContext, pc uintptr) bool {
+	if d == nil || d.sampler != nil || ctx == nil || ctx.C == nil || pc == 0 ||
+		(size != 1 && size != 2 && size != 4 && size != 8) || size-1 > ^uintptr(0)-addr {
+		return false
+	}
+	return d.rangeMemory.TryOrdinaryWrite(addr, size, ctx.GetEpoch(), ctx.C, pc)
+}
+
+// MaterializeOrdinaryScalar moves one already-recorded, word-local scalar
+// history from the compact representation into its permanent exact slot. It is
+// a representation-only operation: materializeSlotLocked copies the complete
+// authoritative word before publication and retires compact membership only
+// after the slot becomes visible.
+func (d *Detector) MaterializeOrdinaryScalar(addr, size uintptr) bool {
+	if d == nil || size == 0 || size > 8-(addr&7) || size-1 > ^uintptr(0)-addr {
+		return false
+	}
+	return d.rangeMemory.GetOrCreateSlot(addr) != nil
+}
+
 func (d *Detector) OnWrite(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) {
 	d.onWriteSized(addr, 1, ctx, pc)
 }
@@ -501,6 +530,37 @@ func (d *Detector) onWriteSized(addr, size uintptr, ctx *goroutine.RaceContext, 
 // Thread Safety: Safe for concurrent calls from multiple goroutines.
 //
 // Zero Allocations: Fast path allocates nothing. Slow path may allocate VectorClock on promotion.
+
+// TryOrdinaryRead is the read counterpart of TryOrdinaryWrite. Cacheable
+// completions return the authoritative exact VarState generation; other
+// handled completions return nil because an unexposed compact generation must
+// not be published into the runtime's Tier-0 cache.
+//
+//go:nosplit
+func (d *Detector) TryOrdinaryRead(addr, size uintptr, ctx *goroutine.RaceContext, pc uintptr) (shadowmem.OrdinaryFastResult, *shadowmem.VarState) {
+	if d == nil || d.sampler != nil || ctx == nil || ctx.C == nil || pc == 0 ||
+		(size != 1 && size != 2 && size != 4 && size != 8) || size-1 > ^uintptr(0)-addr ||
+		(size == 1 && rwMutexMarkerPC(pc)) {
+		return shadowmem.OrdinaryFastMiss, nil
+	}
+	if cached := ctx.LookupPromotedReadCapability(addr, size); cached != nil {
+		capability := (*shadowmem.PromotedReadCapability)(cached)
+		if capability.TryRead(addr, size, ctx.GetEpoch(), ctx.C, pc) {
+			return shadowmem.OrdinaryFastHandledCacheable, capability.State()
+		}
+	}
+	return d.rangeMemory.TryOrdinaryRead(addr, size, ctx.GetEpoch(), ctx.C, pc)
+}
+
+func (d *Detector) recordPromotedReadCapability(addr, size uintptr, ctx *goroutine.RaceContext, state *shadowmem.VarState) {
+	if d == nil || ctx == nil || state == nil || !state.IsPromoted() {
+		return
+	}
+	if capability := d.rangeMemory.PromotedReadCapability(addr, size, ctx.TID, state); capability != nil {
+		ctx.RecordPromotedReadCapability(addr, size, unsafe.Pointer(capability))
+	}
+}
+
 func (d *Detector) OnRead(addr uintptr, ctx *goroutine.RaceContext, pc uintptr) {
 	d.onReadSized(addr, 1, ctx, pc)
 }
@@ -575,6 +635,9 @@ func (d *Detector) onReadSized(addr, size uintptr, ctx *goroutine.RaceContext, p
 		ctx.RecordReadSized(addr, size, unsafe.Pointer(vs))
 	}
 	vs.UnlockAccess()
+	if !marker {
+		d.recordPromotedReadCapability(addr, size, ctx, vs)
+	}
 	pending.report(d)
 }
 
@@ -678,6 +741,66 @@ func (d *Detector) RacesDetected() int {
 //	mu.Lock()  // Compiler inserts: raceacquire(&mu)
 //	// OnAcquire merges previous Unlock's clock into current thread
 //	x = 42     // Now happens-after previous critical section
+
+// fastClockAdvance returns the checked successor used by non-blocking
+// synchronization attempts. It deliberately converts released contexts and
+// clock exhaustion into misses so the canonical path retains its diagnostics.
+//
+//go:nosplit
+func (d *Detector) fastClockAdvance(ctx *goroutine.RaceContext) (uint32, bool) {
+	if d == nil || d.sampler != nil || ctx == nil || ctx.C == nil {
+		return 0, false
+	}
+	tid, current := ctx.Epoch.Decode()
+	if tid != ctx.TID || current == 0 || !ctx.C.CanSetKnownMonotonicAlive(ctx.TID) {
+		return 0, false
+	}
+	if current >= epoch.MaxClock || current+1 > epoch.MaxClockWarning {
+		return 0, false
+	}
+	// Fast synchronization must not be the operation which emits an overflow
+	// diagnostic. Once any process-wide warning is active, leave both the event
+	// and the periodic counter to the canonical path.
+	tidOverflow, clockOverflow, tidWarning, clockWarning := epoch.CheckOverflows()
+	if tidOverflow || clockOverflow || tidWarning || clockWarning {
+		return 0, false
+	}
+	return uint32(current), true
+}
+
+// TryAcquire attempts one complete acquire against an already existing sync
+// owner. TryJoinReleaseClock is all-or-nothing: failure leaves both clocks
+// untouched, while success is followed by exactly one context clock commit.
+//
+//go:nosplit
+func (d *Detector) TryAcquire(addr uintptr, ctx *goroutine.RaceContext) bool {
+	if ctx == nil {
+		return false
+	}
+	syncVar := (*syncshadow.SyncVar)(ctx.LookupSyncVar(addr))
+	if syncVar == nil {
+		return false
+	}
+	current, ok := d.fastClockAdvance(ctx)
+	if !ok || ctx.ForeignGeneration == ^uint64(0) {
+		return false
+	}
+	joined, ok := syncVar.TryJoinReleaseClockForContext(ctx.C, ctx.TID, ctx.ForeignGeneration)
+	if !ok {
+		return false
+	}
+	if joined {
+		ctx.NoteForeignImport()
+	}
+	ctx.CommitKnownClockAdvance(current)
+	// Preserve the exact event count with one atomic Add after the all-or-nothing
+	// semantic transition. fastClockAdvance already proved that no process-wide
+	// overflow warning is active and that this event cannot create one, so the
+	// direct nosplit path must not enter the allocating diagnostic reporter.
+	d.operationCount.Add(1)
+	return true
+}
+
 func (d *Detector) OnAcquire(addr uintptr, ctx *goroutine.RaceContext) {
 	next := ctx.PreflightClockAdvance()
 	// Periodic overflow detection runs on synchronization events.
@@ -690,11 +813,15 @@ func (d *Detector) OnAcquire(addr uintptr, ctx *goroutine.RaceContext) {
 	// Step 2: Join the lock's release clock while holding the SyncVar lock.
 	// This establishes happens-before from the previous Unlock without racing
 	// an in-place Release or ReleaseMerge update.
-	if syncVar.JoinReleaseClock(ctx.C) {
+	if syncVar.JoinReleaseClockForContext(ctx.C, ctx.TID, ctx.ForeignGeneration) {
 		// A sync acquire may import an arbitrary foreign projection. Record one
 		// conservative invalidation before advancing the context's own clock.
 		ctx.NoteForeignImport()
 	}
+	ctx.RecordSyncVar(addr, unsafe.Pointer(syncVar))
+	// The acquire above may change the owned sparse representation. Reserve the
+	// allocation-free successor only after that final import.
+	ctx.PreflightClockAdvance()
 
 	// Step 3: Increment logical clock to advance time.
 	// This must be done AFTER joining to maintain happens-before invariant.
@@ -724,6 +851,31 @@ func (d *Detector) OnAcquire(addr uintptr, ctx *goroutine.RaceContext) {
 //	x = 42       // Write happens-before Unlock
 //	mu.Unlock()  // Compiler inserts: racerelease(&mu)
 //	// OnRelease captures current clock for next Lock to see
+
+// TryRelease is the allocation-free release path for an existing, warmed sync
+// owner. A failed release-clock probe makes no detector mutation.
+//
+//go:nosplit
+func (d *Detector) TryRelease(addr uintptr, ctx *goroutine.RaceContext) bool {
+	if ctx == nil {
+		return false
+	}
+	syncVar := (*syncshadow.SyncVar)(ctx.LookupSyncVar(addr))
+	if syncVar == nil {
+		return false
+	}
+	current, ok := d.fastClockAdvance(ctx)
+	if !ok {
+		return false
+	}
+	if !syncVar.TrySetReleaseClockForContext(ctx.C, ctx.TID, ctx.ForeignGeneration) {
+		return false
+	}
+	ctx.CommitKnownClockAdvance(current)
+	d.operationCount.Add(1)
+	return true
+}
+
 func (d *Detector) OnRelease(addr uintptr, ctx *goroutine.RaceContext) {
 	next := ctx.PreflightClockAdvance()
 	// Periodic overflow detection runs on synchronization events.
@@ -735,7 +887,8 @@ func (d *Detector) OnRelease(addr uintptr, ctx *goroutine.RaceContext) {
 	// Step 2: Set lock's release clock to current thread's clock.
 	// This captures the happens-before relationship for future Acquires.
 	// Lm := Ct (lock clock = thread clock).
-	syncVar.SetReleaseClock(ctx.C)
+	syncVar.SetReleaseClockForContext(ctx.C, ctx.TID, ctx.ForeignGeneration)
+	ctx.RecordSyncVar(addr, unsafe.Pointer(syncVar))
 
 	// Step 3: Increment logical clock to advance time.
 	// This must be done AFTER updating release clock to maintain happens-before.
@@ -776,6 +929,29 @@ func (d *Detector) OnRelease(addr uintptr, ctx *goroutine.RaceContext) {
 //	// Writer
 //	mu.Lock()    // Acquire (sees union of Reader 1 and Reader 2 clocks)
 //	x = 42       // Write happens-after both readers
+
+// TryReleaseMerge is the warmed, non-blocking ReleaseMerge path.
+//
+//go:nosplit
+func (d *Detector) TryReleaseMerge(addr uintptr, ctx *goroutine.RaceContext) bool {
+	if ctx == nil {
+		return false
+	}
+	syncVar := (*syncshadow.SyncVar)(ctx.LookupSyncVar(addr))
+	if syncVar == nil {
+		return false
+	}
+	current, ok := d.fastClockAdvance(ctx)
+	if !ok {
+		return false
+	}
+	if !syncVar.TryPublishReleaseMergeForContext(ctx.C, ctx.TID, ctx.ForeignGeneration) {
+		return false
+	}
+	ctx.CommitKnownClockAdvance(current)
+	return true
+}
+
 func (d *Detector) OnReleaseMerge(addr uintptr, ctx *goroutine.RaceContext) {
 	next := ctx.PreflightClockAdvance()
 	// Step 1: Get or create SyncVar for this mutex address.
@@ -784,7 +960,8 @@ func (d *Detector) OnReleaseMerge(addr uintptr, ctx *goroutine.RaceContext) {
 	// Step 2: Merge current thread's clock into lock's release clock.
 	// This captures the union of happens-before relationships.
 	// Lm := Lm ⊔ Ct (lock clock merges with thread clock).
-	syncVar.MergeReleaseClock(ctx.C)
+	syncVar.PublishReleaseMergeForContext(ctx.C, ctx.TID, ctx.ForeignGeneration)
+	ctx.RecordSyncVar(addr, unsafe.Pointer(syncVar))
 
 	// Step 3: Increment logical clock to advance time.
 	ctx.CommitClockAdvance(next)

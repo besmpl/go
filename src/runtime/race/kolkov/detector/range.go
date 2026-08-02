@@ -121,6 +121,7 @@ func (d *Detector) applySizedScalarRead(addr, size uintptr, ctx *goroutine.RaceC
 			d.applyOrdinaryReadLocked(addr, state, ctx, pc, &pending)
 			ctx.RecordReadSized(addr, size, unsafe.Pointer(state))
 			state.UnlockAccess()
+			d.recordPromotedReadCapability(addr, size, ctx, state)
 			pending.report(d)
 			return
 		}
@@ -152,6 +153,7 @@ func (d *Detector) applySizedScalarRead(addr, size uintptr, ctx *goroutine.RaceC
 	if slot := d.rangeMemory.GetSlot(addr); slot != nil {
 		if state := slot.State(uint8(addr & 7)); state != nil {
 			ctx.RecordReadSized(addr, size, unsafe.Pointer(state))
+			d.recordPromotedReadCapability(addr, size, ctx, state)
 			pending.report(d)
 			return
 		}

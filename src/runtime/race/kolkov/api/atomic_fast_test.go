@@ -40,7 +40,7 @@ func TestAtomicBridgeDispatchesPlainAndRMWFastModes(t *testing.T) {
 	}
 	raceAtomicEnd(addr, 8, 0x6103, ctx, &token, true, true)
 
-	// The general bridge is retained for ignored operations and RMW reuse misses.
+	// The general bridge is retained for ignored and otherwise general operations.
 	// Even with the same compatible width it must close the capability.
 	ctx = raceAtomicBegin(addr, 8, ctx, true, &token)
 	if token[0] == nil || token[1] == nil {
@@ -64,24 +64,25 @@ func TestAtomicBridgeDispatchesPlainAndRMWFastModes(t *testing.T) {
 	raceAtomicEnd(addr, 8, 0x6106, ctx, &token, false, true)
 }
 
-func TestAtomicRMWBridgeMissNeverEnrolls(t *testing.T) {
+func TestAtomicRMWBridgeMissEnrollsAndReuses(t *testing.T) {
 	Reset()
 	defer Reset()
 	Enable()
 	const addr = uintptr(0x7f2000)
 
 	var token [8]unsafe.Pointer
-	var ctx uintptr
-	for operation := 0; operation < 3; operation++ {
-		ctx = raceAtomicBeginRMW(addr, 8, ctx, true, &token)
-		if ctx <= 1 {
-			t.Fatalf("RMW bridge operation %d returned invalid context %#x", operation, ctx)
-		}
-		if token[0] == nil || token[1] == nil {
-			t.Fatalf("RMW bridge miss operation %d token = [%p %p], want fully locked transaction", operation, token[0], token[1])
-		}
-		raceAtomicEnd(addr, 8, 0x6200+uintptr(operation), ctx, &token, true, true)
+	ctx := raceAtomicBeginRMW(addr, 8, 0, true, &token)
+	if ctx <= 1 || token[0] == nil || token[1] != nil {
+		t.Fatalf("first RMW bridge begin = (%#x, [%p %p]), want valid context and converted enrollment", ctx, token[0], token[1])
 	}
+	capability := token[0]
+	raceAtomicEnd(addr, 8, 0x6200, ctx, &token, true, true)
+
+	ctx = raceAtomicBeginRMW(addr, 8, ctx, true, &token)
+	if token[0] != capability || token[1] != nil {
+		t.Fatalf("second RMW bridge token = [%p %p], want enrolled capability %p", token[0], token[1], capability)
+	}
+	raceAtomicEnd(addr, 8, 0x6201, ctx, &token, true, true)
 }
 
 func TestAtomicRMWCooperativeBridgeContentionReturnsCleanRetry(t *testing.T) {
@@ -91,7 +92,7 @@ func TestAtomicRMWCooperativeBridgeContentionReturnsCleanRetry(t *testing.T) {
 	const addr = uintptr(0x7f3000)
 
 	var token [8]unsafe.Pointer
-	ctx := raceAtomicBeginPlain(addr, 8, 0, false, &token)
+	ctx := raceAtomicBeginRMW(addr, 8, 0, true, &token)
 	raceAtomicEnd(addr, 8, 0x6300, ctx, &token, true, true)
 
 	ctx = raceAtomicBeginRMW(addr, 8, ctx, true, &token)
@@ -100,7 +101,7 @@ func TestAtomicRMWCooperativeBridgeContentionReturnsCleanRetry(t *testing.T) {
 	}
 	var contender [8]unsafe.Pointer
 	contender[0] = unsafe.Pointer(new(byte))
-	gotContext, retry := raceAtomicBeginRMWCooperative(addr, 8, ctx, true, &contender)
+	gotContext, retry, _, _, _ := raceAtomicBeginRMWCooperative(addr, 8, ctx, true, &contender)
 	if gotContext != ctx {
 		t.Fatalf("contention context = %#x, want %#x", gotContext, ctx)
 	}
@@ -114,7 +115,7 @@ func TestAtomicRMWCooperativeBridgeContentionReturnsCleanRetry(t *testing.T) {
 	}
 	raceAtomicEnd(addr, 8, 0x6301, ctx, &token, true, true)
 
-	gotContext, retry = raceAtomicBeginRMWCooperative(addr, 8, ctx, true, &contender)
+	gotContext, retry, _, _, _ = raceAtomicBeginRMWCooperative(addr, 8, ctx, true, &contender)
 	if gotContext != ctx || retry {
 		t.Fatalf("uncontended cooperative begin = (%#x, %v), want (%#x, false)", gotContext, retry, ctx)
 	}
@@ -124,12 +125,12 @@ func TestAtomicRMWCooperativeBridgeContentionReturnsCleanRetry(t *testing.T) {
 	raceAtomicEnd(addr, 8, 0x6302, ctx, &contender, true, true)
 
 	var miss [8]unsafe.Pointer
-	gotContext, retry = raceAtomicBeginRMWCooperative(addr+8, 8, ctx, true, &miss)
+	gotContext, retry, _, _, _ = raceAtomicBeginRMWCooperative(addr+8, 8, ctx, true, &miss)
 	if gotContext != ctx || retry {
-		t.Fatalf("general cooperative miss = (%#x, %v), want (%#x, false)", gotContext, retry, ctx)
+		t.Fatalf("cooperative RMW miss = (%#x, %v), want (%#x, false)", gotContext, retry, ctx)
 	}
-	if miss[0] == nil || miss[1] == nil {
-		t.Fatalf("general cooperative miss token = [%p %p], want blocking transaction", miss[0], miss[1])
+	if miss[0] == nil || miss[1] != nil {
+		t.Fatalf("cooperative RMW miss token = [%p %p], want converted enrollment", miss[0], miss[1])
 	}
 	raceAtomicEnd(addr+8, 8, 0x6303, ctx, &miss, true, true)
 }

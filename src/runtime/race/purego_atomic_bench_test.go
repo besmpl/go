@@ -7,6 +7,7 @@
 package race_test
 
 import (
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,11 @@ import (
 const publicAtomicBenchmarkOperations = 100_000
 
 var publicAtomicBenchmarkValue uint64
+
+var (
+	publicAtomicValueBenchmark         atomic.Value
+	publicAtomicValueBenchmarkPayloads [2]uint64
+)
 
 func reportPublicAtomicLatency(b *testing.B) {
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/(float64(b.N)*publicAtomicBenchmarkOperations), "ns/public-op")
@@ -77,6 +83,29 @@ func BenchmarkPureGoAtomicCASFixedN(b *testing.B) {
 	b.StopTimer()
 	reportPublicAtomicLatency(b)
 	runtime.KeepAlive(want)
+}
+
+func BenchmarkPureGoAtomicValueSwapFixedN(b *testing.B) {
+	values := [2]*uint64{
+		&publicAtomicValueBenchmarkPayloads[0],
+		&publicAtomicValueBenchmarkPayloads[1],
+	}
+	current := 0
+	publicAtomicValueBenchmark.Store(values[current])
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		for range publicAtomicBenchmarkOperations {
+			next := current ^ 1
+			if old := publicAtomicValueBenchmark.Swap(values[next]); old != values[current] {
+				b.Fatalf("atomic.Value.Swap returned %p, want %p", old, values[current])
+			}
+			current = next
+		}
+	}
+	b.StopTimer()
+	reportPublicAtomicLatency(b)
+	runtime.KeepAlive(values)
 }
 
 func TestPureGoAtomicUintptrOperations(t *testing.T) {
@@ -169,5 +198,77 @@ func TestPureGoAtomicValueLoadStoreContendedProgress(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("contended atomic.Value loads and stores did not make scheduler progress")
+	}
+}
+
+func TestPureGoAtomicValueSnapshotScale(t *testing.T) {
+	if os.Getenv("GO_RACE_SNAPSHOT_SCALE") != "1" {
+		t.Skip("set GO_RACE_SNAPSHOT_SCALE=1 to run the 10-million-swap scale gate")
+	}
+	const (
+		phases          = 10
+		workers         = 10_000
+		swapsPerWorker  = 100
+		operationsPhase = workers * swapsPerWorker
+	)
+	var value atomic.Value
+	value.Store(uint64(0))
+	var returnedTotal uint64
+	postGCInuse := make([]uint64, 0, phases)
+	started := time.Now()
+	for phase := 0; phase < phases; phase++ {
+		start := make(chan struct{})
+		returned := make([]uint64, workers)
+		phaseBase := uint64(phase * operationsPhase)
+		var wg sync.WaitGroup
+		for worker := 0; worker < workers; worker++ {
+			wg.Add(1)
+			go func(worker int, phaseBase uint64) {
+				defer wg.Done()
+				<-start
+				var sum uint64
+				base := phaseBase + uint64(worker*swapsPerWorker)
+				for operation := 1; operation <= swapsPerWorker; operation++ {
+					sum += value.Swap(base + uint64(operation)).(uint64)
+				}
+				returned[worker] = sum
+			}(worker, phaseBase)
+		}
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		close(start)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Minute):
+			t.Fatalf("snapshot scale phase %d stalled", phase+1)
+		}
+		for _, sum := range returned {
+			returnedTotal += sum
+		}
+		runtime.GC()
+		runtime.GC()
+		var mem runtime.MemStats
+		runtime.ReadMemStats(&mem)
+		postGCInuse = append(postGCInuse, mem.HeapInuse)
+		t.Logf("phase=%d elapsed=%s TotalAlloc=%d HeapAlloc=%d HeapInuse=%d NumGC=%d",
+			phase+1, time.Since(started), mem.TotalAlloc, mem.HeapAlloc, mem.HeapInuse, mem.NumGC)
+	}
+	final := value.Load().(uint64)
+	operations := uint64(phases * operationsPhase)
+	want := operations * (operations + 1) / 2
+	if returnedTotal+final != want {
+		t.Fatalf("swap permutation sum = %d, want %d", returnedTotal+final, want)
+	}
+	min, max := postGCInuse[phases/2], postGCInuse[phases/2]
+	for _, inuse := range postGCInuse[phases/2:] {
+		if inuse < min {
+			min = inuse
+		}
+		if inuse > max {
+			max = inuse
+		}
+	}
+	if max > min+min/10 {
+		t.Fatalf("last-half post-GC HeapInuse did not plateau: min=%d max=%d", min, max)
 	}
 }

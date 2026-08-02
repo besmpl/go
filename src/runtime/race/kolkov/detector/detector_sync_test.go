@@ -1,12 +1,58 @@
 package detector
 
 import (
+	"reflect"
 	"sync"
 	"testing"
 	"unsafe"
 
+	"runtime/race/kolkov/epoch"
 	"runtime/race/kolkov/goroutine"
+	"runtime/race/kolkov/vectorclock"
 )
+
+type syncFastEventSnapshot struct {
+	clockRuns         []vectorclock.FiniteRange
+	clockRetired      []vectorclock.RetiredRange
+	releaseRuns       []vectorclock.FiniteRange
+	releaseRetired    []vectorclock.RetiredRange
+	epoch             uint64
+	foreignGeneration uint64
+	readCache         [goroutine.ReadCacheSlots]uintptr
+	readCacheWidths   [goroutine.ReadCacheSlots]uint8
+	invalidatedClock  uint32
+	operationCount    uint64
+}
+
+func snapshotSyncFastEvent(d *Detector, addr uintptr, ctx *goroutine.RaceContext) syncFastEventSnapshot {
+	clockRuns, clockRetired := snapshotContext(ctx)
+	var releaseRuns []vectorclock.FiniteRange
+	var releaseRetired []vectorclock.RetiredRange
+	if syncVar := d.syncShadow.Get(addr); syncVar != nil {
+		if release := syncVar.GetReleaseClock(); release != nil {
+			releaseRuns, releaseRetired = snapshotContext(&goroutine.RaceContext{C: release})
+		}
+	}
+	return syncFastEventSnapshot{
+		clockRuns:         clockRuns,
+		clockRetired:      clockRetired,
+		releaseRuns:       releaseRuns,
+		releaseRetired:    releaseRetired,
+		epoch:             uint64(ctx.GetEpoch()),
+		foreignGeneration: ctx.ForeignGeneration,
+		readCache:         ctx.ReadCache,
+		readCacheWidths:   ctx.ReadCacheWidths,
+		invalidatedClock:  ctx.ReadCacheInvalidatedClock.Load(),
+		operationCount:    d.operationCount.Load(),
+	}
+}
+
+func requireSyncFastParity(t *testing.T, event string, canonical, fast syncFastEventSnapshot) {
+	t.Helper()
+	if !reflect.DeepEqual(fast, canonical) {
+		t.Fatalf("%s fast state differs from canonical:\nfast:      %#v\ncanonical: %#v", event, fast, canonical)
+	}
+}
 
 // TestOnAcquire_FirstAcquire verifies OnAcquire on first mutex lock (no previous releases).
 func TestOnAcquire_FirstAcquire(t *testing.T) {
@@ -54,7 +100,7 @@ func TestOnRelease_FirstRelease(t *testing.T) {
 
 	// Set some clock values.
 	ctx.C.Set(0, 10)
-	ctx.Epoch = ctx.GetEpoch() // Sync epoch
+	ctx.Epoch = epoch.NewEpoch(ctx.TID, 10)
 
 	// First release - should capture clock.
 	d.OnRelease(mutexAddr, ctx)
@@ -369,6 +415,210 @@ func TestClearShadowRange_ClearsSyncLifecycle(t *testing.T) {
 
 // === BENCHMARKS ===
 
+func TestSynchronizationFastPathsMatchCanonicalEventByEvent(t *testing.T) {
+	const syncAddr = uintptr(0x7f00)
+	canonical := NewDetector()
+	fast := NewDetector()
+	// Keep the compared owner in inline vector-clock storage: a prepared owner
+	// in the dense tail deliberately requires the allocating canonical path and
+	// is covered separately by TestReleaseMergePreservesPreparedDenseOwnerAdvance.
+	canonicalCtx := goroutine.Alloc(30)
+	fastCtx := goroutine.Alloc(30)
+	canonicalForeign := goroutine.Alloc(31)
+	fastForeign := goroutine.Alloc(31)
+
+	// Provision the owner and its immutable reusable release versions on the
+	// canonical path. Both sides begin the compared sequence identically.
+	canonical.OnRelease(syncAddr, canonicalForeign)
+	fast.OnRelease(syncAddr, fastForeign)
+	requireSyncFastParity(t, "warm release", snapshotSyncFastEvent(canonical, syncAddr, canonicalForeign), snapshotSyncFastEvent(fast, syncAddr, fastForeign))
+
+	// Capacity preflight is intentionally conservative. Seed dominated entries
+	// so the warmed acquire can import the published version without growing the
+	// target clock.
+	canonicalCtx.C.Set(canonicalForeign.TID, canonicalForeign.C.Get(canonicalForeign.TID)-1)
+	fastCtx.C.Set(fastForeign.TID, fastForeign.C.Get(fastForeign.TID)-1)
+	fastCtx.RecordSyncVar(syncAddr, unsafe.Pointer(fast.syncShadow.Get(syncAddr)))
+	canonicalCtx.RecordAddressOnlyReadRange(0x9000, 8)
+	fastCtx.RecordAddressOnlyReadRange(0x9000, 8)
+	canonical.OnAcquire(syncAddr, canonicalCtx)
+	if !fast.TryAcquire(syncAddr, fastCtx) {
+		t.Fatal("warmed TryAcquire missed")
+	}
+	requireSyncFastParity(t, "acquire", snapshotSyncFastEvent(canonical, syncAddr, canonicalCtx), snapshotSyncFastEvent(fast, syncAddr, fastCtx))
+
+	canonical.OnRelease(syncAddr, canonicalCtx)
+	if !fast.TryRelease(syncAddr, fastCtx) {
+		t.Fatal("warmed TryRelease missed")
+	}
+	requireSyncFastParity(t, "release", snapshotSyncFastEvent(canonical, syncAddr, canonicalCtx), snapshotSyncFastEvent(fast, syncAddr, fastCtx))
+
+	canonicalCtx.C.Set(33, 11)
+	fastCtx.C.Set(33, 11)
+	// ForeignGeneration is the proof boundary used by synchronization release
+	// folding. Direct test mutation must model the same invalidation performed
+	// by every detector-owned foreign-clock import.
+	canonicalCtx.NoteForeignImport()
+	fastCtx.NoteForeignImport()
+	// The retained-M fast bridge cannot allocate the first pending generation.
+	// Provision both sides canonically, then compare the next exact merge. Do
+	// not snapshot between those events: observing the release clock folds and
+	// retires its pending generation by design.
+	canonical.OnReleaseMerge(syncAddr, canonicalCtx)
+	fast.OnReleaseMerge(syncAddr, fastCtx)
+	canonical.OnReleaseMerge(syncAddr, canonicalCtx)
+	if !fast.TryReleaseMerge(syncAddr, fastCtx) {
+		t.Fatal("canonically provisioned TryReleaseMerge missed")
+	}
+	requireSyncFastParity(t, "release-merge", snapshotSyncFastEvent(canonical, syncAddr, canonicalCtx), snapshotSyncFastEvent(fast, syncAddr, fastCtx))
+}
+
+func TestSynchronizationFastMissesDoNotCommitEvent(t *testing.T) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(311)
+	before := snapshotSyncFastEvent(d, 0x8800, ctx)
+	if d.TryAcquire(0x8800, ctx) || d.TryRelease(0x8800, ctx) || d.TryReleaseMerge(0x8800, ctx) {
+		t.Fatal("fast synchronization unexpectedly created a missing owner")
+	}
+	after := snapshotSyncFastEvent(d, 0x8800, ctx)
+	requireSyncFastParity(t, "missing owner", before, after)
+
+	// An existing but never-released owner is also a miss: acquire cannot import
+	// a stable published version, and the context clock must not advance.
+	d.syncShadow.GetOrCreate(0x8810)
+	before = snapshotSyncFastEvent(d, 0x8810, ctx)
+	if d.TryAcquire(0x8810, ctx) {
+		t.Fatal("TryAcquire handled an owner with no release")
+	}
+	after = snapshotSyncFastEvent(d, 0x8810, ctx)
+	requireSyncFastParity(t, "empty owner", before, after)
+
+	sampled := NewDetectorWithOptions(DetectorOptions{SamplingEnabled: true, SampleRate: 1})
+	sampledCtx := goroutine.Alloc(312)
+	sampled.OnRelease(0x8820, sampledCtx)
+	before = snapshotSyncFastEvent(sampled, 0x8820, sampledCtx)
+	if sampled.TryRelease(0x8820, sampledCtx) {
+		t.Fatal("sampling-enabled detector used synchronization fast path")
+	}
+	after = snapshotSyncFastEvent(sampled, 0x8820, sampledCtx)
+	requireSyncFastParity(t, "sampling", before, after)
+}
+
+func TestReleaseMergePreservesPreparedDenseOwnerAdvance(t *testing.T) {
+	d := NewDetector()
+	const ownerTID = vectorclock.DenseThreads + 100
+	ctx := goroutine.Alloc(ownerTID)
+	defer ctx.C.Release()
+	for i := uint32(0); i < 256; i++ {
+		tid := uint32(vectorclock.DenseThreads) + i
+		if tid != ownerTID {
+			ctx.C.Set(tid, i&1+1)
+		}
+	}
+	const addr = uintptr(0x8830)
+
+	d.OnReleaseMerge(addr, ctx)
+	if got := ctx.C.Get(ownerTID); got != 2 {
+		t.Fatalf("owner clock after release-merge = %d, want 2", got)
+	}
+	if got := d.syncShadow.Get(addr).GetReleaseClock().Get(ownerTID); got != 1 {
+		t.Fatalf("first merged owner clock = %d, want 1", got)
+	}
+
+	// Capturing a dense owner cannot preserve the allocation-free fast commit,
+	// so the non-blocking path must miss without mutating the event.
+	if d.TryReleaseMerge(addr, ctx) {
+		t.Fatal("dense-owner TryReleaseMerge unexpectedly committed")
+	}
+	if got := ctx.C.Get(ownerTID); got != 2 {
+		t.Fatalf("fast miss changed owner clock to %d", got)
+	}
+
+	d.OnReleaseMerge(addr, ctx)
+	if got := ctx.C.Get(ownerTID); got != 3 {
+		t.Fatalf("owner clock after fallback = %d, want 3", got)
+	}
+	if got := d.syncShadow.Get(addr).GetReleaseClock().Get(ownerTID); got != 2 {
+		t.Fatalf("second merged owner clock = %d, want 2", got)
+	}
+}
+
+func TestReleasePreservesPreparedDenseOwnerAdvance(t *testing.T) {
+	d := NewDetector()
+	const ownerTID = vectorclock.DenseThreads + 100
+	ctx := goroutine.Alloc(ownerTID)
+	defer ctx.C.Release()
+	for i := uint32(0); i < 256; i++ {
+		tid := uint32(vectorclock.DenseThreads) + i
+		if tid != ownerTID {
+			ctx.C.Set(tid, i&1+1)
+		}
+	}
+	const addr = uintptr(0x8838)
+
+	// Canonical publication must not make the live context's dense owner
+	// copy-on-write before its prepared clock commit.
+	d.OnRelease(addr, ctx)
+	if got := ctx.C.Get(ownerTID); got != 2 {
+		t.Fatalf("owner clock after release = %d, want 2", got)
+	}
+	if got := d.syncShadow.Get(addr).GetReleaseClock().Get(ownerTID); got != 1 {
+		t.Fatalf("first release owner clock = %d, want 1", got)
+	}
+
+	// Invalidate the same-source scalar proof so the fast path must overwrite a
+	// detached immutable slot, not merely fold another owner-clock value.
+	foreignTID := uint32(vectorclock.DenseThreads + 17)
+	ctx.C.Set(foreignTID, 99)
+	ctx.NoteForeignImport()
+	if !d.TryRelease(addr, ctx) {
+		t.Fatal("dense-owner TryRelease missed with warmed detached slots")
+	}
+	if got := ctx.C.Get(ownerTID); got != 3 {
+		t.Fatalf("owner clock after fast release = %d, want 3", got)
+	}
+	release := d.syncShadow.Get(addr).GetReleaseClock()
+	if got := release.Get(ownerTID); got != 2 {
+		t.Fatalf("second release owner clock = %d, want 2", got)
+	}
+	if got := release.Get(foreignTID); got != 99 {
+		t.Fatalf("second release foreign clock = %d, want 99", got)
+	}
+}
+
+func TestSynchronizationFastOperationCountBoundary(t *testing.T) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(313)
+	const addr = uintptr(0x8830)
+
+	// Provision the owner outside the measured boundary, then put the next
+	// counted event exactly on the periodic overflow-check interval. The fast
+	// completion must use one exact atomic Add, as canonical code does;
+	// a Load followed by a later Add could skip this boundary under concurrency.
+	d.OnRelease(addr, ctx)
+	d.operationCount.Store(overflowCheckInterval - 1)
+	if !d.TryRelease(addr, ctx) {
+		t.Fatal("warmed TryRelease missed at operation-count boundary")
+	}
+	if got := d.operationCount.Load(); got != overflowCheckInterval {
+		t.Fatalf("operation count = %d, want boundary %d", got, overflowCheckInterval)
+	}
+
+	// ReleaseMerge is deliberately not counted by the canonical path. Its first
+	// allocation-free attempt must miss until canonical fallback provisions the
+	// pending generation; subsequent inline publication can hit.
+	if d.TryReleaseMerge(addr, ctx) {
+		t.Fatal("first TryReleaseMerge allocated a pending generation")
+	}
+	d.OnReleaseMerge(addr, ctx)
+	if !d.TryReleaseMerge(addr, ctx) {
+		t.Fatal("canonically provisioned TryReleaseMerge missed")
+	}
+	if got := d.operationCount.Load(); got != overflowCheckInterval {
+		t.Fatalf("ReleaseMerge changed operation count to %d", got)
+	}
+}
+
 // BenchmarkOnAcquire benchmarks mutex lock tracking.
 // Target: <500ns/op (VectorClock join overhead acceptable).
 func BenchmarkOnAcquire(b *testing.B) {
@@ -385,6 +635,20 @@ func BenchmarkOnAcquire(b *testing.B) {
 	}
 }
 
+func BenchmarkOnAcquireFast(b *testing.B) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(920)
+	const addr = uintptr(0x92000)
+	d.OnRelease(addr, ctx)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !d.TryAcquire(addr, ctx) {
+			d.OnAcquire(addr, ctx)
+		}
+	}
+}
+
 // BenchmarkOnRelease benchmarks mutex unlock tracking.
 // Target: <300ns/op (VectorClock copy overhead acceptable).
 func BenchmarkOnRelease(b *testing.B) {
@@ -398,6 +662,20 @@ func BenchmarkOnRelease(b *testing.B) {
 	}
 }
 
+func BenchmarkOnReleaseFast(b *testing.B) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(921)
+	const addr = uintptr(0x92100)
+	d.OnRelease(addr, ctx)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !d.TryRelease(addr, ctx) {
+			d.OnRelease(addr, ctx)
+		}
+	}
+}
+
 // BenchmarkOnReleaseMerge benchmarks RWMutex unlock tracking.
 // Target: <500ns/op (VectorClock merge overhead acceptable).
 func BenchmarkOnReleaseMerge(b *testing.B) {
@@ -408,6 +686,20 @@ func BenchmarkOnReleaseMerge(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		d.OnReleaseMerge(mutexAddr, ctx)
+	}
+}
+
+func BenchmarkOnReleaseMergeFast(b *testing.B) {
+	d := NewDetector()
+	ctx := goroutine.Alloc(922)
+	const addr = uintptr(0x92200)
+	d.OnReleaseMerge(addr, ctx)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !d.TryReleaseMerge(addr, ctx) {
+			d.OnReleaseMerge(addr, ctx)
+		}
 	}
 }
 

@@ -289,3 +289,20 @@ func (image *clockImage) appendTo(dst *VectorClock) {
 		return true
 	})
 }
+
+// materialize returns an independently mutable clock with the image's exact
+// canonical representation. Lineage anchors are already normalized, so copying
+// their flat buffers avoids rebuilding the same representation one range at a
+// time (and avoids a temporary bulk-import slice on the common path).
+func (image *clockImage) materialize() *VectorClock {
+	vc := NewFromPool()
+	if image == nil {
+		return vc
+	}
+	vc.clocks = image.clocks
+	vc.maxDense = image.maxDense
+	vc.denseTail = append(vc.denseTail, image.denseTail...)
+	vc.sparseRuns = append(vc.sparseRuns, image.sparseRuns...)
+	vc.retired = append(vc.retired, image.retired...)
+	return vc
+}

@@ -49,14 +49,24 @@ func TestRuntimeFastPathABI(t *testing.T) {
 		{"externalShadowBlock.history", unsafe.Offsetof(externalBlock.history), 8},
 		{"blockSlotTable.slots", unsafe.Offsetof(blockSlots.slots), 0},
 		{"shadowSlot.states", unsafe.Offsetof(slot.states), 0},
+		{"shadowSlot.mu", unsafe.Offsetof(slot.mu), 64},
+		{"shadowSlot.mu.state", unsafe.Offsetof(slot.mu) + unsafe.Offsetof(slot.mu.state), 64},
 		{"VarState.W", unsafe.Offsetof(state.W), 0},
 		{"VarState.readEpoch0", unsafe.Offsetof(state.readEpoch0), 32},
 		{"VarState.readerState", unsafe.Offsetof(state.readerState), 40},
+		{"VarState.atomicState", unsafe.Offsetof(state.atomicState), 120},
 		{"RaceContext.ReadCacheInvalidatedClock", unsafe.Offsetof(ctx.ReadCacheInvalidatedClock), 4},
 		{"RaceContext.Epoch", unsafe.Offsetof(ctx.Epoch), 16},
 		{"RaceContext.ReadCache", unsafe.Offsetof(ctx.ReadCache), 24},
 		{"RaceContext.ReadCacheStates", unsafe.Offsetof(ctx.ReadCacheStates), 56},
 		{"RaceContext.ReadCacheWidths", unsafe.Offsetof(ctx.ReadCacheWidths), 88},
+		{"RaceContext.WriteCacheWidth", unsafe.Offsetof(ctx.WriteCacheWidth), 355},
+		{"RaceContext.WriteCacheAddr", unsafe.Offsetof(ctx.WriteCacheAddr), 360},
+		{"RaceContext.WriteCacheState", unsafe.Offsetof(ctx.WriteCacheState), 368},
+		{"RaceContext.WriteCacheSlot", unsafe.Offsetof(ctx.WriteCacheSlot), 376},
+		{"RaceContext.WriteCacheVersion", unsafe.Offsetof(ctx.WriteCacheVersion), 384},
+		{"RaceContext.ReadCacheGeneration", unsafe.Offsetof(ctx.ReadCacheGeneration), 392},
+		{"RaceContext.WriteCacheReadGeneration", unsafe.Offsetof(ctx.WriteCacheReadGeneration), 400},
 	}
 	for _, check := range checks {
 		if check.got != check.want {
@@ -94,6 +104,12 @@ func TestRuntimeFastPathABI(t *testing.T) {
 	if got := unsafe.Sizeof(blockSlots); got != 4096 {
 		t.Errorf("runtime/race_kolkov.go ABI dependency blockSlotTable size=%d, want 4096", got)
 	}
+	if got := unsafe.Sizeof(slot); got != 72 {
+		t.Errorf("runtime/race_kolkov.go ABI dependency shadowSlot size=%d, want 72", got)
+	}
+	if got := unsafe.Sizeof(ctx); got != 536 {
+		t.Errorf("runtime/race_kolkov.go ABI dependency RaceContext size=%d, want 536", got)
+	}
 	if raceg.ReadCacheSlots != 4 || unsafe.Sizeof(ctx.ReadCache) != 4*unsafe.Sizeof(uintptr(0)) {
 		t.Errorf("runtime/race_kolkov.go read-cache ABI changed: slots=%d size=%d", raceg.ReadCacheSlots, unsafe.Sizeof(ctx.ReadCache))
 	}
@@ -105,6 +121,11 @@ func TestRuntimeFastPathABI(t *testing.T) {
 	}
 	if raceg.ReadCacheWeakWidth != 1<<7 {
 		t.Errorf("runtime/race_kolkov.go weak-width marker changed: %#x", raceg.ReadCacheWeakWidth)
+	}
+	if unsafe.Sizeof(OrdinaryFastResult(0)) != 1 || OrdinaryFastMiss != 0 ||
+		OrdinaryFastHandled != 1 || OrdinaryFastHandledCacheable != 2 {
+		t.Errorf("ordinary fast-result ABI changed: size=%d values=[%d %d %d]",
+			unsafe.Sizeof(OrdinaryFastResult(0)), OrdinaryFastMiss, OrdinaryFastHandled, OrdinaryFastHandledCacheable)
 	}
 	if l1Size != 65536 || l1Shift != 21 || l2Mask != 0x3FFFF || ptTotalCoverage != 1<<37 {
 		t.Errorf("runtime/race_kolkov.go page-table policy changed: size=%d shift=%d mask=%#x coverage=%d", l1Size, l1Shift, l2Mask, ptTotalCoverage)
@@ -131,6 +152,105 @@ func TestRuntimeFastPathABI(t *testing.T) {
 		if got := fastHash(addr); got != want {
 			t.Errorf("runtime/race_kolkov.go external hash policy for %#x: got %#x, want %#x", addr, got, want)
 		}
+	}
+}
+
+// mirroredRuntimeWriteCertificateValid models the raw loads in
+// runtime/race_kolkov.go. Keeping this lifecycle proof beside the layout owner
+// makes changes to VarState or ShadowSlot fail here instead of silently
+// weakening the runtime's retained heap/stack/static write certificate.
+func mirroredRuntimeWriteCertificateValid(pt *PageTableShadow, slot *ShadowSlot, state *VarState, addr, size uintptr, capturedRevision uint64, current, capturedReadGeneration uint64, currentEpoch epoch.Epoch) bool {
+	if slot == nil || state == nil || size == 0 || size > 8-(addr&7) ||
+		capturedRevision&1 != 0 || slot.mu.state.Load() != capturedRevision ||
+		current != capturedReadGeneration || pt == nil || pt.GetSlot(addr) != slot {
+		return false
+	}
+	first := uint8(addr & 7)
+	for lane := uint8(0); lane < 8; lane++ {
+		mapped := slot.states[lane].Load() == state
+		want := first <= lane && uintptr(lane-first) < size
+		if mapped != want {
+			return false
+		}
+	}
+	return currentEpoch != 0 && epoch.Epoch(state.W.Load()) == currentEpoch &&
+		state.readerState.Load() == 0 && state.atomicState.Load() == nil &&
+		slot.mu.state.Load() == capturedRevision
+}
+
+func TestRuntimeWriteCertificateRevocationProofs(t *testing.T) {
+	const (
+		addr = uintptr(1)<<40 + 0x684
+		size = uintptr(4)
+	)
+	pt := NewPageTableShadow()
+	writer := epoch.NewEpoch(81, 7)
+	state := materializedExactState(t, pt, addr, size)
+	state.SetW(writer)
+	slot := pt.GetSlot(addr)
+	revision := slot.mu.state.Load()
+	const readGeneration = uint64(19)
+	valid := func(currentEpoch epoch.Epoch, currentReadGeneration uint64) bool {
+		return mirroredRuntimeWriteCertificateValid(pt, slot, state, addr, size, revision,
+			currentReadGeneration, readGeneration, currentEpoch)
+	}
+	if !valid(writer, readGeneration) {
+		t.Fatal("fresh exact certificate was rejected")
+	}
+	if mirroredRuntimeWriteCertificateValid(pt, slot, state, addr, size/2, revision,
+		readGeneration, readGeneration, writer) {
+		t.Fatal("different scalar width reused certificate")
+	}
+	if mirroredRuntimeWriteCertificateValid(NewPageTableShadow(), slot, state, addr, size, revision,
+		readGeneration, readGeneration, writer) {
+		t.Fatal("replacement page-table lifecycle revived certificate")
+	}
+	if valid(epoch.NewEpoch(81, 8), readGeneration) {
+		t.Fatal("synchronization epoch change retained certificate")
+	}
+	if valid(writer, readGeneration+1) {
+		t.Fatal("local read publication retained certificate")
+	}
+
+	state.readerState.Store(1)
+	if valid(writer, readGeneration) {
+		t.Fatal("foreign reader retained certificate")
+	}
+	state.readerState.Store(0)
+	state.W.Store(uint64(epoch.NewEpoch(82, 1)))
+	if valid(writer, readGeneration) {
+		t.Fatal("foreign writer retained certificate")
+	}
+	state.W.Store(uint64(writer))
+	state.LockAccess()
+	state.SetAtomicState(unsafe.Pointer(new(byte)))
+	state.UnlockAccess()
+	if valid(writer, readGeneration) {
+		t.Fatal("mixed atomic sidecar retained ordinary certificate")
+	}
+	state.atomicState.Store(nil)
+
+	pt.ClearRange(addr, size)
+	if valid(writer, readGeneration) {
+		t.Fatal("clear/address retirement retained certificate")
+	}
+	if got := slot.mu.state.Load(); got == revision || got&1 != 0 {
+		t.Fatalf("clear revision = %d, captured %d; want changed even revision", got, revision)
+	}
+
+	// Reusing the same application address may repopulate the permanent slot,
+	// but it cannot revive the rooted old generation/revision tuple.
+	newClock := vectorclock.New()
+	newWriter := epoch.NewEpoch(83, 1)
+	newClock.Set(83, 1)
+	if !pt.TryOrdinaryWrite(addr, size, newWriter, newClock, 0x8300) {
+		pt.AccessRange(addr, size, func(_ uintptr, _ uint8, replacement *VarState) {
+			replacement.SetW(newWriter)
+		})
+	}
+	if mirroredRuntimeWriteCertificateValid(pt, slot, state, addr, size, revision,
+		readGeneration, readGeneration, writer) {
+		t.Fatal("same-address reuse revived old certificate")
 	}
 }
 

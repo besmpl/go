@@ -102,7 +102,7 @@ func raceAtomicBeginStoreCooperative(addr, size, racectx uintptr, token *[8]unsa
 
 // raceAtomicBeginRMW is used only by enabled read-modify-write and
 // compare-and-swap operations. An aligned exact-mask operation may reuse an
-// existing capability, but a miss takes the general path and never enrolls.
+// existing capability or enroll one through canonical setup.
 // Ignored operations continue to use raceAtomicBegin.
 //
 //go:linkname raceAtomicBeginRMW
@@ -112,18 +112,20 @@ func raceAtomicBeginRMW(addr, size, racectx uintptr, acquire bool, token *[8]uns
 }
 
 // raceAtomicBeginRMWCooperative is the public-runtime RMW entry point. A true
-// retry result is a clean exact-capability lock miss: token is empty and the
-// caller must leave systemstack, yield its user goroutine, and begin again.
-// General misses remain blocking and return a normal transaction token.
+// retry with spin or a non-nil park retains the exact capability in token[0];
+// the caller waits on the spinner doorbell on its user G or acquires park
+// before Resume. A
+// true retry with neither remains a clean lock/queue miss with an empty token.
+// Canonical enrollment and general misses remain blocking.
 //
 //go:linkname raceAtomicBeginRMWCooperative
 //go:nocheckptr
-func raceAtomicBeginRMWCooperative(addr, size, racectx uintptr, acquire bool, token *[8]unsafe.Pointer) (context uintptr, retry bool) {
+func raceAtomicBeginRMWCooperative(addr, size, racectx uintptr, acquire bool, token *[8]unsafe.Pointer) (context uintptr, retry, spin, polite bool, park *uint32) {
 	if apiInitCalled.Load() == 0 {
 		ensureInitialized()
 	}
 	if enabled.Load() == 0 {
-		return 0, false
+		return 0, false, false, false, nil
 	}
 	var ctx *goroutine.RaceContext
 	if racectx > 1 {
@@ -132,9 +134,46 @@ func raceAtomicBeginRMWCooperative(addr, size, racectx uintptr, acquire bool, to
 		ctx = getCurrentContext()
 	}
 	if token != nil {
-		retry = det.AtomicBeginRMWCooperative(addr, size, ctx, acquire, (*detector.AtomicToken)(token))
+		retry, spin, polite, park = det.AtomicBeginRMWCooperative(addr, size, ctx, acquire, (*detector.AtomicToken)(token))
 	}
-	return uintptr(unsafe.Pointer(ctx)), retry
+	return uintptr(unsafe.Pointer(ctx)), retry, spin, polite, park
+}
+
+//go:linkname raceAtomicResumeRMW
+//go:nocheckptr
+func raceAtomicResumeRMW(addr, size, racectx uintptr, acquire bool, token *[8]unsafe.Pointer) (context uintptr, retry, spin, polite bool, park *uint32) {
+	if token == nil || racectx <= 1 {
+		return 0, false, false, false, nil
+	}
+	ctx := (*goroutine.RaceContext)(unsafe.Pointer(racectx))
+	retry, spin, polite, park = det.AtomicResumeRMW(addr, size, ctx, acquire, (*detector.AtomicToken)(token))
+	return racectx, retry, spin, polite, park
+}
+
+//go:linkname raceAtomicInternalRMWPC
+func raceAtomicInternalRMWPC(pc uintptr) bool {
+	return detector.AtomicInternalRMWPC(pc)
+}
+
+//go:linkname raceAtomicBeginInternalRMWCooperative
+//go:nocheckptr
+func raceAtomicBeginInternalRMWCooperative(addr, size, pc, racectx uintptr, synchronize bool, token *[8]unsafe.Pointer) (context uintptr, retry, direct, spin, polite bool, park *uint32) {
+	if apiInitCalled.Load() == 0 {
+		ensureInitialized()
+	}
+	if enabled.Load() == 0 {
+		return 0, false, false, false, false, nil
+	}
+	var ctx *goroutine.RaceContext
+	if racectx > 1 {
+		ctx = (*goroutine.RaceContext)(unsafe.Pointer(racectx))
+	} else {
+		ctx = getCurrentContext()
+	}
+	if token != nil {
+		retry, direct, spin, polite, park = det.AtomicBeginInternalRMWCooperative(addr, size, ctx, pc, synchronize, (*detector.AtomicToken)(token))
+	}
+	return uintptr(unsafe.Pointer(ctx)), retry, direct, spin, polite, park
 }
 
 type atomicBeginMode uint8
@@ -188,6 +227,16 @@ func raceAtomicEnd(addr, size, pc, racectx uintptr, token *[8]unsafe.Pointer, wr
 	}
 	ctx := (*goroutine.RaceContext)(unsafe.Pointer(racectx))
 	det.AtomicEndMode(addr, size, ctx, (*detector.AtomicToken)(token), pc, write, synchronize)
+}
+
+//go:linkname raceAtomicEndInternalRMW
+//go:nocheckptr
+func raceAtomicEndInternalRMW(addr, size, pc, racectx uintptr, token *[8]unsafe.Pointer, write, synchronize, direct bool) *uint32 {
+	if token == nil || racectx <= 1 {
+		return nil
+	}
+	ctx := (*goroutine.RaceContext)(unsafe.Pointer(racectx))
+	return det.AtomicEndInternalRMW(addr, size, ctx, (*detector.AtomicToken)(token), pc, write, synchronize, direct)
 }
 
 //go:linkname raceAtomicLoadFastBegin

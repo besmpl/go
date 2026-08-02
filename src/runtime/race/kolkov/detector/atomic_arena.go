@@ -32,10 +32,142 @@ type atomicHistoryNode struct {
 	entry atomicHistoryEntry
 }
 
+// atomicHistoryIndex is a four-byte sparse radix over the complete uint32 TID
+// space. Only overflow nodes are indexed: their slab addresses are stable,
+// while deleting an inline entry may move the last of the four inline values.
+// Empty paths are unlinked on deletion, so index memory is bounded by the TIDs
+// currently represented in overflow rather than by all TIDs ever observed.
+type atomicHistoryIndex struct {
+	root *atomicHistoryIndex1
+}
+
+type atomicHistoryIndex1 struct {
+	child [256]*atomicHistoryIndex2
+	used  uint16
+}
+
+type atomicHistoryIndex2 struct {
+	child [256]*atomicHistoryIndex3
+	used  uint16
+}
+
+type atomicHistoryIndex3 struct {
+	child [256]*atomicHistoryIndexLeaf
+	used  uint16
+}
+
+type atomicHistoryIndexLeaf struct {
+	node [256]*atomicHistoryNode
+	used uint16
+}
+
+func (x *atomicHistoryIndex) find(tid uint32) *atomicHistoryNode {
+	p1 := x.root
+	if p1 == nil {
+		return nil
+	}
+	p2 := p1.child[byte(tid>>24)]
+	if p2 == nil {
+		return nil
+	}
+	p3 := p2.child[byte(tid>>16)]
+	if p3 == nil {
+		return nil
+	}
+	leaf := p3.child[byte(tid>>8)]
+	if leaf == nil {
+		return nil
+	}
+	return leaf.node[byte(tid)]
+}
+
+func (x *atomicHistoryIndex) insert(tid uint32, node *atomicHistoryNode) {
+	if x.root == nil {
+		x.root = new(atomicHistoryIndex1)
+	}
+	p1 := x.root
+	i1 := byte(tid >> 24)
+	p2 := p1.child[i1]
+	if p2 == nil {
+		p2 = new(atomicHistoryIndex2)
+		p1.child[i1] = p2
+		p1.used++
+	}
+	i2 := byte(tid >> 16)
+	p3 := p2.child[i2]
+	if p3 == nil {
+		p3 = new(atomicHistoryIndex3)
+		p2.child[i2] = p3
+		p2.used++
+	}
+	i3 := byte(tid >> 8)
+	leaf := p3.child[i3]
+	if leaf == nil {
+		leaf = new(atomicHistoryIndexLeaf)
+		p3.child[i3] = leaf
+		p3.used++
+	}
+	i4 := byte(tid)
+	if leaf.node[i4] != nil {
+		atomicRuntimeThrow("race detector duplicate atomic-history index entry")
+	}
+	leaf.node[i4] = node
+	leaf.used++
+}
+
+// remove clears the leaf before its history node may be unlinked or recycled.
+// Checking the exact pointer makes a stale delete incapable of removing a
+// different TID generation after arena-node reuse.
+func (x *atomicHistoryIndex) remove(tid uint32, node *atomicHistoryNode) {
+	p1 := x.root
+	if p1 == nil {
+		atomicRuntimeThrow("race detector missing atomic-history index root")
+	}
+	i1 := byte(tid >> 24)
+	p2 := p1.child[i1]
+	if p2 == nil {
+		atomicRuntimeThrow("race detector missing atomic-history index branch")
+	}
+	i2 := byte(tid >> 16)
+	p3 := p2.child[i2]
+	if p3 == nil {
+		atomicRuntimeThrow("race detector missing atomic-history index branch")
+	}
+	i3 := byte(tid >> 8)
+	leaf := p3.child[i3]
+	if leaf == nil || leaf.node[byte(tid)] != node {
+		atomicRuntimeThrow("race detector stale atomic-history index deletion")
+	}
+	leaf.node[byte(tid)] = nil
+	leaf.used--
+	if leaf.used != 0 {
+		return
+	}
+	p3.child[i3] = nil
+	p3.used--
+	if p3.used != 0 {
+		return
+	}
+	p2.child[i2] = nil
+	p2.used--
+	if p2.used != 0 {
+		return
+	}
+	p1.child[i1] = nil
+	p1.used--
+	if p1.used == 0 {
+		x.root = nil
+	}
+}
+
 type atomicHistoryClass struct {
-	inline   [atomicInlineFrontier]atomicHistoryEntry
-	inlineN  uint8
-	overflow *atomicHistoryNode
+	inline            [atomicInlineFrontier]atomicHistoryEntry
+	inlineN           uint8
+	overflow          *atomicHistoryNode
+	index             atomicHistoryIndex
+	live              uint32
+	insertedSinceScan uint32
+	lastScanLive      uint32
 }
 
 func (c *atomicHistoryClass) find(tid uint32) (*atomicHistoryEntry, bool) {
@@ -44,10 +176,8 @@ func (c *atomicHistoryClass) find(tid uint32) (*atomicHistoryEntry, bool) {
 			return &c.inline[i], true
 		}
 	}
-	for n := c.overflow; n != nil; n = n.next {
-		if n.entry.tid == tid {
-			return &n.entry, true
-		}
+	if n := c.index.find(tid); n != nil {
+		return &n.entry, true
 	}
 	return nil, false
 }
@@ -60,13 +190,36 @@ func (c *atomicHistoryClass) insert(a *AtomicHistoryArena, tid uint32) *atomicHi
 		e := &c.inline[c.inlineN]
 		c.inlineN++
 		e.tid = tid
+		c.live++
+		c.insertedSinceScan++
 		return e
 	}
 	n := a.allocHistoryNode()
 	n.entry.tid = tid
 	n.next = c.overflow
 	c.overflow = n
+	c.index.insert(tid, n)
+	c.live++
+	c.insertedSinceScan++
 	return &n.entry
+}
+
+const atomicHistoryEagerPruneThreshold = 16
+
+// shouldPruneBeforeInsert implements geometric lazy compaction. Small ordered
+// chains remain compact eagerly. Once the frontier is large, a full scan runs
+// only after roughly the size observed by the preceding scan has arrived as
+// new unique TIDs, making construction of a concurrent antichain O(G).
+func (c *atomicHistoryClass) shouldPruneBeforeInsert() bool {
+	if c.live <= atomicHistoryEagerPruneThreshold || c.lastScanLive == 0 {
+		return true
+	}
+	return c.insertedSinceScan >= c.lastScanLive-1
+}
+
+func (c *atomicHistoryClass) finishScan() {
+	c.insertedSinceScan = 0
+	c.lastScanLive = c.live
 }
 
 func (c *atomicHistoryClass) visit(fn func(*atomicHistoryEntry) bool) {
@@ -91,6 +244,7 @@ func (c *atomicHistoryClass) removeEmpty(a *AtomicHistoryArena) {
 		c.inlineN--
 		c.inline[i] = c.inline[c.inlineN]
 		c.inline[c.inlineN] = atomicHistoryEntry{}
+		c.live--
 	}
 	link := &c.overflow
 	for *link != nil {
@@ -99,9 +253,12 @@ func (c *atomicHistoryClass) removeEmpty(a *AtomicHistoryArena) {
 			link = &n.next
 			continue
 		}
+		c.index.remove(n.entry.tid, n)
 		*link = n.next
+		c.live--
 		a.freeHistoryNode(n)
 	}
+	c.finishScan()
 }
 
 func (c *atomicHistoryClass) clear(a *AtomicHistoryArena) {
@@ -111,6 +268,13 @@ func (c *atomicHistoryClass) clear(a *AtomicHistoryArena) {
 	c.inlineN = 0
 	head := c.overflow
 	c.overflow = nil
+	// Drop the complete index before any indexed node enters the arena free
+	// list. A recycled slab address can therefore never be found through the
+	// previous class or state generation.
+	c.index = atomicHistoryIndex{}
+	c.live = 0
+	c.insertedSinceScan = 0
+	c.lastScanLive = 0
 	for head != nil {
 		next := head.next
 		a.freeHistoryNode(head)
@@ -282,7 +446,12 @@ func (a *AtomicHistoryArena) releaseState(s *atomicState) {
 	// state slot becomes reusable; dormant context cache entries then reject the
 	// pointer without locking a recycled state.
 	s.mu.lock()
-	if s.transactionActive || s.writerRevision.Load()&1 != 0 {
+	s.rmwQueue.lock()
+	invalidRMW := s.rmwOwner || s.rmwGranted || s.rmwWaiters != 0 || s.rmwSema != 0 || iatomic.Load(&s.rmwSpinnerEpoch) != 0 ||
+		s.rmwSpinnerTID != 0 || s.rmwSpinnerMisses != 0 || s.rmwCohortOps != 0 || s.rmwForceSpinner ||
+		s.rmwPromoteParked || s.rmwPromotedOwner || s.rmwWakeCompetitors != 0 || s.rmwGrantTID != 0
+	s.rmwQueue.unlock()
+	if s.transactionActive || s.writerRevision.Load()&1 != 0 || invalidRMW {
 		s.mu.unlock()
 		atomicRuntimeThrow("race detector retired active atomic arena state")
 	}
@@ -404,6 +573,7 @@ func (a *AtomicHistoryArena) freeReleaseObject(r *atomicRelease) {
 	if r == nil {
 		return
 	}
+	r.releaseCausalResources()
 	a.freeRangeList(r.runs)
 	a.freeRangeList(r.retired)
 	a.mu.lock()
@@ -411,6 +581,22 @@ func (a *AtomicHistoryArena) freeReleaseObject(r *atomicRelease) {
 	a.freeRelease = r
 	a.stats.Releases--
 	a.mu.unlock()
+}
+
+// releaseCausalResources drops references owned by one release without
+// touching arena accounting. It is also used by quiescent reset while a.mu is
+// held, where calling freeReleaseObject would deadlock.
+func (r *atomicRelease) releaseCausalResources() {
+	if r == nil {
+		return
+	}
+	clearAtomicReleaseImports(r)
+	clearAtomicReleaseDeferred(r)
+	r.view.Release()
+	if r.lineage != nil {
+		r.lineage.Release()
+		r.lineage = nil
+	}
 }
 
 func (a *AtomicHistoryArena) allocRange() *atomicReleaseRange {
@@ -584,6 +770,9 @@ func (a *AtomicHistoryArena) reset() {
 		*s = atomicHistorySlab{}
 	}
 	for _, s := range a.releases {
+		for i := uint32(0); i < s.used; i++ {
+			s.nodes[i].releaseCausalResources()
+		}
 		*s = atomicReleaseSlab{}
 	}
 	for _, s := range a.ranges {

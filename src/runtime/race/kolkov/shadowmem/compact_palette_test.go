@@ -3,6 +3,7 @@
 package shadowmem
 
 import (
+	"runtime"
 	"testing"
 	"unsafe"
 
@@ -10,12 +11,288 @@ import (
 	"runtime/race/kolkov/vectorclock"
 )
 
+var compactPaletteAllocationSink *compactPalette
+
 func TestCompactPaletteStorageCrossover(t *testing.T) {
-	if got, want := unsafe.Sizeof(compactPalette{}), uintptr(4680); got != want {
+	if got, want := unsafe.Sizeof(compactPalette{}), uintptr(5136); got != want {
 		t.Fatalf("palette root size=%d, want %d", got, want)
 	}
-	if got, want := unsafe.Sizeof(compactPaletteClockChunk{}), uintptr(512); got != want {
+	if got, want := unsafe.Sizeof(compactPaletteClockChunk{}), uintptr(640); got != want {
 		t.Fatalf("palette clock chunk size=%d, want %d", got, want)
+	}
+}
+
+func TestCompactPaletteCoLocatesInitialShapeChunk(t *testing.T) {
+	shape := compactPaletteShape{writeTID: 17, lifecycle: allocateLifecycleID()}
+	palette := new(compactPalette)
+	owner := palette.ensureShape(shape)
+	if owner != compactPaletteFirstShape {
+		t.Fatalf("initial owner=%d, want %d", owner, compactPaletteFirstShape)
+	}
+	if record := palette.shapeRecord(owner, false); record != &palette.initialShapes.records[0] {
+		t.Fatalf("initial shape record=%p, want co-located %p", record, &palette.initialShapes.records[0])
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		p := new(compactPalette)
+		if p.ensureShape(shape) == 0 {
+			panic("shape setup failed")
+		}
+		compactPaletteAllocationSink = p
+	}); allocs != 1 {
+		t.Fatalf("palette plus initial shape allocations=%.2f, want one co-located object", allocs)
+	}
+	compactPaletteAllocationSink = nil
+
+	record := func() *compactPaletteShapeRecord {
+		p := new(compactPalette)
+		id := p.ensureShape(shape)
+		return p.shapeRecord(id, false)
+	}()
+	runtime.GC()
+	if record == nil || !record.used || record.shape != shape {
+		t.Fatalf("interior shape record after GC=%+v, want %+v", record, shape)
+	}
+}
+
+func TestCompactPaletteUniformWordPartialBoundariesAreExact(t *testing.T) {
+	type operation struct {
+		name              string
+		current           epoch.Epoch
+		pc                uintptr
+		write             bool
+		clear             bool
+		defaultHasHistory bool
+	}
+	writer := epoch.NewEpoch(51, 0x12345)
+	operations := []operation{
+		{name: "read", current: epoch.NewEpoch(52, 0x23456), pc: 0xe102},
+		{name: "write", current: epoch.NewEpoch(53, 0x34567), pc: 0xe103, write: true},
+		{name: "clear-default", clear: true},
+		{name: "clear-tombstone", clear: true, defaultHasHistory: true},
+	}
+	const (
+		base    = uintptr(64)
+		wordLen = uintptr(8)
+		writePC = uintptr(0xe101)
+	)
+
+	for _, operation := range operations {
+		for lo := uintptr(0); lo < wordLen; lo++ {
+			for hi := lo + 1; hi <= wordLen; hi++ {
+				if lo == 0 && hi == wordLen {
+					continue
+				}
+				name := operation.name + "/" + string(rune('0'+lo)) + "-" + string(rune('0'+hi))
+				t.Run(name, func(t *testing.T) {
+					groups := newCompactGroups()
+					palette := new(compactPalette)
+					groups.palette.Store(palette)
+					if !groups.tryRange(base, wordLen, nil, writer, compactTestClock(writer), writePC, true) {
+						t.Fatal("uniform word setup fell back")
+					}
+
+					owner := palette.owner(base)
+					fusedOwner, fusedWrite, fusedRead, fused := compactPaletteDecodeFusedOwnerWord(palette.owners[base>>3].Load())
+					clocks, _ := palette.clockStorage(base, false)
+					if owner < compactPaletteFirstShape || !fused || fusedOwner != owner || fusedWrite != 0x2345 || fusedRead != 0 || clocks != nil {
+						t.Fatalf("uniform setup owner=%d clocks=%p", owner, clocks)
+					}
+
+					var before [8]compactHistoryDescriptor
+					for lane := uintptr(0); lane < wordLen; lane++ {
+						var ok bool
+						before[lane], ok = palette.descriptor(base + lane)
+						if !ok {
+							t.Fatalf("setup descriptor missing at lane %d", lane)
+						}
+					}
+
+					if operation.clear {
+						palette.clearRange(groups, base+lo, hi-lo, operation.defaultHasHistory, false)
+					} else {
+						clock := compactTestClock(writer, operation.current)
+						if !groups.tryRange(base+lo, hi-lo, nil, operation.current, clock, operation.pc, operation.write) {
+							t.Fatal("partial transition fell back")
+						}
+					}
+
+					if _, _, _, valid := compactPaletteDecodeFusedOwnerWord(palette.owners[base>>3].Load()); valid {
+						t.Fatal("partial mutation retained fused owner metadata")
+					}
+					clocks, index := palette.clockStorage(base, false)
+					if clocks == nil {
+						t.Fatal("partial mutation did not install explicit clock storage")
+					}
+					if _, _, valid := compactPaletteDecodeUniformLows(clocks.uniform[index>>3].Load()); valid {
+						t.Fatal("partial mutation retained uniform-word metadata")
+					}
+					for lane := uintptr(0); lane < wordLen; lane++ {
+						selected := lane >= lo && lane < hi
+						got, represented := palette.descriptor(base + lane)
+						if operation.clear && selected {
+							wantOwner := compactPaletteDefault
+							wantAuthoritative := false
+							if operation.defaultHasHistory {
+								wantOwner = compactPaletteTombstone
+								wantAuthoritative = true
+							}
+							_, authoritative, lookupOwner := palette.lookup(base + lane)
+							if represented || palette.owner(base+lane) != wantOwner || authoritative != wantAuthoritative || lookupOwner != wantOwner {
+								t.Fatalf("cleared lane %d descriptor=%+v represented=%v owner=%d lookup=(%v,%d), want owner=%d authoritative=%v",
+									lane, got, represented, palette.owner(base+lane), authoritative, lookupOwner, wantOwner, wantAuthoritative)
+							}
+							continue
+						}
+
+						want := before[lane]
+						if selected {
+							var next compactHistoryKey
+							var ok bool
+							if operation.write {
+								next, ok = want.history.afterWrite(operation.current, compactTestClock(writer, operation.current), operation.pc)
+							} else {
+								next, ok = want.history.afterRead(operation.current, compactTestClock(writer, operation.current), operation.pc)
+							}
+							if !ok {
+								t.Fatalf("expected transition rejected at lane %d", lane)
+							}
+							want.history = next
+						}
+						_, authoritative, lookupOwner := palette.lookup(base + lane)
+						if !represented || got != want || !authoritative || lookupOwner != palette.owner(base+lane) {
+							t.Fatalf("lane %d descriptor=%+v represented=%v lookup=(%v,%d), want %+v", lane, got, represented, authoritative, lookupOwner, want)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestCompactPaletteAlignedWordFusesWithoutClockAllocation(t *testing.T) {
+	palette := new(compactPalette)
+	descriptor := compactHistoryDescriptor{
+		history: compactHistoryKey{
+			write:           epoch.NewEpoch(61, 0x12345),
+			read:            epoch.NewEpoch(62, 0x23456),
+			exclusiveWriter: -1,
+			writePC:         0xf101,
+			readPC:          0xf102,
+			writeCount:      3,
+		},
+		lifecycle: allocateLifecycleID(),
+	}
+	shape, writeLow, readLow := paletteShapeFromDescriptor(descriptor)
+	owner := palette.ensureShape(shape)
+	if owner == 0 {
+		t.Fatal("shape setup failed")
+	}
+	const base = uintptr(128)
+	if allocs := testing.AllocsPerRun(1000, func() {
+		palette.setUniformDescriptorRange(base, base+8, owner, writeLow, readLow)
+		palette.setUniformRangeOwner(base, base+8, compactPaletteDefault)
+	}); allocs != 0 {
+		t.Fatalf("aligned fused publication allocated %.2f objects/op", allocs)
+	}
+	palette.setUniformDescriptorRange(base, base+8, owner, writeLow, readLow)
+	if clocks, _ := palette.clockStorage(base, false); clocks != nil {
+		t.Fatalf("aligned fused publication allocated clock chunk %p", clocks)
+	}
+	fusedOwner, fusedWrite, fusedRead, ok := compactPaletteDecodeFusedOwnerWord(palette.owners[base>>3].Load())
+	if !ok || fusedOwner != owner || fusedWrite != writeLow || fusedRead != readLow {
+		t.Fatalf("fused word=(owner %d lows %#x/%#x ok %v), want (%d %#x/%#x)",
+			fusedOwner, fusedWrite, fusedRead, ok, owner, writeLow, readLow)
+	}
+	for lane := uintptr(0); lane < 8; lane++ {
+		got, represented := palette.descriptor(base + lane)
+		if !represented || got != descriptor || palette.owner(base+lane) != owner {
+			t.Fatalf("lane %d descriptor=%+v represented=%v owner=%d, want %+v/%d",
+				lane, got, represented, palette.owner(base+lane), descriptor, owner)
+		}
+	}
+	palette.setUniformRangeOwner(base, base+8, owner)
+	if _, _, _, fused := compactPaletteDecodeFusedOwnerWord(palette.owners[base>>3].Load()); fused {
+		t.Fatal("owner-only helper retained fused descriptor")
+	}
+	for lane := uintptr(0); lane < 8; lane++ {
+		got, represented := palette.descriptor(base + lane)
+		if !represented || got != descriptor {
+			t.Fatalf("owner-only helper lost lane %d descriptor=%+v represented=%v", lane, got, represented)
+		}
+	}
+}
+
+func TestCompactPaletteFusedMigrationMaterializationAndFullClear(t *testing.T) {
+	groups := newCompactGroups()
+	current := epoch.NewEpoch(63, 0x34567)
+	const (
+		base = uintptr(192)
+		pc   = uintptr(0xf201)
+	)
+	if !groups.tryRange(base, 8, nil, current, compactTestClock(current), pc, true) {
+		t.Fatal("bitmap range setup failed")
+	}
+	if groups.palette.Load() != nil {
+		t.Fatal("single bitmap class unexpectedly upgraded before migration")
+	}
+	palette := densePaletteFromBitmaps(groups)
+	if palette == nil {
+		t.Fatal("bitmap migration failed")
+	}
+	if clocks, _ := palette.clockStorage(base, false); clocks != nil {
+		t.Fatalf("complete migrated word allocated clock chunk %p", clocks)
+	}
+	owner, writeLow, readLow, fused := compactPaletteDecodeFusedOwnerWord(palette.owners[base>>3].Load())
+	if !fused || owner < compactPaletteFirstShape || writeLow != 0x4567 || readLow != 0 {
+		t.Fatalf("migrated fused word owner=%d lows=%#x/%#x fused=%v", owner, writeLow, readLow, fused)
+	}
+	var slot ShadowSlot
+	palette.materializeWord(base, &slot)
+	first := slot.states[0].Load()
+	if first == nil {
+		t.Fatal("fused materialization omitted first lane")
+	}
+	want := compactHistoryDescriptor{
+		history:   compactHistoryKey{write: current, exclusiveWriter: 63, writePC: pc, writeCount: 1},
+		lifecycle: groups.lifecycle,
+	}
+	for lane := uintptr(0); lane < 8; lane++ {
+		state := slot.states[lane].Load()
+		got, ok := compactDescriptorFromState(state)
+		if state != first || !ok || got != want {
+			t.Fatalf("materialized lane %d state=%p/%p descriptor=%+v ok=%v, want %+v", lane, state, first, got, ok, want)
+		}
+	}
+	if record := palette.shapeRecord(owner, false); record == nil || record.members != 8 {
+		t.Fatalf("migrated owner record=%+v, want 8 members", record)
+	}
+	palette.setRangeOwner(base, 8, compactPaletteTombstone)
+	if raw := palette.owners[base>>3].Load(); raw != 0x0101010101010101 {
+		t.Fatalf("full tombstone clear retained fused payload: %#x", raw)
+	}
+	if clocks, _ := palette.clockStorage(base, false); clocks != nil {
+		t.Fatalf("full clear allocated clock chunk %p", clocks)
+	}
+	if palette.tombstoneWord(base) != 0xff || palette.coveredWord(base) != 0 {
+		t.Fatalf("full clear masks tombstone=%#x covered=%#x", palette.tombstoneWord(base), palette.coveredWord(base))
+	}
+}
+
+func TestCompactPaletteTaggedOwnersAreReserved(t *testing.T) {
+	palette := new(compactPalette)
+	for i := 0; i < compactPaletteMaxShapes; i++ {
+		shape := compactPaletteShape{writeTID: 1, writePC: uintptr(i + 1), flags: compactPaletteHasWrite}
+		owner := palette.ensureShape(shape)
+		if owner < compactPaletteFirstShape || owner >= 0xfe {
+			t.Fatalf("shape %d received reserved owner %d", i, owner)
+		}
+		palette.shapeRecord(owner, false).members = 1
+		if i == compactPaletteMaxShapes-1 && owner != 0xfd {
+			t.Fatalf("last shape owner=%#x, want %#x", owner, uint8(0xfd))
+		}
+	}
+	if owner := palette.ensureShape(compactPaletteShape{writeTID: 2, flags: compactPaletteHasWrite}); owner != 0 {
+		t.Fatalf("capacity overflow returned reserved/recycled owner %#x", owner)
 	}
 }
 
@@ -1255,30 +1532,45 @@ func BenchmarkCompactPaletteFullBlockNoop(b *testing.B) {
 	}
 }
 
-func BenchmarkCompactPaletteUniformScalarReadWrite(b *testing.B) {
-	groups := newCompactGroups()
-	current := epoch.NewEpoch(9, 2)
-	clock := compactTestClock(current)
-	for i := 0; i <= compactGroupCapacity; i++ {
-		if _, ok := groups.tryWrite(uintptr(i*17), current, clock, uintptr(100+i)); !ok {
-			b.Fatal("palette setup failed")
+func BenchmarkCompactPaletteUniformWordTransition(b *testing.B) {
+	for _, size := range []uintptr{8, 7} {
+		name := "uniform-8"
+		if size != 8 {
+			name = "expanded-7-of-8"
 		}
-	}
-	const (
-		anchor  = uintptr(3000)
-		writePC = uintptr(0xd201)
-		readPC  = uintptr(0xd202)
-	)
-	if !groups.tryRange(anchor, 8, nil, current, clock, writePC, true) {
-		b.Fatal("uniform scalar setup failed")
-	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if !groups.tryRange(anchor, 8, nil, current, clock, readPC, false) ||
-			!groups.tryRange(anchor, 8, nil, current, clock, writePC, true) {
-			b.Fatal("uniform scalar transition fell back")
-		}
+		b.Run(name, func(b *testing.B) {
+			groups := newCompactGroups()
+			current := epoch.NewEpoch(9, 2)
+			clock := compactTestClock(current)
+			for i := 0; i <= compactGroupCapacity; i++ {
+				if _, ok := groups.tryWrite(uintptr(i*17), current, clock, uintptr(100+i)); !ok {
+					b.Fatal("palette setup failed")
+				}
+			}
+			const (
+				anchor  = uintptr(3000)
+				writePC = uintptr(0xd201)
+				readPC  = uintptr(0xd202)
+			)
+			if !groups.tryRange(anchor, 8, nil, current, clock, writePC, true) {
+				b.Fatal("uniform word setup failed")
+			}
+			// Split the comparison case before timing. Its seven selected lanes
+			// remain exact explicit lows while the aligned eight-lane case remains
+			// one packed low word.
+			if size != 8 && !groups.tryRange(anchor, size, nil, current, clock, readPC, false) {
+				b.Fatal("expanded word setup failed")
+			}
+			b.ReportAllocs()
+			b.ReportMetric(float64(size), "anchors/op")
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if !groups.tryRange(anchor, size, nil, current, clock, readPC, false) ||
+					!groups.tryRange(anchor, size, nil, current, clock, writePC, true) {
+					b.Fatal("word transition fell back")
+				}
+			}
+		})
 	}
 }
 

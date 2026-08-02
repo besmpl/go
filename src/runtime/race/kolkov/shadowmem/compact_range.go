@@ -60,8 +60,8 @@ func compactRangeGroupEmptyAfter(group *compactGroup, offset, size uintptr, keep
 	if group == nil {
 		return true
 	}
-	for word := range group.members {
-		value := group.members[word].Load()
+	for word := 0; word < compactMembershipWords; word++ {
+		value := group.membershipWord(word)
 		if !keepSelected {
 			value &^= compactRangeWordMask(offset, size, word)
 		}
@@ -116,7 +116,7 @@ func (c *compactGroups) compactRangeUniformNoop(offset, size uintptr, current ep
 		intersects := false
 		for word := firstWord; word <= lastWord; word++ {
 			selected := compactRangeWordMask(offset, size, word)
-			if group.members[word].Load()&selected != 0 {
+			if group.membershipWord(word)&selected != 0 {
 				intersects = true
 				break
 			}
@@ -134,7 +134,7 @@ func (c *compactGroups) compactRangeUniformNoop(offset, size uintptr, current ep
 	}
 	for word := firstWord; word <= lastWord; word++ {
 		selected := compactRangeWordMask(offset, size, word)
-		if source.members[word].Load()&selected != selected || c.tombstoneWord(word)&selected != 0 {
+		if source.membershipWord(word)&selected != selected || c.tombstoneWord(word)&selected != 0 {
 			return false
 		}
 	}
@@ -184,14 +184,14 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 		}
 		intersects := false
 		for word := firstWord; word <= lastWord; word++ {
-			intersection := group.members[word].Load() & compactRangeWordMask(offset, size, word)
+			intersection := group.membershipWord(word) & compactRangeWordMask(offset, size, word)
 			if intersection == 0 {
 				continue
 			}
 			intersects = true
 			for j := 0; j < sourceCount; j++ {
 				previous := sources[j].group
-				if previous != nil && previous.members[word].Load()&intersection != 0 {
+				if previous != nil && previous.membershipWord(word)&intersection != 0 {
 					return false
 				}
 			}
@@ -225,7 +225,7 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 		}
 		tombstoneSelected = true
 		for i := 0; i < sourceCount; i++ {
-			if group := sources[i].group; group != nil && group.members[word].Load()&mask != 0 {
+			if group := sources[i].group; group != nil && group.membershipWord(word)&mask != 0 {
 				return false
 			}
 		}
@@ -251,7 +251,7 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 		covered := c.tombstoneWord(word) & selected
 		for i := 0; i < sourceCount; i++ {
 			if group := sources[i].group; group != nil {
-				covered |= group.members[word].Load() & selected
+				covered |= group.membershipWord(word) & selected
 			}
 		}
 		if selected&^covered != 0 {
@@ -440,9 +440,7 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 			destination.recycle = true
 			continue
 		}
-		state := compactStateFromDescriptor(destination.descriptor)
-		group := &compactGroup{descriptor: destination.descriptor, joinable: true}
-		group.state.Store(state)
+		group := newCompactGroup(destination.descriptor)
 		destination.newGroup = group
 		destination.group = group
 	}
@@ -476,7 +474,7 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 			var mask uint64
 			switch source.kind {
 			case compactRangeGroupSource:
-				mask = source.group.members[word].Load() & selected
+				mask = source.group.membershipWord(word) & selected
 			case compactRangeTombstoneSource:
 				mask = c.tombstoneWord(word) & selected
 			case compactRangeDefaultSource:
@@ -491,7 +489,7 @@ func (c *compactGroups) tryRange(offset, size uintptr, defaultState *VarState, c
 
 		for i := 0; i < sourceCount; i++ {
 			if mask := sourceMasks[i]; mask != 0 {
-				compactAtomicSet(&destinations[sources[i].target].group.members[word], mask)
+				compactSetMembershipMask(destinations[sources[i].target].group, word, mask)
 			}
 		}
 		for i := 0; i < sourceCount; i++ {
@@ -553,6 +551,9 @@ func (pt *PageTableShadow) tryCompactRange(addr, size uintptr, current epoch.Epo
 		}
 		compact = newCompactGroups()
 		newHeader = true
+	}
+	if preparePaletteMutationLocked(view, compact, firstWord, lastWord) {
+		return finishCompactRangeBlock(view.history, false)
 	}
 	if !compact.tryRange(addr&(rangeBlockSize-1), size, view.history.state.Load(), current, clock, pc, write) {
 		return finishCompactRangeBlock(view.history, false)
