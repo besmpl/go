@@ -297,6 +297,118 @@ func TestPruneWideSingletonEventSetKeepsCausalRootStructural(t *testing.T) {
 	anchor.Release()
 }
 
+func TestPruneCoalescedEventSetKeepsCausalRootStructural(t *testing.T) {
+	const first = uint32(100_000)
+	const eventsN = uint32(512)
+	const observedN = uint32(233)
+
+	// Equal reader epochs are canonically coalesced even though each coordinate
+	// remains an independent read event.
+	events := New()
+	events.JoinRange(first, first+eventsN-1, 7)
+	anchor := New()
+	anchor.JoinRange(first, first+observedN-1, 7)
+	lineage := NewClockLineage(anchor)
+	view := lineage.Pin()
+	observed := New()
+	if !observed.TryJoinCausal(view) {
+		t.Fatal("failed to install observed causal root")
+	}
+	refs := view.segment.refs.Load()
+
+	events.PruneEventSetLessOrEqual(observed)
+	if got := view.segment.refs.Load(); got != refs {
+		t.Fatalf("coalesced event pruning changed segment refs: got %d want %d", got, refs)
+	}
+	if !observed.causal.Valid() {
+		t.Fatal("coalesced event pruning materialized observed causal root")
+	}
+	if len(events.sparseRuns) != 1 {
+		t.Fatalf("coalesced event pruning produced %d runs, want 1: %+v", len(events.sparseRuns), events.sparseRuns)
+	}
+	want := finiteRun{First: first + observedN, Last: first + eventsN - 1, Clock: 7}
+	if got := events.sparseRuns[0]; got != want {
+		t.Fatalf("retained run = %+v, want %+v", got, want)
+	}
+
+	events.Release()
+	observed.Release()
+	view.Release()
+	lineage.Release()
+	anchor.Release()
+}
+
+func TestPruneCoalescedEventSetSplitsExactly(t *testing.T) {
+	const first = uint32(100_000)
+	const eventsN = uint32(64)
+	events := New()
+	events.JoinRange(first, first+eventsN-1, 11)
+	anchor := New()
+	for offset := uint32(0); offset < eventsN; offset += 2 {
+		anchor.Set(first+offset, 11)
+	}
+	lineage := NewClockLineage(anchor)
+	view := lineage.Pin()
+	observed := New()
+	if !observed.TryJoinCausal(view) {
+		t.Fatal("failed to install observed causal root")
+	}
+
+	events.PruneEventSetLessOrEqual(observed)
+	if len(events.sparseRuns) != int(eventsN/2) {
+		t.Fatalf("split event pruning produced %d runs, want %d", len(events.sparseRuns), eventsN/2)
+	}
+	for offset := uint32(0); offset < eventsN; offset++ {
+		want := uint32(0)
+		if offset&1 != 0 {
+			want = 11
+		}
+		if got := events.Get(first + offset); got != want {
+			t.Fatalf("event %d = %d, want %d", offset, got, want)
+		}
+	}
+	if !observed.causal.Valid() {
+		t.Fatal("split event pruning materialized observed causal root")
+	}
+
+	events.Release()
+	observed.Release()
+	view.Release()
+	lineage.Release()
+	anchor.Release()
+}
+
+func TestPrunePathologicallyWideCoalescedEventSetFallsBackExactly(t *testing.T) {
+	const first = uint32(100_000)
+	const eventsN = uint32(64*1024 + 1)
+	const observedN = uint32(40_000)
+	events := New()
+	events.JoinRange(first, first+eventsN-1, 13)
+	anchor := New()
+	anchor.JoinRange(first, first+observedN-1, 13)
+	lineage := NewClockLineage(anchor)
+	view := lineage.Pin()
+	observed := New()
+	if !observed.TryJoinCausal(view) {
+		t.Fatal("failed to install observed causal root")
+	}
+
+	events.PruneEventSetLessOrEqual(observed)
+	want := finiteRun{First: first + observedN, Last: first + eventsN - 1, Clock: 13}
+	if len(events.sparseRuns) != 1 || events.sparseRuns[0] != want {
+		t.Fatalf("wide fallback result = %+v, want [%+v]", events.sparseRuns, want)
+	}
+	if !observed.causal.Valid() {
+		t.Fatal("wide fallback changed the observing clock representation")
+	}
+
+	events.Release()
+	observed.Release()
+	view.Release()
+	lineage.Release()
+	anchor.Release()
+}
+
 func BenchmarkVectorClockTryJoinCausalSameFamily(b *testing.B) {
 	anchor := New()
 	lineage := NewClockLineage(anchor)

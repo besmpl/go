@@ -1254,8 +1254,8 @@ func (vc *VectorClock) PruneLessOrEqual(observed *VectorClock) {
 // canonical storage may coalesce adjacent equal epochs), so their semantic
 // coordinates can be scanned directly against an arbitrarily wide observing
 // clock without materializing its immutable causal roots. This API is for
-// event sets, not manufactured wide ranges. Partial composite inputs retain
-// PruneLessOrEqual's fully general fallback.
+// event sets, not manufactured wide ranges. Pathologically wide coalesced
+// inputs retain PruneLessOrEqual's exact structural fallback.
 func (vc *VectorClock) PruneEventSetLessOrEqual(observed *VectorClock) {
 	if vc == nil || observed == nil {
 		return
@@ -1271,9 +1271,30 @@ func (vc *VectorClock) PruneEventSetLessOrEqual(observed *VectorClock) {
 			break
 		}
 	}
+	if !allSingleton {
+		// Bound point lookup before inspecting the observer. Real promoted read
+		// frontiers contain one coordinate per reader; a manufactured or
+		// pathological composite range uses the exact structural fallback.
+		const maxDirectCompositeEventCoordinates = uint64(64 * 1024)
+		var represented uint64
+		vc.rangeOwnedRuns(func(first, last, _ uint32) bool {
+			represented += uint64(last) - uint64(first) + 1
+			return represented <= maxDirectCompositeEventCoordinates
+		})
+		if represented > maxDirectCompositeEventCoordinates {
+			vc.PruneLessOrEqual(observed)
+			return
+		}
+	}
+	// A promoted read frontier is an event set even when canonical storage has
+	// coalesced adjacent readers with equal epochs into one finite run. Prune it
+	// through point lookup: materializing a process-wide causal observer merely
+	// to split the represented reader events turns mutex handoff into work
+	// proportional to unrelated goroutines.
 	total, kept := uint64(0), uint64(0)
 	vc.rangeOwnedRuns(func(first, last, clock uint32) bool {
-		total += uint64(last) - uint64(first) + 1
+		width := uint64(last) - uint64(first) + 1
+		total += width
 		for tid := uint64(first); tid <= uint64(last); tid++ {
 			id := uint32(tid)
 			if !observed.IsRetired(id) && observed.Get(id) < clock {
@@ -1297,10 +1318,14 @@ func (vc *VectorClock) PruneEventSetLessOrEqual(observed *VectorClock) {
 		vc.sparseRuns = vc.sparseRuns[:0]
 		return
 	}
-	if !allSingleton {
-		vc.PruneLessOrEqual(observed)
+	if allSingleton {
+		vc.prunePartialSingletonEventSet(observed)
 		return
 	}
+	vc.prunePartialCompositeEventSet(observed)
+}
+
+func (vc *VectorClock) pruneOwnedDenseEvents(observed *VectorClock) {
 	for tid := uint32(0); tid <= uint32(vc.maxDense); tid++ {
 		if clock := vc.clocks[tid]; clock != 0 && (observed.IsRetired(tid) || observed.Get(tid) >= clock) {
 			vc.clocks[tid] = 0
@@ -1316,13 +1341,52 @@ func (vc *VectorClock) PruneEventSetLessOrEqual(observed *VectorClock) {
 			vc.denseTail[i] = 0
 		}
 	}
-	out := vc.sparseRuns[:0]
-	for _, run := range vc.sparseRuns {
+}
+
+func (vc *VectorClock) prunePartialSingletonEventSet(observed *VectorClock) {
+	vc.pruneOwnedDenseEvents(observed)
+	oldSparse := vc.sparseRuns
+	out := oldSparse[:0]
+	for _, run := range oldSparse {
 		if !observed.IsRetired(run.First) && observed.Get(run.First) < run.Clock {
 			out = append(out, run)
 		}
 	}
-	clear(vc.sparseRuns[len(out):])
+	if len(out) < len(oldSparse) {
+		clear(oldSparse[len(out):])
+	}
+	vc.sparseRuns = out
+}
+
+func (vc *VectorClock) prunePartialCompositeEventSet(observed *VectorClock) {
+	// Preserve the input runs while rebuilding because one coalesced run may
+	// split into several retained runs. The common promoted frontier has only a
+	// handful of runs, so keep that snapshot on this composite-only stack frame.
+	// A fragmented bounded frontier copies only its represented read events;
+	// this remains far smaller than materializing the observer's causal roots.
+	const inlineCompositeRuns = 16
+	var composite [inlineCompositeRuns]finiteRun
+	var sparse []finiteRun
+	if len(vc.sparseRuns) <= len(composite) {
+		copy(composite[:], vc.sparseRuns)
+		sparse = composite[:len(vc.sparseRuns)]
+	} else {
+		sparse = append([]finiteRun(nil), vc.sparseRuns...)
+	}
+	vc.pruneOwnedDenseEvents(observed)
+	oldSparse := vc.sparseRuns
+	out := oldSparse[:0]
+	for _, run := range sparse {
+		for tid := uint64(run.First); tid <= uint64(run.Last); tid++ {
+			id := uint32(tid)
+			if !observed.IsRetired(id) && observed.Get(id) < run.Clock {
+				out = appendFiniteRun(out, finiteRun{First: id, Last: id, Clock: run.Clock})
+			}
+		}
+	}
+	if len(out) < len(oldSparse) {
+		clear(oldSparse[len(out):])
+	}
 	vc.sparseRuns = out
 }
 
