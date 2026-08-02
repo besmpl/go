@@ -441,12 +441,15 @@ func (p *ReleaseProjection) get(tid uint32) uint32 {
 			clock = candidate
 		}
 	}
-	for _, r := range p.finite[:p.finiteN] {
+	finite := p.finite[:p.finiteN]
+	for i := 0; i < len(finite); i++ {
+		r := finite[i]
 		if tid >= r.First && tid <= r.Last && r.Clock > clock {
 			clock = r.Clock
 		}
 	}
-	for _, r := range p.dynamicFinite {
+	for i := 0; i < len(p.dynamicFinite); i++ {
+		r := p.dynamicFinite[i]
 		if tid >= r.First && tid <= r.Last && r.Clock > clock {
 			clock = r.Clock
 		}

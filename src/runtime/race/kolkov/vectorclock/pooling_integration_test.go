@@ -22,6 +22,11 @@ func resetClockPoolForIntegrationTest(t *testing.T) {
 			}
 			shard.count = 0
 			shard.lock.Store(0)
+			if !shard.joinLock.CompareAndSwap(0, 1) {
+				t.Fatalf("join scratch shard %d remained locked", i)
+			}
+			shard.joinScratch = nil
+			shard.joinLock.Store(0)
 		}
 		poolCursor.Store(0)
 		poolingClockSink.Store(nil)

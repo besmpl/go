@@ -5,11 +5,24 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
 type pointClockModel struct {
 	finite  map[uint32]uint32
 	retired map[uint32]bool
+}
+
+func equalFiniteRuns(left, right []finiteRun) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := 0; i < len(left); i++ {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func newPointClockModel() *pointClockModel {
@@ -842,6 +855,264 @@ func TestVectorClockReusesRetainedMetadataForStructuralGrowth(t *testing.T) {
 		retiredIncoming[1] != (RetiredRange{First: ^uint32(0) - 2, Last: ^uint32(0)}) {
 		t.Fatalf("retirement merge mutated input: %+v", retiredIncoming)
 	}
+}
+
+func TestVectorClockSparseDominatingJoinReusesDestinationStorage(t *testing.T) {
+	dst, incoming := New(), New()
+	for i := uint32(0); i < 32; i++ {
+		tid := uint32(1<<20) + i*3
+		dst.Set(tid, i+1)
+		incoming.Set(tid, i+101)
+	}
+	// The incoming layout also contains coordinates absent from dst, while dst
+	// has enough retained capacity for the exact replacement.
+	incoming.Set(1<<22, 999)
+	dst.sparseRuns = append(make([]finiteRun, 0, len(incoming.sparseRuns)), dst.sparseRuns...)
+	if allocs := testing.AllocsPerRun(1000, func() {
+		for i := range dst.sparseRuns {
+			dst.sparseRuns[i].Clock = uint32(i + 1)
+		}
+		dst.Join(incoming)
+	}); allocs != 0 {
+		t.Fatalf("dominating sparse join allocated %.2f objects with retained capacity", allocs)
+	}
+	if !incoming.LessOrEqual(dst) || !dst.LessOrEqual(incoming) {
+		t.Fatal("dominating sparse replacement changed the exact union")
+	}
+	dst.Release()
+	incoming.Release()
+}
+
+func TestVectorClockSparseDominatingJoinPreservesRetirement(t *testing.T) {
+	dst, incoming := New(), New()
+	dst.Set(1<<20, 3)
+	dst.RetireRange(1<<21, 1<<21+2)
+	incoming.JoinRange(1<<20, 1<<22, 9)
+	dst.Join(incoming)
+	if got := dst.Get(1 << 20); got != 9 {
+		t.Fatalf("finite union clock = %d, want 9", got)
+	}
+	for tid := uint32(1 << 21); tid <= uint32(1<<21+2); tid++ {
+		if !dst.IsRetired(tid) {
+			t.Fatalf("retired coordinate %d was resurrected", tid)
+		}
+	}
+	if got := dst.Get(1 << 22); got != 9 {
+		t.Fatalf("post-retirement finite clock = %d, want 9", got)
+	}
+	dst.Release()
+	incoming.Release()
+}
+
+func TestVectorClockSparseDominatingJoinWithDisjointRetirement(t *testing.T) {
+	dst, incoming := New(), New()
+	dst.Set(1<<20, 3)
+	dst.RetireRange(1<<22, 1<<22+2)
+	incoming.Set(1<<20, 9)
+	incoming.Set(1<<21, 11)
+	dst.sparseRuns = append(make([]finiteRun, 0, len(incoming.sparseRuns)), dst.sparseRuns...)
+
+	// Holding the general-join scratch lease makes an allocation unavoidable if
+	// the exact dominating-replacement shortcut is not selected.
+	shard := &poolShards[dst.poolShard]
+	shard.joinLock.Store(1)
+	allocs := testing.AllocsPerRun(1000, func() {
+		dst.sparseRuns = dst.sparseRuns[:1]
+		dst.sparseRuns[0] = finiteRun{First: 1 << 20, Last: 1 << 20, Clock: 3}
+		dst.Join(incoming)
+	})
+	shard.joinLock.Store(0)
+	if allocs != 0 {
+		t.Fatalf("dominating sparse join with disjoint retirement allocated %.2f objects", allocs)
+	}
+	if !incoming.LessOrEqual(dst) || !dst.IsRetired(1<<22) {
+		t.Fatal("dominating replacement lost a finite or retired coordinate")
+	}
+	dst.Release()
+	incoming.Release()
+}
+
+func TestVectorClockSparseDominatingJoinClipsAtDenseFloor(t *testing.T) {
+	dst, incoming := New(), New()
+	dst.denseTail = make([]uint32, 16)
+	floor := uint32(DenseThreads + len(dst.denseTail))
+	dst.Set(floor+4, 3)
+	incoming.JoinRange(DenseThreads, floor+8, 9)
+	dst.Join(incoming)
+
+	if got := dst.Get(floor - 1); got != 9 {
+		t.Fatalf("joined dense-tail clock = %d, want 9", got)
+	}
+	if got := dst.Get(floor); got != 9 {
+		t.Fatalf("joined sparse clock at floor = %d, want 9", got)
+	}
+	if len(dst.sparseRuns) != 1 || dst.sparseRuns[0] != (finiteRun{First: floor, Last: floor + 8, Clock: 9}) {
+		t.Fatalf("clipped sparse frontier = %v, want [%d,%d]@9", dst.sparseRuns, floor, floor+8)
+	}
+	dst.Release()
+	incoming.Release()
+}
+
+func TestVectorClockGeneralSparseJoinReusesBoundedShardScratch(t *testing.T) {
+	base, incoming, dst := New(), New(), New()
+	base.JoinRange(1<<20, 1<<20+100, 5)
+	incoming.JoinRange(1<<20+20, 1<<20+30, 7)
+	dst.sparseRuns = make([]finiteRun, 0, 8)
+	shard := &poolShards[dst.poolShard]
+	if !shard.joinLock.CompareAndSwap(0, 1) {
+		t.Fatal("join scratch shard is locked")
+	}
+	shard.joinScratch = make([]finiteRun, 0, 8)
+	shard.joinLock.Store(0)
+
+	if allocs := testing.AllocsPerRun(1000, func() {
+		dst.CopyFrom(base)
+		dst.Join(incoming)
+	}); allocs != 0 {
+		t.Fatalf("general sparse join allocated %.2f objects with prewarmed shard scratch", allocs)
+	}
+	for tid := uint32(1 << 20); tid <= uint32(1<<20+100); tid++ {
+		want := uint32(5)
+		if tid >= 1<<20+20 && tid <= 1<<20+30 {
+			want = 7
+		}
+		if got := dst.Get(tid); got != want {
+			t.Fatalf("joined clock[%d] = %d, want %d", tid, got, want)
+		}
+	}
+	if len(shard.joinScratch) != 0 || cap(shard.joinScratch) == 0 {
+		t.Fatal("general join did not retain an empty shard snapshot backing")
+	}
+	shard.joinScratch = nil
+	base.Release()
+	incoming.Release()
+	dst.Release()
+}
+
+func TestVectorClockGeneralSparseJoinDoesNotRetainOversizedShardScratch(t *testing.T) {
+	dst, incoming := New(), New()
+	oversizedRuns := int(maxPooledMetadataBytes/unsafe.Sizeof(FiniteRange{})) + 1
+	dst.sparseRuns = append(make([]finiteRun, 0, oversizedRuns),
+		finiteRun{First: 1 << 20, Last: 1<<20 + 100, Clock: 5})
+	shard := &poolShards[dst.poolShard]
+	if !shard.joinLock.CompareAndSwap(0, 1) {
+		t.Fatal("join scratch shard is locked")
+	}
+	retained := make([]finiteRun, 0, 8)
+	shard.joinScratch = retained
+	shard.joinLock.Store(0)
+	incoming.JoinRange(1<<20+20, 1<<20+30, 7)
+	dst.Join(incoming)
+	if cap(shard.joinScratch) != cap(retained) {
+		t.Fatalf("oversized snapshot displaced bounded shard scratch: capacity %d, want %d", cap(shard.joinScratch), cap(retained))
+	}
+	shard.joinScratch = nil
+	if got := dst.Get(1<<20 + 25); got != 7 {
+		t.Fatalf("oversized-fallback union clock = %d, want 7", got)
+	}
+	dst.Release()
+	incoming.Release()
+}
+
+func TestVectorClockGeneralSparseJoinFailsOpenWhenShardScratchIsBusy(t *testing.T) {
+	dst, incoming := New(), New()
+	dst.JoinRange(1<<20, 1<<20+100, 5)
+	incoming.JoinRange(1<<20+20, 1<<20+30, 7)
+	shard := &poolShards[dst.poolShard]
+	retained := make([]finiteRun, 0, 8)
+	shard.joinScratch = retained
+	shard.joinLock.Store(1)
+	dst.Join(incoming)
+	shard.joinLock.Store(0)
+	if cap(shard.joinScratch) != cap(retained) {
+		t.Fatal("contended join modified the unavailable shard scratch")
+	}
+	for tid := uint32(1 << 20); tid <= uint32(1<<20+100); tid++ {
+		want := uint32(5)
+		if tid >= 1<<20+20 && tid <= 1<<20+30 {
+			want = 7
+		}
+		if got := dst.Get(tid); got != want {
+			t.Fatalf("fallback joined clock[%d] = %d, want %d", tid, got, want)
+		}
+	}
+	shard.joinScratch = nil
+	dst.Release()
+	incoming.Release()
+}
+
+func TestVectorClockGeneralSparseJoinSeedsUndersizedShardScratch(t *testing.T) {
+	dst, incoming := New(), New()
+	backing := make([]finiteRun, 2, 8)
+	backing[0] = finiteRun{First: 100, Last: 120, Clock: 1}
+	backing[1] = finiteRun{First: 140, Last: 160, Clock: 1}
+	dst.sparseRuns = backing
+	incoming.JoinRange(110, 150, 2)
+	shard := &poolShards[dst.poolShard]
+	shard.joinScratch = make([]finiteRun, 0, 1)
+
+	dst.Join(incoming)
+	if cap(shard.joinScratch) != cap(backing) {
+		t.Fatalf("allocating join retained scratch capacity %d, want seeded old receiver capacity %d",
+			cap(shard.joinScratch), cap(backing))
+	}
+	shard.joinScratch = nil
+	dst.Release()
+	incoming.Release()
+}
+
+func TestVectorClockGeneralSparseJoinExpandsBeyondInputRunCount(t *testing.T) {
+	dst, incoming := New(), New()
+	backing := make([]finiteRun, 1, 3)
+	backing[0] = finiteRun{First: 100, Last: 200, Clock: 1}
+	incoming.sparseRuns = []finiteRun{
+		{First: 120, Last: 130, Clock: 2},
+		{First: 150, Last: 160, Clock: 2},
+	}
+	shard := &poolShards[dst.poolShard]
+	shard.joinScratch = make([]finiteRun, 0, 1)
+	dst.sparseRuns = backing
+	dst.joinSparseRuns(incoming.sparseRuns)
+	want := []finiteRun{
+		{First: 100, Last: 119, Clock: 1},
+		{First: 120, Last: 130, Clock: 2},
+		{First: 131, Last: 149, Clock: 1},
+		{First: 150, Last: 160, Clock: 2},
+		{First: 161, Last: 200, Clock: 1},
+	}
+	if !equalFiniteRuns(dst.sparseRuns, want) {
+		t.Fatalf("expanding sparse union = %v, want %v", dst.sparseRuns, want)
+	}
+	shard.joinScratch = nil
+	dst.Release()
+	incoming.Release()
+}
+
+func TestVectorClockGeneralSparseJoinIncomingSplitByRetirement(t *testing.T) {
+	dst, incoming := New(), New()
+	dst.JoinRange(100, 200, 1)
+	dst.RetireRange(120, 130)
+	dst.RetireRange(150, 160)
+	incoming.JoinRange(110, 190, 2)
+	dst.Join(incoming)
+
+	want := []finiteRun{
+		{First: 100, Last: 109, Clock: 1},
+		{First: 110, Last: 119, Clock: 2},
+		{First: 131, Last: 149, Clock: 2},
+		{First: 161, Last: 190, Clock: 2},
+		{First: 191, Last: 200, Clock: 1},
+	}
+	if !equalFiniteRuns(dst.sparseRuns, want) {
+		t.Fatalf("retirement-split sparse union = %v, want %v", dst.sparseRuns, want)
+	}
+	for _, tid := range []uint32{120, 125, 130, 150, 155, 160} {
+		if !dst.IsRetired(tid) {
+			t.Fatalf("retired coordinate %d was resurrected", tid)
+		}
+	}
+	dst.Release()
+	incoming.Release()
 }
 
 func TestVectorClockRetireRangesRetainedCapacityDropsSubsumedIntervals(t *testing.T) {

@@ -46,6 +46,10 @@ type clockPoolShard struct {
 	lock  iatomic.Uint32
 	count uint8
 	slots [poolShardCapacity]*VectorClock
+	// joinScratch is a separately leased merge-input snapshot. Retention is
+	// capped at maxPooledMetadataBytes, so all shards together retain <= 1 MiB.
+	joinLock    iatomic.Uint32
+	joinScratch []finiteRun
 }
 
 var poolCursor iatomic.Uint32
@@ -406,7 +410,8 @@ func (vc *VectorClock) maybePromoteDenseTail() {
 	}
 	start := vc.denseTailEnd()
 	best, required := 0, uint64(0)
-	for i, run := range vc.sparseRuns {
+	for i := 0; i < len(vc.sparseRuns); i++ {
+		run := vc.sparseRuns[i]
 		if uint64(run.First) < start {
 			runtimeThrow("race detector vector-clock representation overlap")
 		}
@@ -438,7 +443,8 @@ func (vc *VectorClock) maybePromoteDenseTail() {
 		vc.denseTail = vc.denseTail[:newLen]
 		clear(vc.denseTail[oldLen:])
 	}
-	for _, run := range vc.sparseRuns[:best] {
+	for i := 0; i < best; i++ {
+		run := vc.sparseRuns[i]
 		first := int(uint64(run.First) - uint64(DenseThreads))
 		last := int(uint64(run.Last) + 1 - uint64(DenseThreads))
 		for i := first; i < last; i++ {
@@ -906,12 +912,35 @@ func (vc *VectorClock) joinSparseRuns(other []finiteRun) {
 	if sparseRangesLessOrEqual(other, floor, vc.sparseRuns, vc.retired) {
 		return
 	}
+	// When the incoming sparse frontier dominates every owned destination run,
+	// the pointwise union is exactly the incoming layout. Replacing in retained
+	// destination storage avoids allocating a temporary merge result on the
+	// common acquire path. Retirement is kept separately as +infinity, so this
+	// shortcut is valid only when no incoming finite run crosses it.
+	if !sparseRunsOverlapRetiredFrom(other, floor, vc.retired) &&
+		sparseRangesLessOrEqual(vc.sparseRuns, floor, other, nil) {
+		if cap(vc.sparseRuns) < len(other) {
+			capacity := cap(vc.sparseRuns) * 2
+			if capacity < cap(vc.sparseRuns) || capacity < len(other) {
+				capacity = len(other)
+			}
+			vc.sparseRuns = make([]finiteRun, len(other), capacity)
+		} else {
+			vc.sparseRuns = vc.sparseRuns[:len(other)]
+		}
+		copy(vc.sparseRuns, other)
+		vc.sparseRuns[0].First = otherFirst
+		vc.sparseRuns = coalesceFiniteRuns(vc.sparseRuns)
+		vc.maybePromoteDenseTail()
+		return
+	}
 	if len(vc.sparseRuns) == 0 {
 		if !sparseRunsOverlapRetiredFrom(other, floor, vc.retired) {
 			if cap(vc.sparseRuns) < len(other) {
 				vc.sparseRuns = make([]finiteRun, 0, len(other))
 			}
-			for i, r := range other {
+			for i := 0; i < len(other); i++ {
+				r := other[i]
 				if i == 0 {
 					r.First = otherFirst
 				}
@@ -926,7 +955,8 @@ func (vc *VectorClock) joinSparseRuns(other []finiteRun) {
 	// receiver state, so retained destination capacity is safe to reuse.
 	if len(vc.sparseRuns) != 0 && vc.sparseRuns[len(vc.sparseRuns)-1].Last < otherFirst &&
 		!sparseRunsOverlapRetiredFrom(other, floor, vc.retired) {
-		for i, r := range other {
+		for i := 0; i < len(other); i++ {
+			r := other[i]
 			if i == 0 {
 				r.First = otherFirst
 			}
@@ -941,7 +971,8 @@ func (vc *VectorClock) joinSparseRuns(other []finiteRun) {
 	// any newly equal neighbors instead of allocating a replacement slice.
 	if len(vc.sparseRuns) == len(other) && !sparseRunsOverlapRetiredFrom(other, floor, vc.retired) {
 		sameLayout := true
-		for i, r := range other {
+		for i := 0; i < len(other); i++ {
+			r := other[i]
 			first := r.First
 			if i == 0 && first < floor {
 				first = floor
@@ -952,7 +983,8 @@ func (vc *VectorClock) joinSparseRuns(other []finiteRun) {
 			}
 		}
 		if sameLayout {
-			for i, r := range other {
+			for i := 0; i < len(other); i++ {
+				r := other[i]
 				if r.Clock > vc.sparseRuns[i].Clock {
 					vc.sparseRuns[i].Clock = r.Clock
 				}
@@ -964,17 +996,42 @@ func (vc *VectorClock) joinSparseRuns(other []finiteRun) {
 	}
 
 	const end = uint64(1) << 32
-	out := make([]finiteRun, 0, len(vc.sparseRuns)+len(other))
+	left := vc.sparseRuns
+	var out []finiteRun
+	var joinShard *clockPoolShard
+	shardIndex := int(vc.poolShard)
+	// Borrow only an already-large-enough snapshot. Otherwise the ordinary
+	// allocating merge runs without a snapshot; after it finishes, the old
+	// receiver backing can seed the bounded shard scratch for a later join.
+	// This avoids ever allocating both a snapshot and a grown output.
+	if shardIndex < poolShardCount {
+		shard := &poolShards[shardIndex]
+		if shard.joinLock.CompareAndSwap(0, 1) {
+			savedScratch := shard.joinScratch
+			if cap(savedScratch) >= len(left) {
+				joinShard = shard
+				snapshot := savedScratch[:len(left)]
+				copy(snapshot, left)
+				left = snapshot
+				out = vc.sparseRuns[:0]
+			} else {
+				shard.joinLock.Store(0)
+			}
+		}
+	}
+	if joinShard == nil {
+		out = make([]finiteRun, 0, len(left)+len(other))
+	}
 	i, j, retiredIndex := 0, 0, 0
 	pos := uint64(otherFirst)
-	if len(vc.sparseRuns) != 0 && uint64(vc.sparseRuns[0].First) < pos {
-		pos = uint64(vc.sparseRuns[0].First)
+	if len(left) != 0 && uint64(left[0].First) < pos {
+		pos = uint64(left[0].First)
 	}
 	for retiredIndex < len(vc.retired) && uint64(vc.retired[retiredIndex].Last) < pos {
 		retiredIndex++
 	}
 	for pos < end {
-		for i < len(vc.sparseRuns) && uint64(vc.sparseRuns[i].Last) < pos {
+		for i < len(left) && uint64(left[i].Last) < pos {
 			i++
 		}
 		for j < len(other) && uint64(other[j].Last) < pos {
@@ -993,8 +1050,8 @@ func (vc *VectorClock) joinSparseRuns(other []finiteRun) {
 		}
 
 		leftClock, leftNext := uint32(0), end
-		if i < len(vc.sparseRuns) {
-			r := vc.sparseRuns[i]
+		if i < len(left) {
+			r := left[i]
 			if pos < uint64(r.First) {
 				leftNext = uint64(r.First)
 			} else {
@@ -1036,6 +1093,21 @@ func (vc *VectorClock) joinSparseRuns(other []finiteRun) {
 		pos = next
 	}
 	vc.sparseRuns = out
+	if joinShard != nil {
+		joinShard.joinScratch = left[:0]
+		joinShard.joinLock.Store(0)
+	} else if shardIndex < poolShardCount && cap(left) != 0 &&
+		uintptr(cap(left))*unsafe.Sizeof(FiniteRange{}) <= maxPooledMetadataBytes {
+		// The allocating merge no longer reads the receiver's old private
+		// backing. Publish it only when it improves the bounded shard buffer.
+		shard := &poolShards[shardIndex]
+		if shard.joinLock.CompareAndSwap(0, 1) {
+			if cap(shard.joinScratch) < cap(left) {
+				shard.joinScratch = left[:0]
+			}
+			shard.joinLock.Store(0)
+		}
+	}
 	vc.maybePromoteDenseTail()
 }
 
@@ -1068,7 +1140,8 @@ func sparseRunsOverlapRetiredFrom(runs []finiteRun, floor uint32, retired []Reti
 
 func sparseRangesLessOrEqual(left []finiteRun, floor uint32, right []finiteRun, rightRetired []RetiredRange) bool {
 	runIndex, retiredIndex := 0, 0
-	for _, l := range left {
+	for i := 0; i < len(left); i++ {
+		l := left[i]
 		cursor := uint64(l.First)
 		if cursor < uint64(floor) {
 			cursor = uint64(floor)
@@ -1895,7 +1968,8 @@ func (vc *VectorClock) replaceSparseRun(index, remove int, replacement []finiteR
 
 func coalesceFiniteRuns(runs []finiteRun) []finiteRun {
 	out := 0
-	for _, r := range runs {
+	for i := 0; i < len(runs); i++ {
+		r := runs[i]
 		if r.Clock == 0 || r.First > r.Last {
 			continue
 		}
@@ -2359,7 +2433,8 @@ func (vc *VectorClock) rangeProjectionRuns(visit func(first, last, clock uint32)
 			return
 		}
 	}
-	for _, run := range vc.sparseRuns {
+	for i := 0; i < len(vc.sparseRuns); i++ {
+		run := vc.sparseRuns[i]
 		if !emit(run.First, run.Last, run.Clock) {
 			return
 		}
