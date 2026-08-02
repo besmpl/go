@@ -12,8 +12,12 @@ const (
 )
 
 type ReleaseProjection struct {
-	base           *ClockSnapshot
-	denseTail      []uint32
+	base      *ClockSnapshot
+	denseTail []uint32
+	// denseOwned distinguishes the detached backing used by prepared-owner
+	// capture from the ordinary borrowed/shared VectorClock backing. Only an
+	// owned backing may be overwritten by RepinReleaseProjectionForPreparedOwner.
+	denseOwned     bool
 	roots          [CausalRootCapacity]CausalView
 	finite         [ReleaseProjectionFiniteCapacity]FiniteRange
 	retired        [ReleaseProjectionRetiredCapacity]RetiredRange
@@ -155,10 +159,117 @@ func PinReleaseProjectionForPreparedOwner(vc *VectorClock, ownerTID uint32) Rele
 			dense := make([]uint32, len(projection.denseTail))
 			copy(dense, projection.denseTail)
 			projection.denseTail = dense
+			projection.denseOwned = true
 			vc.denseTailShared = wasShared
 		}
 	}
 	return projection
+}
+
+// RepinReleaseProjectionForPreparedOwner replaces out with an exact capture of
+// vc while reusing projection-owned buffers when possible. Atomic release
+// publication calls this while its state lock excludes readers, so the old
+// projection can be released before the replacement is installed. Borrowed
+// dense backings are never reused: they may still be the mutable storage of the
+// clock from which they were captured.
+func RepinReleaseProjectionForPreparedOwner(vc *VectorClock, ownerTID uint32, out *ReleaseProjection) {
+	if out == nil {
+		return
+	}
+	if vc == nil {
+		out.Release()
+		return
+	}
+	// Retain the complete incoming root set before dropping the old projection.
+	// This keeps repin all-or-nothing across the only explicit fallible lifecycle
+	// operation and permits the old and new images to share lineage families.
+	var retainedRoots [CausalRootCapacity]CausalView
+	retainedN := 0
+	for i := 0; i < int(vc.causal.count); i++ {
+		root, ok := vc.causal.roots[i].Duplicate()
+		if !ok {
+			for j := 0; j < retainedN; j++ {
+				retainedRoots[j].Release()
+			}
+			runtimeThrow("race detector repinned a released causal clock root")
+		}
+		retainedRoots[retainedN] = root
+		retainedN++
+	}
+
+	var reusableDense []uint32
+	if out.denseOwned {
+		reusableDense = out.denseTail
+	}
+	reusableFinite := out.dynamicFinite
+	reusableRetired := out.dynamicRetired
+	for i := 0; i < int(out.rootN); i++ {
+		out.roots[i].Release()
+	}
+	*out = ReleaseProjection{}
+	copy(out.roots[:retainedN], retainedRoots[:retainedN])
+	out.rootN = uint8(retainedN)
+
+	finiteN := 0
+	vc.rangeProjectionRuns(func(_, _, _ uint32) bool {
+		finiteN++
+		return true
+	})
+	out.base = vc.base
+	if finiteN <= ReleaseProjectionFiniteCapacity {
+		out.finiteN = uint8(finiteN)
+		i := 0
+		vc.rangeProjectionRuns(func(first, last, clock uint32) bool {
+			out.finite[i] = FiniteRange{First: first, Last: last, Clock: clock}
+			i++
+			return true
+		})
+	} else {
+		if cap(reusableFinite) < finiteN {
+			reusableFinite = make([]FiniteRange, finiteN)
+		} else {
+			reusableFinite = reusableFinite[:finiteN]
+		}
+		i := 0
+		vc.rangeProjectionRuns(func(first, last, clock uint32) bool {
+			reusableFinite[i] = FiniteRange{First: first, Last: last, Clock: clock}
+			i++
+			return true
+		})
+		out.dynamicFinite = reusableFinite
+	}
+	if len(vc.retired) <= ReleaseProjectionRetiredCapacity {
+		out.retiredN = uint8(len(vc.retired))
+		copy(out.retired[:], vc.retired)
+	} else {
+		if cap(reusableRetired) < len(vc.retired) {
+			reusableRetired = make([]RetiredRange, len(vc.retired))
+		} else {
+			reusableRetired = reusableRetired[:len(vc.retired)]
+		}
+		copy(reusableRetired, vc.retired)
+		out.dynamicRetired = reusableRetired
+	}
+	if len(vc.denseTail) == 0 {
+		return
+	}
+	ownerInDense := false
+	if ownerTID >= DenseThreads {
+		ownerInDense = uint64(ownerTID)-DenseThreads < uint64(len(vc.denseTail))
+	}
+	if ownerInDense {
+		if cap(reusableDense) < len(vc.denseTail) {
+			reusableDense = make([]uint32, len(vc.denseTail))
+		} else {
+			reusableDense = reusableDense[:len(vc.denseTail)]
+		}
+		copy(reusableDense, vc.denseTail)
+		out.denseTail = reusableDense
+		out.denseOwned = true
+		return
+	}
+	out.denseTail = vc.denseTail
+	vc.denseTailShared = true
 }
 
 func (p *ReleaseProjection) appendDenseRanges(finite *[]FiniteRange) {

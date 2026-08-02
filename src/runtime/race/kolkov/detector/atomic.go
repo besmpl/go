@@ -1603,18 +1603,14 @@ func (s *atomicState) publishRelease(ctx *goroutine.RaceContext, mask uint8) {
 				// projection instead of flattening the process-wide frontier into a
 				// new lineage anchor. The primary lineage remains independently
 				// appendable for later strong owner-only publications.
-				projection := vectorclock.PinReleaseProjectionForPreparedOwner(ctx.C, ctx.TID)
-				nextDeferred := new(vectorclock.ReleaseProjection)
-				*nextDeferred = projection
-				oldDeferred := release.deferred
-				release.deferred = nextDeferred
+				if release.deferred == nil {
+					release.deferred = new(vectorclock.ReleaseProjection)
+				}
+				vectorclock.RepinReleaseProjectionForPreparedOwner(ctx.C, ctx.TID, release.deferred)
 				clearAtomicReleaseImports(release)
 				bumpAtomicReleaseStructureVersion(release)
 				bumpAtomicReleaseVersion(release)
 				release.deltaN, release.deltaAt = 0, 0
-				if oldDeferred != nil {
-					oldDeferred.Release()
-				}
 				ctx.RecordAtomicReleaseStructure(unsafe.Pointer(release), release.stream, release.version, release.structureVersion, membership, true)
 				return
 			}

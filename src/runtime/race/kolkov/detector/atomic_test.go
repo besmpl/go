@@ -2217,6 +2217,7 @@ func TestAtomicPromotedCompositeOverflowFallsBackToExactDeferredProjection(t *te
 	if dataRelease.deferred == nil {
 		t.Fatal("overflow fallback did not retain deferred exact projection")
 	}
+	deferred := dataRelease.deferred
 	if !dataRelease.view.SameFamily(oldPrimary) {
 		t.Fatal("overflow fallback replaced primary family")
 	}
@@ -2225,6 +2226,21 @@ func TestAtomicPromotedCompositeOverflowFallsBackToExactDeferredProjection(t *te
 		if got := releaseClockForTest(dataRelease, tid); got != want {
 			t.Fatalf("overflow fallback clock[%d] = %d, want %d", tid, got, want)
 		}
+	}
+
+	// A later weak publication replaces the exact deferred image under the
+	// same state lock. The wrapper and its owned buffers are reusable; retaining
+	// the prior object would recreate the allocation churn this fallback avoids.
+	const laterTID = uint32(239_199)
+	overflow.C.Set(laterTID, 41)
+	overflow.NoteForeignImport()
+	overflow.IncrementClock()
+	dataState.publishRelease(overflow, 1)
+	if dataRelease.deferred != deferred {
+		t.Fatal("repeated weak publication replaced deferred projection wrapper")
+	}
+	if got := releaseClockForTest(dataRelease, laterTID); got != 41 {
+		t.Fatalf("repinned fallback clock[%d] = %d, want 41", laterTID, got)
 	}
 }
 

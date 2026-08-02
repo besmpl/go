@@ -153,6 +153,117 @@ func TestReleaseProjectionPreservesPreparedDenseOwnerWrite(t *testing.T) {
 	source.Release()
 }
 
+func TestRepinReleaseProjectionReusesOwnedPreparedBuffers(t *testing.T) {
+	source := New()
+	for i := uint32(0); i < 256; i++ {
+		source.Set(DenseThreads+i, i&1+1)
+	}
+	for i := uint32(0); i < ReleaseProjectionFiniteCapacity+2; i++ {
+		source.Set(1<<20+i*2, 100+i)
+	}
+	for i := uint32(0); i < ReleaseProjectionRetiredCapacity+2; i++ {
+		tid := uint32(1<<21) + i*3
+		source.RetireRange(tid, tid)
+	}
+	const ownerTID = DenseThreads + 100
+	source.PrepareKnownMonotonicSet(ownerTID)
+
+	var projection ReleaseProjection
+	RepinReleaseProjectionForPreparedOwner(source, ownerTID, &projection)
+	if !projection.denseOwned || len(projection.denseTail) == 0 || len(projection.dynamicFinite) == 0 || len(projection.dynamicRetired) == 0 {
+		t.Fatal("test did not create reusable projection-owned buffers")
+	}
+	dense := &projection.denseTail[0]
+	finite := &projection.dynamicFinite[0]
+	retired := &projection.dynamicRetired[0]
+	old := source.Get(ownerTID)
+	if allocs := testing.AllocsPerRun(100, func() {
+		RepinReleaseProjectionForPreparedOwner(source, ownerTID, &projection)
+		old++
+		source.SetKnownMonotonicAlive(ownerTID, old)
+	}); allocs != 0 {
+		t.Fatalf("steady repin allocations = %v, want 0", allocs)
+	}
+	if &projection.denseTail[0] != dense || &projection.dynamicFinite[0] != finite || &projection.dynamicRetired[0] != retired {
+		t.Fatal("steady repin replaced reusable backing")
+	}
+	if got := projection.get(ownerTID); got != old-1 {
+		t.Fatalf("repinned owner clock = %d, want %d", got, old-1)
+	}
+	if source.denseTailShared {
+		t.Fatal("owned repin made prepared source backing shared")
+	}
+	projection.Release()
+	source.Release()
+}
+
+func TestRepinReleaseProjectionNeverOverwritesBorrowedDenseBacking(t *testing.T) {
+	source := New()
+	for i := uint32(0); i < 256; i++ {
+		source.Set(DenseThreads+i, i+1)
+	}
+	const ownerTID = DenseThreads + 100
+	want := source.Get(ownerTID)
+	projection := PinReleaseProjection(source)
+	if projection.denseOwned || &projection.denseTail[0] != &source.denseTail[0] {
+		t.Fatal("test did not begin with borrowed dense backing")
+	}
+
+	RepinReleaseProjectionForPreparedOwner(source, ownerTID, &projection)
+	if !projection.denseOwned || &projection.denseTail[0] == &source.denseTail[0] {
+		t.Fatal("repin reused borrowed source backing")
+	}
+	projection.denseTail[ownerTID-DenseThreads]++
+	if got := source.Get(ownerTID); got != want {
+		t.Fatalf("projection mutation changed source clock: got %d want %d", got, want)
+	}
+	projection.Release()
+	source.Release()
+}
+
+func TestRepinReleaseProjectionTransfersRootOwnershipExactly(t *testing.T) {
+	anchorA, anchorB := New(), New()
+	anchorA.Set(701, 11)
+	anchorB.Set(702, 12)
+	lineageA, lineageB := NewClockLineage(anchorA), NewClockLineage(anchorB)
+	viewA, viewB := lineageA.Pin(), lineageB.Pin()
+	sourceA, sourceB := New(), New()
+	if !sourceA.TryJoinCausal(viewA) || !sourceB.TryJoinCausal(viewB) {
+		t.Fatal("failed to install source roots")
+	}
+	refsA, refsB := viewA.segment.refs.Load(), viewB.segment.refs.Load()
+
+	var projection ReleaseProjection
+	RepinReleaseProjectionForPreparedOwner(sourceA, 1, &projection)
+	if got := viewA.segment.refs.Load(); got != refsA+1 {
+		t.Fatalf("first root refs = %d, want %d", got, refsA+1)
+	}
+	RepinReleaseProjectionForPreparedOwner(sourceA, 1, &projection)
+	if got := viewA.segment.refs.Load(); got != refsA+1 {
+		t.Fatalf("repeated root refs = %d, want %d", got, refsA+1)
+	}
+	RepinReleaseProjectionForPreparedOwner(sourceB, 1, &projection)
+	if got := viewA.segment.refs.Load(); got != refsA {
+		t.Fatalf("replaced old root refs = %d, want %d", got, refsA)
+	}
+	if got := viewB.segment.refs.Load(); got != refsB+1 {
+		t.Fatalf("replacement root refs = %d, want %d", got, refsB+1)
+	}
+	projection.Release()
+	if got := viewB.segment.refs.Load(); got != refsB {
+		t.Fatalf("released replacement refs = %d, want %d", got, refsB)
+	}
+
+	sourceA.Release()
+	sourceB.Release()
+	viewA.Release()
+	viewB.Release()
+	lineageA.Release()
+	lineageB.Release()
+	anchorA.Release()
+	anchorB.Release()
+}
+
 func TestTryReleaseProjectionRejectsPreparedDenseOwner(t *testing.T) {
 	source := New()
 	for i := uint32(0); i < 256; i++ {
@@ -373,4 +484,33 @@ func BenchmarkPinReleaseProjectionLargeOverlay(b *testing.B) {
 	view.Release()
 	lineage.Release()
 	anchor.Release()
+}
+
+func BenchmarkRepinReleaseProjectionPreparedDense(b *testing.B) {
+	source := New()
+	for i := uint32(0); i < 4096; i++ {
+		source.Set(DenseThreads+i, i&1+1)
+	}
+	const ownerTID = DenseThreads + 2048
+	source.PrepareKnownMonotonicSet(ownerTID)
+
+	b.Run("fresh", func(b *testing.B) {
+		b.ReportAllocs()
+		for range b.N {
+			projection := PinReleaseProjectionForPreparedOwner(source, ownerTID)
+			projection.Release()
+		}
+	})
+	b.Run("reuse", func(b *testing.B) {
+		var projection ReleaseProjection
+		RepinReleaseProjectionForPreparedOwner(source, ownerTID, &projection)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			RepinReleaseProjectionForPreparedOwner(source, ownerTID, &projection)
+		}
+		b.StopTimer()
+		projection.Release()
+	})
+	source.Release()
 }
