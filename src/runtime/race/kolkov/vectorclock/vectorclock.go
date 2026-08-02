@@ -206,6 +206,18 @@ func (s *causalRootSet) IsRetired(tid uint32) bool {
 	return false
 }
 
+func (s *causalRootSet) anchorDominatesAlignedBlock(first, clock uint32) bool {
+	if s == nil {
+		return false
+	}
+	for i := 0; i < int(s.count); i++ {
+		if s.roots[i].anchorDominatesAlignedBlock(first, clock) {
+			return true
+		}
+	}
+	return false
+}
+
 // FiniteRange is one inclusive, non-zero vector-clock run. Bulk callers pass
 // sorted, non-overlapping ranges to JoinRanges.
 type FiniteRange struct {
@@ -1295,12 +1307,7 @@ func (vc *VectorClock) PruneEventSetLessOrEqual(observed *VectorClock) {
 	vc.rangeOwnedRuns(func(first, last, clock uint32) bool {
 		width := uint64(last) - uint64(first) + 1
 		total += width
-		for tid := uint64(first); tid <= uint64(last); tid++ {
-			id := uint32(tid)
-			if !observed.IsRetired(id) && observed.Get(id) < clock {
-				kept++
-			}
-		}
+		kept += observed.countUnobservedEventRange(first, last, clock)
 		return true
 	})
 	if kept == total {
@@ -1325,9 +1332,41 @@ func (vc *VectorClock) PruneEventSetLessOrEqual(observed *VectorClock) {
 	vc.prunePartialCompositeEventSet(observed)
 }
 
+func (observed *VectorClock) countUnobservedEventRange(first, last, clock uint32) uint64 {
+	var kept uint64
+	for pos, limit := uint64(first), uint64(last); pos <= limit; {
+		if pos%clockImageDenseMinBlock == 0 && pos+clockImageDenseMinBlock-1 <= limit &&
+			observed.causal.anchorDominatesAlignedBlock(uint32(pos), clock) {
+			pos += clockImageDenseMinBlock
+			continue
+		}
+		if observed.Get(uint32(pos)) < clock {
+			kept++
+		}
+		pos++
+	}
+	return kept
+}
+
+func (observed *VectorClock) appendUnobservedEventRange(out []finiteRun, first, last, clock uint32) []finiteRun {
+	for pos, limit := uint64(first), uint64(last); pos <= limit; {
+		if pos%clockImageDenseMinBlock == 0 && pos+clockImageDenseMinBlock-1 <= limit &&
+			observed.causal.anchorDominatesAlignedBlock(uint32(pos), clock) {
+			pos += clockImageDenseMinBlock
+			continue
+		}
+		if observed.Get(uint32(pos)) < clock {
+			id := uint32(pos)
+			out = appendFiniteRun(out, finiteRun{First: id, Last: id, Clock: clock})
+		}
+		pos++
+	}
+	return out
+}
+
 func (vc *VectorClock) pruneOwnedDenseEvents(observed *VectorClock) {
 	for tid := uint32(0); tid <= uint32(vc.maxDense); tid++ {
-		if clock := vc.clocks[tid]; clock != 0 && (observed.IsRetired(tid) || observed.Get(tid) >= clock) {
+		if clock := vc.clocks[tid]; clock != 0 && observed.Get(tid) >= clock {
 			vc.clocks[tid] = 0
 		}
 	}
@@ -1337,7 +1376,7 @@ func (vc *VectorClock) pruneOwnedDenseEvents(observed *VectorClock) {
 	vc.detachDenseTail()
 	for i, clock := range vc.denseTail {
 		tid := uint32(DenseThreads + i)
-		if clock != 0 && (observed.IsRetired(tid) || observed.Get(tid) >= clock) {
+		if clock != 0 && observed.Get(tid) >= clock {
 			vc.denseTail[i] = 0
 		}
 	}
@@ -1348,7 +1387,7 @@ func (vc *VectorClock) prunePartialSingletonEventSet(observed *VectorClock) {
 	oldSparse := vc.sparseRuns
 	out := oldSparse[:0]
 	for _, run := range oldSparse {
-		if !observed.IsRetired(run.First) && observed.Get(run.First) < run.Clock {
+		if observed.Get(run.First) < run.Clock {
 			out = append(out, run)
 		}
 	}
@@ -1377,12 +1416,7 @@ func (vc *VectorClock) prunePartialCompositeEventSet(observed *VectorClock) {
 	oldSparse := vc.sparseRuns
 	out := oldSparse[:0]
 	for _, run := range sparse {
-		for tid := uint64(run.First); tid <= uint64(run.Last); tid++ {
-			id := uint32(tid)
-			if !observed.IsRetired(id) && observed.Get(id) < run.Clock {
-				out = appendFiniteRun(out, finiteRun{First: id, Last: id, Clock: run.Clock})
-			}
-		}
+		out = observed.appendUnobservedEventRange(out, run.First, run.Last, run.Clock)
 	}
 	if len(out) < len(oldSparse) {
 		clear(oldSparse[len(out):])

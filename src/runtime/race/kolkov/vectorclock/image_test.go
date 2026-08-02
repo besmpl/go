@@ -147,6 +147,58 @@ func TestClockImageDenseTailForContiguousCoordinates(t *testing.T) {
 	}
 }
 
+func TestClockImageAlignedBlockDominance(t *testing.T) {
+	const coordinates = 128
+	ranges := make([]FiniteRange, coordinates)
+	for i := range ranges {
+		tid := uint32(DenseThreads + i)
+		ranges[i] = FiniteRange{First: tid, Last: tid, Clock: uint32(i&1)*2 + 7}
+	}
+	vc := New()
+	vc.JoinCanonicalRanges(ranges)
+	vc.RetireRange(DenseThreads+17, DenseThreads+17)
+	image := newClockImage(vc)
+	if len(image.denseTailMin) != 2 || cap(image.denseTail) != len(image.denseTail) {
+		t.Fatalf("dense minima layout = %d blocks, tail len/cap %d/%d", len(image.denseTailMin), len(image.denseTail), cap(image.denseTail))
+	}
+	if !image.dominatesAlignedBlock(DenseThreads, 7) {
+		t.Fatal("dense anchor did not prove its exact block minimum")
+	}
+	if image.dominatesAlignedBlock(DenseThreads, 8) {
+		t.Fatal("dense anchor proved a threshold above its block minimum")
+	}
+
+	vc.Set(DenseThreads+33, 0)
+	withGap := newClockImage(vc)
+	if withGap.dominatesAlignedBlock(DenseThreads, 1) {
+		t.Fatal("dense anchor proved a block containing a live zero gap")
+	}
+
+	const sparseFirst = uint32(100_032)
+	sparse := New()
+	sparse.JoinRange(sparseFirst, sparseFirst+63, 11)
+	sparseImage := newClockImage(sparse)
+	if !sparseImage.dominatesAlignedBlock(sparseFirst, 11) || sparseImage.dominatesAlignedBlock(sparseFirst, 12) {
+		t.Fatal("sparse covering-run dominance proof is inexact")
+	}
+
+	retired := New()
+	const retiredFirst = ^uint32(0) - 63
+	retired.RetireRange(retiredFirst, ^uint32(0))
+	retiredImage := newClockImage(retired)
+	if !retiredImage.dominatesAlignedBlock(retiredFirst, ^uint32(0)) {
+		t.Fatal("max-TID retirement block did not dominate a finite epoch")
+	}
+
+	if allocs := testing.AllocsPerRun(1000, func() {
+		_ = image.dominatesAlignedBlock(DenseThreads, 7)
+		_ = sparseImage.dominatesAlignedBlock(sparseFirst, 11)
+		_ = retiredImage.dominatesAlignedBlock(retiredFirst, 1)
+	}); allocs != 0 {
+		t.Fatalf("aligned block proofs allocated %.2f objects", allocs)
+	}
+}
+
 func TestClockImageMutationIsolationAndAppend(t *testing.T) {
 	source := New()
 	source.Set(1, 3)

@@ -1039,6 +1039,13 @@ func (v CausalView) IsRetired(tid uint32) bool {
 	return v.segment != nil && v.segment.anchor.IsRetired(tid)
 }
 
+// anchorDominatesAlignedBlock is a borrowed, allocation-free lower-bound
+// proof. Every point update after a segment anchor is monotonic, so a block
+// dominated by the anchor is dominated by every version pinned in the segment.
+func (v CausalView) anchorDominatesAlignedBlock(first, clock uint32) bool {
+	return v.segment != nil && v.segment.anchor.dominatesAlignedBlock(first, clock)
+}
+
 // MaxTID returns the largest finite or retired TID in the exact view.
 func (v CausalView) MaxTID() uint32 {
 	clock := v.materialize()

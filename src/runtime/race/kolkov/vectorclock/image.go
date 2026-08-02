@@ -6,12 +6,15 @@ package vectorclock
 // never mutated afterwards, so its read methods require neither locks nor
 // allocation.
 type clockImage struct {
-	clocks     [DenseThreads]uint32
-	maxDense   uint16
-	denseTail  []uint32
-	sparseRuns []finiteRun
-	retired    []RetiredRange
+	clocks       [DenseThreads]uint32
+	maxDense     uint16
+	denseTail    []uint32
+	denseTailMin []uint32
+	sparseRuns   []finiteRun
+	retired      []RetiredRange
 }
+
+const clockImageDenseMinBlock = uint64(DenseThreads)
 
 // clockImageSource supplies canonical finite and retired ranges. Construction
 // is the only allocating operation; reads operate solely on the resulting flat
@@ -79,7 +82,11 @@ func buildClockImage(source clockImageSource) *clockImage {
 	})
 
 	if denseEnd > DenseThreads {
-		image.denseTail = make([]uint32, int(denseEnd-DenseThreads))
+		denseLength := int(denseEnd - DenseThreads)
+		minBlocks := denseLength / int(clockImageDenseMinBlock)
+		backing := make([]uint32, denseLength+minBlocks)
+		image.denseTail = backing[:denseLength:denseLength]
+		image.denseTailMin = backing[denseLength:]
 	}
 	if sparseCapacity := highRuns - denseRuns; sparseCapacity != 0 {
 		image.sparseRuns = make([]finiteRun, 0, sparseCapacity)
@@ -127,7 +134,85 @@ func buildClockImage(source clockImageSource) *clockImage {
 		image.retired = append(image.retired, RetiredRange{First: first, Last: last})
 		return true
 	})
+	image.buildDenseTailMin()
 	return image
+}
+
+// buildDenseTailMin records a logical lower bound for each immutable 64-point
+// block. Lineage point updates are monotonic, so an anchor block whose minimum
+// dominates an event epoch remains dominated by every pinned version in that
+// segment. Retired coordinates contribute +infinity, matching Get.
+func (image *clockImage) buildDenseTailMin() {
+	if image == nil || len(image.denseTailMin) == 0 {
+		return
+	}
+	for block := uint64(0); block < uint64(len(image.denseTailMin)); block++ {
+		first := block * clockImageDenseMinBlock
+		last := first + clockImageDenseMinBlock
+		minimum := ^uint32(0)
+		for offset := first; offset < last; offset++ {
+			clock := image.denseTail[offset]
+			if image.IsRetired(uint32(DenseThreads + offset)) {
+				clock = ^uint32(0)
+			}
+			if clock < minimum {
+				minimum = clock
+			}
+		}
+		image.denseTailMin[block] = minimum
+	}
+}
+
+// dominatesAlignedBlock reports an exact lower-bound proof for one complete,
+// aligned block. Dense-tail minima make the common contiguous-cohort proof
+// constant time; one covering sparse finite or retirement run is also enough.
+// False is conservative for mixed structural coverage.
+func (image *clockImage) dominatesAlignedBlock(first, clock uint32) bool {
+	if image == nil || clock == 0 {
+		return clock == 0
+	}
+	last64 := uint64(first) + clockImageDenseMinBlock - 1
+	if last64 > uint64(^uint32(0)) ||
+		uint64(first)%clockImageDenseMinBlock != 0 {
+		return false
+	}
+	last := uint32(last64)
+	if first < DenseThreads {
+		for tid := first; tid <= last; tid++ {
+			if image.Get(tid) < clock {
+				return false
+			}
+		}
+		return true
+	}
+	offset := uint64(first) - DenseThreads
+	if offset+clockImageDenseMinBlock <= uint64(len(image.denseTail)) {
+		block := offset / clockImageDenseMinBlock
+		return block < uint64(len(image.denseTailMin)) && image.denseTailMin[block] >= clock
+	}
+	lo, hi := 0, len(image.retired)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if image.retired[mid].Last < first {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo < len(image.retired) && image.retired[lo].First <= first && image.retired[lo].Last >= last {
+		return true
+	}
+	lo, hi = 0, len(image.sparseRuns)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if image.sparseRuns[mid].Last < first {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo < len(image.sparseRuns) && image.sparseRuns[lo].First <= first &&
+		image.sparseRuns[lo].Last >= last && image.sparseRuns[lo].Clock >= clock
 }
 
 // IsRetired reports whether tid has immutable +infinity causal metadata.

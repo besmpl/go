@@ -409,6 +409,148 @@ func TestPrunePathologicallyWideCoalescedEventSetFallsBackExactly(t *testing.T) 
 	anchor.Release()
 }
 
+func TestPruneCoalescedEventSetUsesDenseAnchorBlocksExactly(t *testing.T) {
+	const first = uint32(DenseThreads)
+	const eventsN = uint32(1024)
+	events := New()
+	events.JoinRange(first, first+eventsN-1, 7)
+	anchor := New()
+	for offset := uint32(0); offset < eventsN; offset++ {
+		clock := uint32(7)
+		if offset&1 != 0 {
+			clock = 9
+		}
+		anchor.Set(first+offset, clock)
+	}
+	lineage := NewClockLineage(anchor)
+	view := lineage.Pin()
+	observed := New()
+	if !observed.TryJoinCausal(view) {
+		t.Fatal("failed to install dense causal anchor")
+	}
+	refs := view.segment.refs.Load()
+
+	events.PruneEventSetLessOrEqual(observed)
+	if len(events.sparseRuns) != 0 || len(events.denseTail) != 0 {
+		t.Fatalf("fully dominated dense-anchor event set survived: dense=%d sparse=%+v", len(events.denseTail), events.sparseRuns)
+	}
+	if !observed.causal.Valid() || view.segment.refs.Load() != refs {
+		t.Fatal("dense block proof changed observer ownership or representation")
+	}
+
+	events.Release()
+	observed.Release()
+	view.Release()
+	lineage.Release()
+	anchor.Release()
+}
+
+func TestPruneCoalescedEventSetDenseAnchorGapFallsBackExactly(t *testing.T) {
+	const first = uint32(DenseThreads)
+	const eventsN = uint32(128)
+	const gap = first + 73
+	events := New()
+	events.JoinRange(first, first+eventsN-1, 5)
+	anchor := New()
+	for offset := uint32(0); offset < eventsN; offset++ {
+		if tid := first + offset; tid != gap {
+			anchor.Set(tid, 5)
+		}
+	}
+	lineage := NewClockLineage(anchor)
+	view := lineage.Pin()
+	observed := New()
+	if !observed.TryJoinCausal(view) {
+		t.Fatal("failed to install gapped dense causal anchor")
+	}
+
+	events.PruneEventSetLessOrEqual(observed)
+	for tid := first; tid < first+eventsN; tid++ {
+		want := uint32(0)
+		if tid == gap {
+			want = 5
+		}
+		if got := events.Get(tid); got != want {
+			t.Fatalf("gapped dense-anchor survivor TID %d = %d, want %d", tid, got, want)
+		}
+	}
+
+	events.Release()
+	observed.Release()
+	view.Release()
+	lineage.Release()
+	anchor.Release()
+}
+
+func TestPruneCoalescedEventSetBlockProofRespectsPinnedVersions(t *testing.T) {
+	const first = uint32(DenseThreads)
+	const eventsN = uint32(64)
+	const gap = first + 41
+	anchor := New()
+	for tid := first; tid < first+eventsN; tid++ {
+		if tid != gap {
+			anchor.Set(tid, 5)
+		}
+	}
+	lineage := NewClockLineage(anchor)
+	old := lineage.Pin()
+	if _, appended := lineage.Append(gap, 5); !appended {
+		t.Fatal("failed to append the anchor gap")
+	}
+	latest := lineage.Pin()
+	if latest.anchorDominatesAlignedBlock(first, 5) {
+		t.Fatal("mutable head incorrectly strengthened the immutable anchor proof")
+	}
+	if !lineage.Rotate() {
+		t.Fatal("failed to rotate the completed block into a new anchor")
+	}
+	current := lineage.Pin()
+
+	prune := func(view CausalView) *VectorClock {
+		events := New()
+		events.JoinRange(first, first+eventsN-1, 5)
+		observed := New()
+		if !observed.TryJoinCausal(view) {
+			t.Fatal("failed to install causal view")
+		}
+		events.PruneEventSetLessOrEqual(observed)
+		observed.Release()
+		return events
+	}
+
+	oldEvents := prune(old)
+	for tid := first; tid < first+eventsN; tid++ {
+		want := uint32(0)
+		if tid == gap {
+			want = 5
+		}
+		if got := oldEvents.Get(tid); got != want {
+			t.Fatalf("historical survivor TID %d = %d, want %d", tid, got, want)
+		}
+	}
+	latestEvents := prune(latest)
+	for tid := first; tid < first+eventsN; tid++ {
+		if got := latestEvents.Get(tid); got != 0 {
+			t.Fatalf("latest pre-rotation survivor TID %d = %d, want 0", tid, got)
+		}
+	}
+	currentEvents := prune(current)
+	for tid := first; tid < first+eventsN; tid++ {
+		if got := currentEvents.Get(tid); got != 0 {
+			t.Fatalf("current survivor TID %d = %d, want 0", tid, got)
+		}
+	}
+
+	oldEvents.Release()
+	latestEvents.Release()
+	currentEvents.Release()
+	current.Release()
+	latest.Release()
+	old.Release()
+	lineage.Release()
+	anchor.Release()
+}
+
 func BenchmarkVectorClockTryJoinCausalSameFamily(b *testing.B) {
 	anchor := New()
 	lineage := NewClockLineage(anchor)
