@@ -127,7 +127,6 @@ WaitGroupFanOut/g64
 MapReadWrite/g1
 MapReadWrite/g4
 MapReadWrite/g16
-MapReadWrite/g64
 ProducerConsumer/buf1
 ProducerConsumer/buf16
 ProducerConsumer/buf64
@@ -766,7 +765,6 @@ WaitGroupFanOut/g64
 MapReadWrite/g1
 MapReadWrite/g4
 MapReadWrite/g16
-MapReadWrite/g64
 ProducerConsumer/buf1
 ProducerConsumer/buf16
 ProducerConsumer/buf64
@@ -868,7 +866,7 @@ EOF
         [[ -s "${fixture}/benchmarks/results/raw/${label}/warmup-rss.time" ]]
         [[ ! -e "${fixture}/benchmarks/results/raw/${label}/warmup-latency.txt.samples" ]]
         [[ ! -e "${fixture}/benchmarks/results/raw/${label}/warmup-rss.stdout.samples" ]]
-        [[ "$(grep -c '^Benchmark' "${fixture}/benchmarks/results/${label}.txt")" == 93 ]]
+        [[ "$(grep -c '^Benchmark' "${fixture}/benchmarks/results/${label}.txt")" == 90 ]]
         [[ "$(grep -c '^Benchmark' "${fixture}/benchmarks/results/rss-${label}.stdout")" == 3 ]]
         [[ "$(wc -l < "${fixture}/benchmarks/results/rss-${label}-kb.txt" | tr -d '[:space:]')" == 3 ]]
     done

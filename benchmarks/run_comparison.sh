@@ -59,7 +59,6 @@ WaitGroupFanOut/g64
 MapReadWrite/g1
 MapReadWrite/g4
 MapReadWrite/g16
-MapReadWrite/g64
 ProducerConsumer/buf1
 ProducerConsumer/buf16
 ProducerConsumer/buf64
