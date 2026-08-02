@@ -398,6 +398,7 @@ func (vc *VectorClock) snapshotLogical() *ClockSnapshot {
 }
 
 func (vc *VectorClock) clearOwned() {
+	vc.invalidateDenseProjectionWitness()
 	for i := uint32(0); i <= uint32(vc.maxDense); i++ {
 		vc.clocks[i] = 0
 	}
@@ -448,6 +449,13 @@ func (vc *VectorClock) TryJoinSnapshot(snapshot *ClockSnapshot) bool {
 	// context-owned overlay remains in place and is already joined by Get.
 	if vc.base == nil || snapshotLineageLessOrEqual(vc.base, snapshot) {
 		vc.base = snapshot
+		return true
+	}
+	// The destination may also retain unrelated causal roots. Its immutable
+	// base is still an exact lower bound for the complete logical clock, so a
+	// same-lineage snapshot already dominated by that base is a no-op without
+	// inspecting or materializing the other roots.
+	if snapshotLineageLessOrEqual(snapshot, vc.base) {
 		return true
 	}
 	// Exact comparison against an unrelated causal root requires one cold

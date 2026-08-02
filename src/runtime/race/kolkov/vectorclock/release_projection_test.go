@@ -133,8 +133,16 @@ func TestReleaseProjectionPreservesPreparedDenseOwnerWrite(t *testing.T) {
 	if &projection.denseTail[0] == &source.denseTail[0] || source.denseTailShared {
 		t.Fatal("owner-aware projection invalidated the prepared dense write")
 	}
+	if projection.denseProjectionID == 0 || source.denseProjectionID != projection.denseProjectionID ||
+		source.denseProjectionOwner != uint64(ownerTID)+1 {
+		t.Fatal("owner-aware projection did not certify its copied dense tail")
+	}
 
+	certificate := source.denseProjectionID
 	source.SetKnownMonotonicAlive(ownerTID, old+1)
+	if source.denseProjectionID != certificate {
+		t.Fatal("prepared owner write invalidated its exact dense certificate")
+	}
 	if got := projection.get(ownerTID); got != old {
 		t.Fatalf("prepared source write changed projection: got %d want %d", got, old)
 	}
@@ -145,11 +153,118 @@ func TestReleaseProjectionPreservesPreparedDenseOwnerWrite(t *testing.T) {
 	if !source.ResidualLessOrEqualReleaseProjection(&noRoots, 0, &projection, ownerTID) {
 		t.Fatal("copied dense projection did not prove unchanged foreign residual")
 	}
+	if source.ResidualLessOrEqualReleaseProjection(&noRoots, 0, &projection, ownerTID+1) {
+		t.Fatal("dense certificate was accepted for the wrong excluded owner")
+	}
 	foreignTID := uint32(ownerTID + 1)
 	source.Set(foreignTID, source.Get(foreignTID)+1)
+	if source.denseProjectionID != 0 || source.denseProjectionOwner != 0 {
+		t.Fatal("foreign dense write retained a prepared-owner certificate")
+	}
 	if source.ResidualLessOrEqualReleaseProjection(&noRoots, 0, &projection, ownerTID) {
 		t.Fatal("copied dense projection accepted newer foreign residual")
 	}
+	source.Release()
+}
+
+func TestPreparedDenseProjectionCertificateInvalidation(t *testing.T) {
+	const (
+		ownerTID   = DenseThreads + 100
+		foreignTID = DenseThreads + 101
+	)
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *VectorClock)
+	}{
+		{"set", func(_ *testing.T, vc *VectorClock) { vc.Set(foreignTID, vc.Get(foreignTID)+1) }},
+		{"known-set", func(_ *testing.T, vc *VectorClock) { vc.SetKnownMonotonicAlive(foreignTID, vc.Get(foreignTID)+1) }},
+		{"increment", func(_ *testing.T, vc *VectorClock) { vc.Increment(foreignTID) }},
+		{"join", func(_ *testing.T, vc *VectorClock) {
+			other := vc.CloneDetached()
+			other.Set(foreignTID, vc.Get(foreignTID)+1)
+			vc.Join(other)
+			other.Release()
+		}},
+		{"try-join", func(t *testing.T, vc *VectorClock) {
+			other := vc.CloneDetached()
+			other.Set(foreignTID, vc.Get(foreignTID)+1)
+			if !vc.TryJoin(other) {
+				t.Fatal("equal-layout TryJoin missed")
+			}
+			other.Release()
+		}},
+		{"join-range", func(_ *testing.T, vc *VectorClock) {
+			vc.JoinRange(foreignTID, foreignTID, vc.Get(foreignTID)+1)
+		}},
+		{"join-projection", func(_ *testing.T, vc *VectorClock) {
+			other := vc.CloneDetached()
+			other.Set(foreignTID, vc.Get(foreignTID)+1)
+			incoming := PinReleaseProjection(other)
+			incoming.JoinInto(vc)
+			incoming.Release()
+			other.Release()
+		}},
+		{"prune", func(_ *testing.T, vc *VectorClock) {
+			observed := vc.CloneDetached()
+			vc.PruneLessOrEqual(observed)
+			observed.Release()
+		}},
+		{"retire", func(_ *testing.T, vc *VectorClock) { vc.RetireRange(foreignTID, foreignTID) }},
+		{"freeze", func(_ *testing.T, vc *VectorClock) { vc.Freeze() }},
+		{"reset", func(_ *testing.T, vc *VectorClock) { vc.Reset() }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source := New()
+			for i := uint32(0); i < 256; i++ {
+				source.Set(DenseThreads+i, i&1+1)
+			}
+			source.PrepareKnownMonotonicSet(ownerTID)
+			projection := PinReleaseProjectionForPreparedOwner(source, ownerTID)
+			if source.denseProjectionID == 0 {
+				t.Fatal("test did not install a dense certificate")
+			}
+			test.mutate(t, source)
+			if source.denseProjectionID != 0 || source.denseProjectionOwner != 0 {
+				t.Fatal("dense mutation retained a prepared-owner certificate")
+			}
+			projection.Release()
+			source.Release()
+		})
+	}
+}
+
+func TestPreparedDenseProjectionCertificateOwnerAndLifecycle(t *testing.T) {
+	source := New()
+	for i := uint32(0); i < 256; i++ {
+		source.Set(DenseThreads+i, i+1)
+	}
+	const ownerA = DenseThreads + 100
+	const ownerB = DenseThreads + 101
+
+	first := PinReleaseProjectionForPreparedOwner(source, ownerA)
+	firstID := first.denseProjectionID
+	second := PinReleaseProjectionForPreparedOwner(source, ownerA)
+	if second.denseProjectionID != firstID {
+		t.Fatal("same-owner capture replaced a valid dense certificate")
+	}
+	third := PinReleaseProjectionForPreparedOwner(source, ownerB)
+	if third.denseProjectionID == 0 || third.denseProjectionID == firstID || source.denseProjectionOwner != uint64(ownerB)+1 {
+		t.Fatal("different-owner capture did not replace the dense certificate")
+	}
+	clone := source.Clone()
+	if clone.denseProjectionID != 0 || clone.denseProjectionOwner != 0 {
+		t.Fatal("clone inherited source-only dense provenance")
+	}
+	source.Reset()
+	if source.denseProjectionID != 0 || source.denseProjectionOwner != 0 {
+		t.Fatal("reset retained dense provenance")
+	}
+
+	clone.Release()
+	first.Release()
+	second.Release()
+	third.Release()
 	source.Release()
 }
 
@@ -513,4 +628,30 @@ func BenchmarkRepinReleaseProjectionPreparedDense(b *testing.B) {
 		projection.Release()
 	})
 	source.Release()
+}
+
+func BenchmarkResidualPreparedDenseProjection(b *testing.B) {
+	for _, width := range []int{256, 4096, 65536} {
+		b.Run(itoa(uint32(width)), func(b *testing.B) {
+			source := New()
+			for i := 0; i < width; i++ {
+				source.Set(DenseThreads+uint32(i), uint32(i&1)+1)
+			}
+			ownerTID := DenseThreads + uint32(width/2)
+			source.PrepareKnownMonotonicSet(ownerTID)
+			projection := PinReleaseProjectionForPreparedOwner(source, ownerTID)
+			source.SetKnownMonotonicAlive(ownerTID, source.Get(ownerTID)+1)
+			var noRoots [CausalRootCapacity]CausalView
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if !source.ResidualLessOrEqualReleaseProjection(&noRoots, 0, &projection, ownerTID) {
+					b.Fatal("certified residual proof failed")
+				}
+			}
+			b.StopTimer()
+			projection.Release()
+			source.Release()
+		})
+	}
 }

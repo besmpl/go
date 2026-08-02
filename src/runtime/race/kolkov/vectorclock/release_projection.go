@@ -17,15 +17,16 @@ type ReleaseProjection struct {
 	// denseOwned distinguishes the detached backing used by prepared-owner
 	// capture from the ordinary borrowed/shared VectorClock backing. Only an
 	// owned backing may be overwritten by RepinReleaseProjectionForPreparedOwner.
-	denseOwned     bool
-	roots          [CausalRootCapacity]CausalView
-	finite         [ReleaseProjectionFiniteCapacity]FiniteRange
-	retired        [ReleaseProjectionRetiredCapacity]RetiredRange
-	dynamicFinite  []FiniteRange
-	dynamicRetired []RetiredRange
-	rootN          uint8
-	finiteN        uint8
-	retiredN       uint8
+	denseOwned        bool
+	denseProjectionID uint64
+	roots             [CausalRootCapacity]CausalView
+	finite            [ReleaseProjectionFiniteCapacity]FiniteRange
+	retired           [ReleaseProjectionRetiredCapacity]RetiredRange
+	dynamicFinite     []FiniteRange
+	dynamicRetired    []RetiredRange
+	rootN             uint8
+	finiteN           uint8
+	retiredN          uint8
 }
 
 // TryPinReleaseProjection captures vc without allocation. It either retains
@@ -160,6 +161,7 @@ func PinReleaseProjectionForPreparedOwner(vc *VectorClock, ownerTID uint32) Rele
 			copy(dense, projection.denseTail)
 			projection.denseTail = dense
 			projection.denseOwned = true
+			projection.denseProjectionID = vc.certifyDenseProjection(ownerTID)
 			vc.denseTailShared = wasShared
 		}
 	}
@@ -266,6 +268,7 @@ func RepinReleaseProjectionForPreparedOwner(vc *VectorClock, ownerTID uint32, ou
 		copy(reusableDense, vc.denseTail)
 		out.denseTail = reusableDense
 		out.denseOwned = true
+		out.denseProjectionID = vc.certifyDenseProjection(ownerTID)
 		return
 	}
 	out.denseTail = vc.denseTail
@@ -564,7 +567,10 @@ func (vc *VectorClock) ResidualLessOrEqualReleaseProjection(views *[CausalRootCa
 	if len(vc.denseTail) != 0 {
 		shared := len(p.denseTail) >= len(vc.denseTail) && len(p.denseTail) != 0 &&
 			&vc.denseTail[0] == &p.denseTail[0]
-		if !shared {
+		certified := p.denseOwned && p.denseProjectionID != 0 &&
+			vc.denseProjectionID == p.denseProjectionID &&
+			vc.denseProjectionOwner == uint64(ownTID)+1 && len(p.denseTail) == len(vc.denseTail)
+		if !shared && !certified {
 			for i, clock := range vc.denseTail {
 				tid := uint32(DenseThreads + i)
 				if clock == 0 || tid == ownTID || projectionSetIsRetired(p, views, n, tid) {

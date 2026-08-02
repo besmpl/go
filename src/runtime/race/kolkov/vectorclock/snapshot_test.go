@@ -300,6 +300,65 @@ func TestClockSnapshotTryOperationsAreAtomicAndAllocationFree(t *testing.T) {
 	}
 }
 
+func TestClockSnapshotSameLineageDominanceWithCausalRoots(t *testing.T) {
+	baseClock := New()
+	baseClock.Set(7, 3)
+	baseClock.RetireRange(40, 45)
+	old := baseClock.Freeze()
+	newer := old.PointMax(7, 9)
+
+	foreignAnchor := New()
+	foreignAnchor.Set(100_000, 11)
+	foreignLineage := NewClockLineage(foreignAnchor)
+	foreignAnchor.Release()
+	foreign := foreignLineage.Pin()
+	defer foreign.Release()
+	defer foreignLineage.Release()
+
+	dst := New()
+	defer dst.Release()
+	if !dst.TryJoinSnapshot(newer) || !dst.TryJoinCausal(foreign) {
+		t.Fatal("failed to construct snapshot plus causal-root destination")
+	}
+	want := imageOf(dst)
+	baseBefore := dst.base
+	causalBefore := dst.causal.roots[0]
+	refsBefore := causalBefore.segment.refs.Load()
+	if allocs := testing.AllocsPerRun(1000, func() {
+		if !dst.TryJoinSnapshot(old) {
+			panic("older same-lineage snapshot was not recognized as dominated")
+		}
+	}); allocs != 0 {
+		t.Fatalf("dominated same-lineage join allocated %.1f times", allocs)
+	}
+	if got := imageOf(dst); !reflect.DeepEqual(got, want) {
+		t.Fatalf("dominated join changed logical clock: got %#v want %#v", got, want)
+	}
+	if dst.base != baseBefore || dst.causal.roots[0].segment != causalBefore.segment ||
+		dst.causal.roots[0].version != causalBefore.version || causalBefore.segment.refs.Load() != refsBefore {
+		t.Fatal("dominated join changed snapshot or causal-root ownership")
+	}
+
+	// The converse remains exact: a newer base is adopted without dropping the
+	// unrelated root or the destination-owned overlay.
+	dst.base = old
+	dst.Set(13, 5)
+	if !dst.TryJoinSnapshot(newer) || dst.base != newer || dst.Get(13) != 5 || dst.Get(100_000) != 11 {
+		t.Fatal("newer same-lineage adoption lost an owned or causal component")
+	}
+
+	incomparableClock := New()
+	incomparableClock.Set(8, 12)
+	incomparable := incomparableClock.Freeze()
+	before := imageOf(dst)
+	if dst.TryJoinSnapshot(incomparable) {
+		t.Fatal("incomparable snapshot unexpectedly joined with causal roots")
+	}
+	if got := imageOf(dst); !reflect.DeepEqual(got, before) {
+		t.Fatalf("failed incomparable join changed logical clock: got %#v want %#v", got, before)
+	}
+}
+
 func TestClockSnapshotRetiredUnionAndExtremeRanges(t *testing.T) {
 	legacy, shared := New(), New()
 	for _, r := range []FiniteRange{

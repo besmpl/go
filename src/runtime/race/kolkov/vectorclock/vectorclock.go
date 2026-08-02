@@ -116,13 +116,45 @@ type VectorClock struct {
 	// detach once, while allocation-free Try operations reject a required write.
 	// GC owns the backing lifetime, so sharing needs no explicit reference count.
 	denseTailShared bool
-	sparseRuns      []finiteRun
-	retired         []RetiredRange
-	base            *ClockSnapshot
+	// denseProjectionID certifies that every dense coordinate except the tagged
+	// owner still equals a prepared-owner ReleaseProjection with the same ID.
+	// The owner is stored as TID+1 so zero remains the invalid tag even for TID 0.
+	denseProjectionID    uint64
+	denseProjectionOwner uint64
+	sparseRuns           []finiteRun
+	retired              []RetiredRange
+	base                 *ClockSnapshot
 	// causal contains independently retained immutable lineage views. The
 	// logical clock is the pointwise maximum of these views, base, and the
 	// owned mutable representation above.
 	causal causalRootSet
+}
+
+var nextDenseProjectionID iatomic.Uint64
+
+func (vc *VectorClock) invalidateDenseProjectionWitness() {
+	vc.denseProjectionID = 0
+	vc.denseProjectionOwner = 0
+}
+
+func (vc *VectorClock) invalidateDenseProjectionWitnessExcept(tid uint32) {
+	if vc.denseProjectionID != 0 && vc.denseProjectionOwner != uint64(tid)+1 {
+		vc.invalidateDenseProjectionWitness()
+	}
+}
+
+func (vc *VectorClock) certifyDenseProjection(ownerTID uint32) uint64 {
+	owner := uint64(ownerTID) + 1
+	if vc.denseProjectionID != 0 && vc.denseProjectionOwner == owner {
+		return vc.denseProjectionID
+	}
+	id := nextDenseProjectionID.Add(1)
+	if id == 0 {
+		runtimeThrow("race detector dense projection identity overflow")
+	}
+	vc.denseProjectionID = id
+	vc.denseProjectionOwner = owner
+	return id
 }
 
 // CausalRootCapacity is the number of unrelated immutable lineage roots a
@@ -295,6 +327,7 @@ func (vc *VectorClock) Reset() {
 		vc.denseTail = vc.denseTail[:0]
 	}
 	vc.denseTailShared = false
+	vc.invalidateDenseProjectionWitness()
 	vc.sparseRuns = vc.sparseRuns[:0]
 	vc.retired = vc.retired[:0]
 	vc.base = nil
@@ -389,6 +422,7 @@ func (vc *VectorClock) detachDenseTail() {
 	if !vc.denseTailShared {
 		return
 	}
+	vc.invalidateDenseProjectionWitness()
 	if len(vc.denseTail) == 0 {
 		vc.denseTail = nil
 		vc.denseTailShared = false
@@ -425,6 +459,7 @@ func (vc *VectorClock) maybePromoteDenseTail() {
 	if best == 0 || targetLen > uint64(^uint(0)>>1) {
 		return
 	}
+	vc.invalidateDenseProjectionWitness()
 	vc.detachDenseTail()
 	oldLen := len(vc.denseTail)
 	newLen := int(targetLen)
@@ -485,6 +520,7 @@ func (vc *VectorClock) ensureDenseTail(length int) {
 }
 
 func (vc *VectorClock) extendDenseTail(length int) {
+	vc.invalidateDenseProjectionWitness()
 	vc.detachDenseTail()
 	if length <= len(vc.denseTail) {
 		return
@@ -614,6 +650,10 @@ func (vc *VectorClock) TryJoin(other *VectorClock) bool {
 	if other.base != nil && !vc.TryJoinSnapshot(other.base) {
 		return false
 	}
+	// The exact join may update any dense coordinate. Invalidating a witness
+	// when the values happen to be unchanged is conservative; retaining it
+	// across a foreign-coordinate maximum would not be.
+	vc.invalidateDenseProjectionWitness()
 	for tid := uint32(0); tid <= uint32(other.maxDense); tid++ {
 		if clock := other.clocks[tid]; clock > vc.Get(tid) {
 			// Inline Set cannot allocate. Retirement in vc simply dominates it.
@@ -1297,6 +1337,7 @@ func (vc *VectorClock) PruneLessOrEqual(observed *VectorClock) {
 		defer copy.Release()
 		observed = copy
 	}
+	vc.invalidateDenseProjectionWitness()
 	vc.detachDenseTail()
 	for tid := uint32(0); tid <= uint32(vc.maxDense); tid++ {
 		if clock := vc.clocks[tid]; clock != 0 && clock <= observed.Get(tid) {
@@ -1428,6 +1469,7 @@ func (vc *VectorClock) PruneEventSetLessOrEqual(observed *VectorClock) {
 			vc.clocks[i] = 0
 		}
 		vc.maxDense = 0
+		vc.invalidateDenseProjectionWitness()
 		vc.detachDenseTail()
 		clear(vc.denseTail)
 		vc.denseTail = vc.denseTail[:0]
@@ -1475,6 +1517,7 @@ func (observed *VectorClock) appendUnobservedEventRange(out []finiteRun, first, 
 }
 
 func (vc *VectorClock) pruneOwnedDenseEvents(observed *VectorClock) {
+	vc.invalidateDenseProjectionWitness()
 	for tid := uint32(0); tid <= uint32(vc.maxDense); tid++ {
 		if clock := vc.clocks[tid]; clock != 0 && observed.Get(tid) >= clock {
 			vc.clocks[tid] = 0
@@ -1568,6 +1611,7 @@ func (vc *VectorClock) pruneSmallOwnedFiniteAgainstLogical(observed *VectorClock
 		vc.clocks[i] = 0
 	}
 	vc.maxDense = 0
+	vc.invalidateDenseProjectionWitness()
 	vc.detachDenseTail()
 	clear(vc.denseTail)
 	vc.denseTail = vc.denseTail[:0]
@@ -1654,6 +1698,7 @@ func (vc *VectorClock) Increment(tid uint32) {
 		if vc.denseTail[offset] == ^uint32(0) {
 			runtimeThrow("race detector logical clock overflow")
 		}
+		vc.invalidateDenseProjectionWitness()
 		vc.detachDenseTail()
 		vc.denseTail[offset]++
 		return
@@ -1772,12 +1817,14 @@ func (vc *VectorClock) Set(tid, clock uint32) {
 	}
 	offset := uint64(tid) - DenseThreads
 	if offset < uint64(len(vc.denseTail)) {
+		vc.invalidateDenseProjectionWitness()
 		vc.detachDenseTail()
 		vc.denseTail[offset] = clock
 		return
 	}
 	if offset == uint64(len(vc.denseTail)) && len(vc.denseTail) != 0 && clock != 0 &&
 		(len(vc.sparseRuns) == 0 || vc.sparseRuns[0].First > tid) {
+		vc.invalidateDenseProjectionWitness()
 		vc.detachDenseTail()
 		vc.denseTail = append(vc.denseTail, clock)
 		return
@@ -1904,6 +1951,7 @@ func (vc *VectorClock) SetKnownMonotonicAlive(tid, clock uint32) {
 		if vc.denseTailShared {
 			runtimeThrow("race detector mutated shared dense clock without preflight")
 		}
+		vc.invalidateDenseProjectionWitnessExcept(tid)
 		vc.denseTail[offset] = clock
 		return
 	}
@@ -2098,6 +2146,7 @@ func (vc *VectorClock) RetireRanges(ranges []RetiredRange) {
 }
 
 func (vc *VectorClock) dropRetiredFiniteEntries() {
+	vc.invalidateDenseProjectionWitness()
 	vc.detachDenseTail()
 	for _, r := range vc.retired {
 		first, last := r.First, r.Last
@@ -2484,6 +2533,7 @@ func (vc *VectorClock) joinDenseTailRanges(ranges []FiniteRange) []FiniteRange {
 	if len(vc.denseTail) == 0 {
 		return ranges
 	}
+	vc.invalidateDenseProjectionWitness()
 	vc.detachDenseTail()
 	end := vc.denseTailEnd()
 	for i, r := range ranges {
