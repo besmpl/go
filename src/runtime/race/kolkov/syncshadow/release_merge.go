@@ -8,6 +8,7 @@ import (
 const (
 	releaseMergeLaneCount       = 16
 	releaseMergeInitialCapacity = 4
+	releaseMergeLaneCapacity    = 4
 	releaseMergeBatchCapacity   = 32
 )
 
@@ -22,11 +23,17 @@ type mergeBatch struct {
 	slots   [releaseMergeBatchCapacity]mergeSlot
 }
 
+type mergeLaneBuffer struct {
+	batches atomic.Pointer[mergeBatch]
+	claimed atomic.Uint32
+	slots   [releaseMergeLaneCapacity]mergeSlot
+}
+
 type mergeGeneration struct {
 	active         atomic.Uint32
 	initialClaimed atomic.Uint32
 	initial        [releaseMergeInitialCapacity]mergeSlot
-	lanes          [releaseMergeLaneCount]atomic.Pointer[mergeBatch]
+	lanes          [releaseMergeLaneCount]atomic.Pointer[mergeLaneBuffer]
 }
 
 func mergeLane(tid uint32) uint32 {
@@ -59,6 +66,15 @@ func (b *mergeBatch) claim() (uint32, bool) {
 	return 0, false
 }
 
+func (l *mergeLaneBuffer) claim() (uint32, bool) {
+	for claimed := l.claimed.Load(); claimed < releaseMergeLaneCapacity; claimed = l.claimed.Load() {
+		if l.claimed.CompareAndSwap(claimed, claimed+1) {
+			return claimed, true
+		}
+	}
+	return 0, false
+}
+
 func (g *mergeGeneration) claimInitial() (uint32, bool) {
 	for claimed := g.initialClaimed.Load(); claimed < releaseMergeInitialCapacity; claimed = g.initialClaimed.Load() {
 		if g.initialClaimed.CompareAndSwap(claimed, claimed+1) {
@@ -85,7 +101,17 @@ func (g *mergeGeneration) append(sv *SyncVar, tid uint32, projection *vectorcloc
 		g.active.Add(-1)
 		return true
 	}
-	batch := g.lanes[mergeLane(tid)].Load()
+	lane := g.lanes[mergeLane(tid)].Load()
+	if lane == nil {
+		g.active.Add(-1)
+		return false
+	}
+	if index, ok := lane.claim(); ok {
+		commitMergeSlot(&lane.slots[index], projection)
+		g.active.Add(-1)
+		return true
+	}
+	batch := lane.batches.Load()
 	if batch == nil {
 		g.active.Add(-1)
 		return false
@@ -112,6 +138,11 @@ func appendUnpublished(g *mergeGeneration, projection *vectorclock.ReleaseProjec
 func appendLinkedBatch(batch *mergeBatch, projection *vectorclock.ReleaseProjection) {
 	batch.claimed.Store(1)
 	commitMergeSlot(&batch.slots[0], projection)
+}
+
+func appendUnpublishedLane(lane *mergeLaneBuffer, projection *vectorclock.ReleaseProjection) {
+	lane.claimed.Store(1)
+	commitMergeSlot(&lane.slots[0], projection)
 }
 
 // TryPublishReleaseMergeForContext publishes only the source projection. It
@@ -172,32 +203,81 @@ func (sv *SyncVar) PublishReleaseMergeForContext(src *vectorclock.VectorClock, t
 		sv.releaseMu.unlock()
 	}
 
-	batch := new(mergeBatch)
-	sv.releaseMu.lock()
-	if sv.retired.Load() != 0 {
+	for {
+		g := sv.pending.Load()
+		if g == nil {
+			prepared := newMergeGeneration()
+			sv.releaseMu.lock()
+			if sv.retired.Load() != 0 {
+				sv.releaseMu.unlock()
+				projection.Release()
+				return
+			}
+			if sv.pending.Load() == nil {
+				appendUnpublished(prepared, &projection)
+				sv.pending.Store(prepared)
+				sv.releaseMu.unlock()
+				return
+			}
+			sv.releaseMu.unlock()
+			continue
+		}
+
+		laneIndex := mergeLane(tid)
+		if g.lanes[laneIndex].Load() == nil {
+			prepared := new(mergeLaneBuffer)
+			sv.releaseMu.lock()
+			if sv.retired.Load() != 0 {
+				sv.releaseMu.unlock()
+				projection.Release()
+				return
+			}
+			if sv.pending.Load() != g {
+				sv.releaseMu.unlock()
+				continue
+			}
+			if g.append(sv, tid, &projection) {
+				sv.releaseMu.unlock()
+				return
+			}
+			if g.lanes[laneIndex].Load() == nil {
+				appendUnpublishedLane(prepared, &projection)
+				g.lanes[laneIndex].Store(prepared)
+				sv.releaseMu.unlock()
+				return
+			}
+			sv.releaseMu.unlock()
+			continue
+		}
+
+		batch := new(mergeBatch)
+		sv.releaseMu.lock()
+		if sv.retired.Load() != 0 {
+			sv.releaseMu.unlock()
+			projection.Release()
+			return
+		}
+		if sv.pending.Load() != g {
+			sv.releaseMu.unlock()
+			continue
+		}
+		if g.append(sv, tid, &projection) {
+			sv.releaseMu.unlock()
+			return
+		}
+		lane := g.lanes[laneIndex].Load()
+		if lane == nil {
+			sv.releaseMu.unlock()
+			continue
+		}
+		// A full batch is immutable. Link a prepared successor while holding
+		// the generation-management lock, then publish in slot 0.
+		batch.next = lane.batches.Load()
+		appendLinkedBatch(batch, &projection)
+		lane.batches.Store(batch)
 		sv.releaseMu.unlock()
-		projection.Release()
 		return
 	}
-	g := sv.pending.Load()
-	if g == nil {
-		prepared := newMergeGeneration()
-		appendUnpublished(prepared, &projection)
-		sv.pending.Store(prepared)
-		sv.releaseMu.unlock()
-		return
-	}
-	if g.append(sv, tid, &projection) {
-		sv.releaseMu.unlock()
-		return
-	}
-	// A full batch is immutable. Link a prepared successor while holding the
-	// generation-management lock, then publish this projection in slot 0.
-	lane := mergeLane(tid)
-	batch.next = g.lanes[lane].Load()
-	appendLinkedBatch(batch, &projection)
-	g.lanes[lane].Store(batch)
-	sv.releaseMu.unlock()
 }
 
 func (sv *SyncVar) takePendingLocked() *mergeGeneration {
@@ -228,8 +308,15 @@ func releaseMergeGeneration(g *mergeGeneration, bases *[]*vectorclock.ClockSnaps
 	for i, claimed := uint32(0), g.initialClaimed.Load(); i < claimed; i++ {
 		drain(&g.initial[i])
 	}
-	for lane := range g.lanes {
-		for batch := g.lanes[lane].Load(); batch != nil; batch = batch.next {
+	for laneIndex := range g.lanes {
+		lane := g.lanes[laneIndex].Load()
+		if lane == nil {
+			continue
+		}
+		for i, claimed := uint32(0), lane.claimed.Load(); i < claimed; i++ {
+			drain(&lane.slots[i])
+		}
+		for batch := lane.batches.Load(); batch != nil; batch = batch.next {
 			for i, claimed := uint32(0), batch.claimed.Load(); i < claimed; i++ {
 				drain(&batch.slots[i])
 			}

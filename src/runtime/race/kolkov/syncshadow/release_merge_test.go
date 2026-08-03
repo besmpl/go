@@ -31,12 +31,45 @@ func TestDeferredReleaseMergeUsesCompactInitialGeneration(t *testing.T) {
 	overflow.Set(200, 20)
 	sv.PublishReleaseMergeForContext(overflow, 200, 0)
 	overflow.Release()
-	batch := generation.lanes[mergeLane(200)].Load()
-	if batch == nil {
-		t.Fatal("fifth release did not allocate an overflow batch")
+	laneIndex := mergeLane(200)
+	lane := generation.lanes[laneIndex].Load()
+	if lane == nil {
+		t.Fatal("fifth release did not allocate a compact lane")
 	}
-	if batch.claimed.Load() != 1 {
-		t.Fatalf("fifth release batch=%p claimed=%d, want one exact overflow", batch, batch.claimed.Load())
+	if lane.claimed.Load() != 1 {
+		t.Fatalf("fifth release lane=%p claimed=%d, want one exact overflow", lane, lane.claimed.Load())
+	}
+	if batch := lane.batches.Load(); batch != nil {
+		t.Fatalf("fifth release allocated full batch %p", batch)
+	}
+
+	sameLane := []uint32{200}
+	for tid := uint32(201); len(sameLane) <= releaseMergeLaneCapacity; tid++ {
+		if mergeLane(tid) == laneIndex {
+			sameLane = append(sameLane, tid)
+		}
+	}
+	for _, tid := range sameLane[1:releaseMergeLaneCapacity] {
+		clock := vectorclock.New()
+		clock.Set(tid, tid+1)
+		sv.PublishReleaseMergeForContext(clock, tid, 0)
+		clock.Release()
+	}
+	if claimed := lane.claimed.Load(); claimed != releaseMergeLaneCapacity {
+		t.Fatalf("compact lane claimed=%d, want %d", claimed, releaseMergeLaneCapacity)
+	}
+	if batch := lane.batches.Load(); batch != nil {
+		t.Fatalf("full compact lane allocated batch %p before overflow", batch)
+	}
+
+	largeTID := sameLane[releaseMergeLaneCapacity]
+	large := vectorclock.New()
+	large.Set(largeTID, largeTID+1)
+	sv.PublishReleaseMergeForContext(large, largeTID, 0)
+	large.Release()
+	batch := lane.batches.Load()
+	if batch == nil || batch.claimed.Load() != 1 {
+		t.Fatalf("large overflow batch=%p, want one committed slot", batch)
 	}
 
 	got := sv.GetReleaseClock()
@@ -47,6 +80,14 @@ func TestDeferredReleaseMergeUsesCompactInitialGeneration(t *testing.T) {
 	}
 	if value := got.Get(200); value != 20 {
 		t.Fatalf("overflow tid 200=%d, want 20", value)
+	}
+	for _, tid := range sameLane[1:releaseMergeLaneCapacity] {
+		if value := got.Get(tid); value != tid+1 {
+			t.Fatalf("compact lane tid %d=%d, want %d", tid, value, tid+1)
+		}
+	}
+	if value := got.Get(largeTID); value != largeTID+1 {
+		t.Fatalf("large batch tid %d=%d, want %d", largeTID, value, largeTID+1)
 	}
 }
 
