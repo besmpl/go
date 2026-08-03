@@ -128,6 +128,9 @@ type VectorClock struct {
 	// logical clock is the pointwise maximum of these views, base, and the
 	// owned mutable representation above.
 	causal causalRootSet
+	// ownerLineage is private mutable authority for this clock's own logical
+	// coordinate. Ordinary copies retain only its immutable causal view.
+	ownerLineage *ClockLineage
 }
 
 var nextDenseProjectionID iatomic.Uint64
@@ -316,6 +319,10 @@ func (vc *VectorClock) Release() { poolPut(vc) }
 // Release applies the bounded pool-retention policy after resetting.
 func (vc *VectorClock) Reset() {
 	vc.causal.Release()
+	if vc.ownerLineage != nil {
+		vc.ownerLineage.Release()
+		vc.ownerLineage = nil
+	}
 	for i := uint32(0); i <= uint32(vc.maxDense); i++ {
 		vc.clocks[i] = 0
 	}
@@ -331,6 +338,145 @@ func (vc *VectorClock) Reset() {
 	vc.sparseRuns = vc.sparseRuns[:0]
 	vc.retired = vc.retired[:0]
 	vc.base = nil
+}
+
+func (vc *VectorClock) ownerRoot() *CausalView {
+	if vc == nil || vc.ownerLineage == nil {
+		return nil
+	}
+	for i := 0; i < int(vc.causal.count); i++ {
+		if vc.ownerLineage.Owns(vc.causal.roots[i]) {
+			return &vc.causal.roots[i]
+		}
+	}
+	return nil
+}
+
+const ownerLineageInlineFoldPoints = 8
+
+// tryFoldOwnerResidual appends a tiny exact mutable residual to the context's
+// linear lineage. This is the steady structured join case: a parent observes
+// one or a few completed children and then forks again. Appending preserves
+// old pinned versions and avoids rebuilding the increasingly wide ancestry on
+// every sequential fork/join iteration. Broader/base/retirement shapes use the
+// unrestricted exact reanchor below.
+func (vc *VectorClock) tryFoldOwnerResidual(root *CausalView) bool {
+	if vc == nil || root == nil || !root.Valid() || vc.ownerLineage == nil ||
+		vc.base != nil || vc.causal.count != 1 || len(vc.retired) != 0 {
+		return false
+	}
+	var points [ownerLineageInlineFoldPoints]FiniteRange
+	count := 0
+	complete := true
+	vc.rangeOwnedRuns(func(first, last, clock uint32) bool {
+		width := uint64(last) - uint64(first) + 1
+		if width > uint64(len(points)-count) {
+			complete = false
+			return false
+		}
+		for tid := first; ; tid++ {
+			points[count] = FiniteRange{First: tid, Last: tid, Clock: clock}
+			count++
+			if tid == last {
+				break
+			}
+		}
+		return true
+	})
+	if !complete {
+		return false
+	}
+	for i := 0; i < count; i++ {
+		point := points[i]
+		_, appended := vc.ownerLineage.AppendOwned(root, point.First, point.Clock)
+		if !appended && root.Get(point.First) < point.Clock {
+			return false
+		}
+	}
+	vc.clearOwned()
+	return true
+}
+
+// EnsureOwnerLineage promotes a live context's complete exact clock into a
+// compact immutable-version lineage. Repeated forks can pin the same ancestry
+// in O(1); tiny child deltas append to the same family, while wider foreign
+// joins are folded into a new immutable same-family anchor once.
+func (vc *VectorClock) EnsureOwnerLineage(tid uint32) bool {
+	if vc == nil || vc.IsRetired(tid) || vc.Get(tid) == 0 {
+		return false
+	}
+	if vc.ownerLineage != nil && vc.ownerLineage.family.isolated.Load() {
+		vc.materializeRoots()
+	}
+	if vc.ownerLineage != nil {
+		if vc.ownerLineage.ownerTID != tid {
+			return false
+		}
+		root := vc.ownerRoot()
+		if root == nil {
+			return false
+		}
+		if vc.base == nil && vc.ownedEmpty() && vc.causal.count == 1 {
+			return true
+		}
+		if vc.tryFoldOwnerResidual(root) {
+			return true
+		}
+
+		// Build the replacement before mutating the live clock. CloneDetached
+		// deliberately retains only immutable views, so materializing it cannot
+		// disturb this clock's private writer authority.
+		canonical := vc.CloneDetached()
+		canonical.materializeRoots()
+		if !vc.ownerLineage.ReanchorOwned(root, canonical, false) {
+			canonical.Release()
+			return false
+		}
+
+		// ReanchorOwned moved the owned pin to the new exact anchor. Transfer
+		// that one reference while releasing every now-folded residual root.
+		var ownerView CausalView
+		for i := 0; i < int(vc.causal.count); i++ {
+			if vc.ownerLineage.Owns(vc.causal.roots[i]) {
+				ownerView = vc.causal.roots[i]
+				vc.causal.roots[i] = CausalView{}
+				break
+			}
+		}
+		vc.causal.Release()
+		vc.clearOwned()
+		vc.base = nil
+		vc.causal.roots[0] = ownerView
+		vc.causal.count = 1
+		canonical.Release()
+		return ownerView.Valid()
+	}
+
+	// The anchor captures base, roots, mutable finite state, and retirement
+	// state before any of them are cleared. Promotion therefore collapses an
+	// arbitrarily wide clock to one retained root instead of adding another
+	// root beside the inherited ancestry.
+	lineage, view := NewOwnerClockLineageFromClock(tid, vc)
+	if !view.Valid() {
+		lineage.Release()
+		return false
+	}
+	vc.causal.Release()
+	vc.clearOwned()
+	vc.base = nil
+	vc.causal.roots[0] = view
+	vc.causal.count = 1
+	vc.ownerLineage = lineage
+	return true
+}
+
+// ContinueOwnerLineage advances an already-promoted, cohort-shared owner
+// clock. An isolated family is deliberately left for renewed probation and a
+// fresh family rather than republishing a representation which a long-lived
+// single child has found unhelpful.
+func (vc *VectorClock) ContinueOwnerLineage(tid uint32) bool {
+	return vc != nil && vc.ownerLineage != nil &&
+		!vc.ownerLineage.family.isolated.Load() && vc.EnsureOwnerLineage(tid)
 }
 
 func (vc *VectorClock) Clone() *VectorClock {
@@ -350,6 +496,57 @@ func (vc *VectorClock) CloneDetached() *VectorClock {
 	clone := poolGet()
 	clone.copyFromZeroWithDenseOwnership(vc, true)
 	return clone
+}
+
+// CloneForkDetached returns an exact independently mutable fork image. A
+// confirmed fan-out may retain the owner's immutable lineage; a probationary
+// fork materializes that lineage in the clone so a later long-lived child does
+// not pay causal-root traversal merely because an earlier fan-out promoted its
+// parent. The live parent and unrelated canonical clocks remain untouched.
+func (vc *VectorClock) CloneForkDetached(shareOwnerLineage bool) *VectorClock {
+	clone := vc.CloneDetached()
+	if !shareOwnerLineage && vc.ownerLineage != nil {
+		clone.materializeRoots()
+	}
+	return clone
+}
+
+const forkLineageCohortRefs = 12
+
+// CollapseIsolatedForkLineage lowers an inherited owner-only root when its
+// first acquire observes no sibling cohort. The reference threshold includes
+// the lineage writer, the parent's owned view, children, and short-lived
+// publication pins; it is only a performance decision. A marked family tells
+// its private writer to lower before publishing another version, so subsequent
+// one-child synchronization does not repeatedly import the same ancestry root.
+func (vc *VectorClock) CollapseIsolatedForkLineage() bool {
+	if vc == nil || !vc.causal.Valid() {
+		return false
+	}
+	marked := false
+	for i := 0; i < int(vc.causal.count); i++ {
+		segment := vc.causal.roots[i].segment
+		if segment == nil || !segment.ownerOnly {
+			continue
+		}
+		if segment.family.isolated.Load() {
+			marked = true
+			break
+		}
+		// The private writer must not infer isolation merely because a completed
+		// fan-out has released its children. Only an inheriting context can
+		// observe whether it entered synchronization without live siblings.
+		if vc.ownerLineage == nil && segment.refs.Load() < forkLineageCohortRefs {
+			segment.family.isolated.Store(true)
+			marked = true
+			break
+		}
+	}
+	if !marked {
+		return false
+	}
+	vc.materializeRoots()
+	return true
 }
 
 func (vc *VectorClock) copyFromZeroWithDenseOwnership(other *VectorClock, detachDense bool) {
@@ -1790,6 +1987,22 @@ func (vc *VectorClock) Get(tid uint32) uint32 {
 }
 
 func (vc *VectorClock) Set(tid, clock uint32) {
+	if vc.ownerLineage != nil && vc.ownerLineage.family.isolated.Load() {
+		vc.materializeRoots()
+	}
+	if vc.ownerLineage != nil && tid == vc.ownerLineage.ownerTID {
+		old := vc.Get(tid)
+		if clock > old && old != ^uint32(0) {
+			if root := vc.ownerRoot(); root != nil {
+				if _, appended := vc.ownerLineage.AppendOwned(root, tid, clock); appended {
+					return
+				}
+			}
+		}
+		if clock != old {
+			vc.materializeRoots()
+		}
+	}
 	if vc.base != nil || vc.causal.Valid() {
 		old := vc.Get(tid)
 		if vc.IsRetired(tid) || old == clock {
@@ -1877,6 +2090,21 @@ func (vc *VectorClock) Set(tid, clock uint32) {
 // value is redundant. Two spare runs cover the worst case: replacing one
 // interior coordinate of a canonical sparse run with three runs.
 func (vc *VectorClock) PrepareKnownMonotonicSet(tid uint32) {
+	if vc.ownerLineage != nil && vc.ownerLineage.family.isolated.Load() {
+		vc.materializeRoots()
+	}
+	if vc.ownerLineage != nil && tid == vc.ownerLineage.ownerTID {
+		next := vc.Get(tid) + 1
+		if vc.ownerLineage.ReserveOwned(tid, next) {
+			vc.prepareKnownMonotonicOverlay(tid)
+			return
+		}
+		vc.materializeRoots()
+	}
+	vc.prepareKnownMonotonicOverlay(tid)
+}
+
+func (vc *VectorClock) prepareKnownMonotonicOverlay(tid uint32) {
 	if tid < DenseThreads {
 		return
 	}
@@ -1904,6 +2132,12 @@ func (vc *VectorClock) PrepareKnownMonotonicSet(tid uint32) {
 func (vc *VectorClock) CanSetKnownMonotonicAlive(tid uint32) bool {
 	if vc == nil {
 		return false
+	}
+	if vc.ownerLineage != nil && vc.ownerLineage.family.isolated.Load() {
+		return false
+	}
+	if vc.ownerLineage != nil && tid == vc.ownerLineage.ownerTID {
+		return vc.ownerRoot() != nil && vc.ownerLineage.CanAppendOwned(tid, vc.Get(tid)+1)
 	}
 	if tid < DenseThreads {
 		return true
@@ -1939,6 +2173,14 @@ func (vc *VectorClock) CanSetKnownMonotonicAlive(tid uint32) bool {
 // necessarily dominates every retained root at tid. Unlike Set, this method
 // deliberately skips optional dense-tail promotion so commit cannot allocate.
 func (vc *VectorClock) SetKnownMonotonicAlive(tid, clock uint32) {
+	if vc.ownerLineage != nil && tid == vc.ownerLineage.ownerTID {
+		if root := vc.ownerRoot(); root != nil {
+			if _, appended := vc.ownerLineage.AppendOwned(root, tid, clock); appended {
+				return
+			}
+		}
+		runtimeThrow("race detector failed prepared owner-lineage commit")
+	}
 	if tid < DenseThreads {
 		vc.clocks[tid] = clock
 		if uint16(tid) > vc.maxDense {

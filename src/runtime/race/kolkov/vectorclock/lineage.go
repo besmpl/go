@@ -4,6 +4,8 @@ import "internal/runtime/atomic"
 
 const (
 	lineageBlockEntries                        = 256
+	lineageOwnerInlineEntries                  = 32
+	lineageOwnerInlineOverflows                = 4
 	lineageBlockPageEntries                    = 256
 	lineageEntryPrevBits                       = 21
 	lineageEntryDeltaBits                      = 10
@@ -79,7 +81,7 @@ type lineageSegment struct {
 	anchor        *clockImage
 	anchorVersion uint64
 	lastVersion   uint64 // writer-owned
-	firstBlock    lineageBlock
+	firstBlock    *lineageBlock
 	blockPages    [lineageBlockPageCount]atomic.Pointer[lineageBlockPage]
 	firstOverflow atomic.Pointer[lineageOverflowBlock]
 	overflowPages [lineageBlockPageCount]atomic.Pointer[lineageOverflowBlockPage]
@@ -91,14 +93,30 @@ type lineageSegment struct {
 	sparseHeads   uint64 // writer-owned number of occupied sparse cells
 	entries       uint32 // writer-owned
 	rotateAt      uint64
-	refs          atomic.Int32
-	sealed        atomic.Bool
+	// ownerOnly is the compact fork-lineage index. Structured goroutine
+	// clocks update one process-lifetime owner coordinate, so paying for the
+	// generic 16-cell sparse table on every child is unnecessary. A request to
+	// append another coordinate rotates to the ordinary generic index.
+	ownerOnly      bool
+	ownerTID       uint32
+	ownerHead      lineageHead
+	ownerEntries   *[lineageOwnerInlineEntries]lineageEntry
+	ownerOverflows *[lineageOwnerInlineOverflows]lineageOverflow
+	refs           atomic.Int32
+	sealed         atomic.Bool
 }
 
 // lineageFamily is deliberately pointer-identified. Versions in one family
 // remain comparable in O(1) across segment rotations; branches start a new
 // family because their subsequent versions are not ordered with the parent.
-type lineageFamily struct{ identity byte }
+type lineageFamily struct {
+	identity byte
+	// isolated is a performance-only representation hint. A context which
+	// first imports an owner-only fork root with no retained sibling cohort sets
+	// it; the private writer then lowers the family before its next publication.
+	// Logical clocks and pinned versions remain exact regardless of the hint.
+	isolated atomic.Bool
+}
 
 // lineageIndexHint describes only coordinates updated in the previous
 // segment. Immutable anchor coordinates need no mutable heads: Get can read
@@ -137,13 +155,36 @@ type CausalView struct {
 // The writer guard is an internal atomic spin guard so this primitive is usable
 // from detector/runtime paths without sync locks or map growth reentrancy.
 type ClockLineage struct {
-	writer   atomic.Uint32
-	family   *lineageFamily
-	current  *lineageSegment
-	version  uint64
-	sealed   bool
-	released bool
+	writer    atomic.Uint32
+	family    *lineageFamily
+	current   *lineageSegment
+	version   uint64
+	sealed    bool
+	released  bool
+	ownerOnly bool
+	ownerTID  uint32
 }
+
+type genericLineageSegmentStorage struct {
+	segment    lineageSegment
+	firstBlock lineageBlock
+}
+
+type ownerLineageSegmentStorage struct {
+	segment   lineageSegment
+	entries   [lineageOwnerInlineEntries]lineageEntry
+	overflows [lineageOwnerInlineOverflows]lineageOverflow
+}
+
+type initialOwnerLineageStorage struct {
+	lineage   ClockLineage
+	family    lineageFamily
+	segment   lineageSegment
+	entries   [lineageOwnerInlineEntries]lineageEntry
+	overflows [lineageOwnerInlineOverflows]lineageOverflow
+}
+
+var emptyLineageAnchor = &clockImage{}
 
 // PreparedCausalAppend is a pre-hardware lineage transaction. PrepareAppend
 // performs every operation which may allocate or rotate while holding the
@@ -185,6 +226,37 @@ func newClockLineage(anchor *clockImage) *ClockLineage {
 	return &ClockLineage{family: family, current: newLineageSegment(family, anchor, 0, lineageIndexHint{})}
 }
 
+// NewOwnerClockLineage creates the compact single-writer lineage used by a
+// structured goroutine clock. The returned view owns one independently
+// releasable pin at the initial clock.
+func NewOwnerClockLineage(ownerTID, clock uint32) (*ClockLineage, CausalView) {
+	return newOwnerClockLineage(ownerTID, emptyLineageAnchor, clock)
+}
+
+// NewOwnerClockLineageFromClock starts an owner-only append stream over one
+// exact immutable parent image. Successive fork versions can then share the
+// complete ancestry rather than only the owner's scalar coordinate.
+func NewOwnerClockLineageFromClock(ownerTID uint32, anchor *VectorClock) (*ClockLineage, CausalView) {
+	return newOwnerClockLineage(ownerTID, newClockImage(anchor), 0)
+}
+
+func newOwnerClockLineage(ownerTID uint32, anchor *clockImage, initialClock uint32) (*ClockLineage, CausalView) {
+	storage := new(initialOwnerLineageStorage)
+	l := &storage.lineage
+	l.family = &storage.family
+	l.ownerOnly = true
+	l.ownerTID = ownerTID
+	initOwnerLineageSegment(&storage.segment, l.family, anchor, 0, ownerTID, &storage.entries, &storage.overflows)
+	l.current = &storage.segment
+	if initialClock != 0 {
+		l.version = 1
+		l.current.append(l.version, ownerTID, initialClock)
+	}
+	view := CausalView{segment: l.current, version: l.version}
+	view.Retain()
+	return l, view
+}
+
 func lineageRotationThreshold(coordinates uint64) uint64 {
 	if coordinates > uint64(lineageMaxRotation)/lineageRotationEntriesPerCoordinate {
 		return lineageMaxRotation
@@ -224,9 +296,12 @@ func newLineageSegment(family *lineageFamily, anchor *clockImage, version uint64
 	for capacity < sparseHint*2 {
 		capacity <<= 1
 	}
-	segment := &lineageSegment{
+	storage := new(genericLineageSegmentStorage)
+	segment := &storage.segment
+	*segment = lineageSegment{
 		family: family, anchor: anchor, anchorVersion: version, lastVersion: version,
-		denseBase: denseBase, denseHeads: denseHeads,
+		firstBlock: &storage.firstBlock,
+		denseBase:  denseBase, denseHeads: denseHeads,
 		cells:    make([]lineageCell, int(capacity)),
 		cellMask: capacity - 1, rotateAt: rotateAt,
 	}
@@ -234,9 +309,24 @@ func newLineageSegment(family *lineageFamily, anchor *clockImage, version uint64
 	return segment
 }
 
+func newOwnerLineageSegment(family *lineageFamily, anchor *clockImage, version uint64, ownerTID uint32) *lineageSegment {
+	storage := new(ownerLineageSegmentStorage)
+	initOwnerLineageSegment(&storage.segment, family, anchor, version, ownerTID, &storage.entries, &storage.overflows)
+	return &storage.segment
+}
+
+func initOwnerLineageSegment(segment *lineageSegment, family *lineageFamily, anchor *clockImage, version uint64, ownerTID uint32, entries *[lineageOwnerInlineEntries]lineageEntry, overflows *[lineageOwnerInlineOverflows]lineageOverflow) {
+	*segment = lineageSegment{
+		family: family, anchor: anchor, anchorVersion: version, lastVersion: version,
+		rotateAt: lineageRotationThreshold(1), ownerOnly: true, ownerTID: ownerTID,
+		ownerEntries: entries, ownerOverflows: overflows,
+	}
+	segment.refs.Store(1)
+}
+
 func (s *lineageSegment) blockAt(blockIndex uint32) *lineageBlock {
 	if blockIndex == 0 {
-		return &s.firstBlock
+		return s.firstBlock
 	}
 	extra := blockIndex - 1
 	page := s.blockPages[extra/lineageBlockPageEntries].Load()
@@ -250,7 +340,10 @@ func (s *lineageSegment) blockAt(blockIndex uint32) *lineageBlock {
 // safe because readers treat a nil block as an entry that did not yet exist.
 func (s *lineageSegment) ensureBlock(blockIndex uint32) *lineageBlock {
 	if blockIndex == 0 {
-		return &s.firstBlock
+		if s.firstBlock == nil {
+			s.firstBlock = new(lineageBlock)
+		}
+		return s.firstBlock
 	}
 	extra := blockIndex - 1
 	pageSlot := &s.blockPages[extra/lineageBlockPageEntries]
@@ -309,11 +402,29 @@ func (s *lineageSegment) overflowAt(index uint32) *lineageOverflow {
 	if index == 0 {
 		return nil
 	}
+	if s.ownerOnly && index <= lineageOwnerInlineOverflows {
+		return &s.ownerOverflows[index-1]
+	}
 	zero := index - 1
+	if s.ownerOnly {
+		zero -= lineageOwnerInlineOverflows
+	}
 	block := s.overflowBlockAt(zero / lineageBlockEntries)
 	if block == nil {
 		return nil
 	}
+	return &block.entries[zero%lineageBlockEntries]
+}
+
+func (s *lineageSegment) ensureOverflow(index uint32) *lineageOverflow {
+	if s.ownerOnly && index <= lineageOwnerInlineOverflows {
+		return &s.ownerOverflows[index-1]
+	}
+	zero := index - 1
+	if s.ownerOnly {
+		zero -= lineageOwnerInlineOverflows
+	}
+	block := s.ensureOverflowBlock(zero / lineageBlockEntries)
 	return &block.entries[zero%lineageBlockEntries]
 }
 
@@ -335,6 +446,13 @@ func (s *lineageSegment) cell(tid uint32) (*lineageCell, bool) {
 }
 
 func (s *lineageSegment) head(tid uint32) (*lineageHead, bool, *lineageCell) {
+	if s.ownerOnly {
+		if tid != s.ownerTID {
+			return nil, false, nil
+		}
+		index, _ := s.ownerHead.load()
+		return &s.ownerHead, index != 0, nil
+	}
 	if tid >= s.denseBase && uint64(tid-s.denseBase) < uint64(len(s.denseHeads)) {
 		head := &s.denseHeads[tid-s.denseBase]
 		index, _ := head.load()
@@ -351,7 +469,13 @@ func (s *lineageSegment) entryAt(index uint32) *lineageEntry {
 	if index == 0 {
 		return nil
 	}
+	if s.ownerOnly && index <= lineageOwnerInlineEntries {
+		return &s.ownerEntries[index-1]
+	}
 	zero := index - 1
+	if s.ownerOnly {
+		zero -= lineageOwnerInlineEntries
+	}
 	block := s.blockAt(zero / lineageBlockEntries)
 	if block == nil {
 		return nil
@@ -359,8 +483,23 @@ func (s *lineageSegment) entryAt(index uint32) *lineageEntry {
 	return &block.entries[zero%lineageBlockEntries]
 }
 
+func (s *lineageSegment) ensureEntry(index uint32) *lineageEntry {
+	if s.ownerOnly && index <= lineageOwnerInlineEntries {
+		return &s.ownerEntries[index-1]
+	}
+	zero := index - 1
+	if s.ownerOnly {
+		zero -= lineageOwnerInlineEntries
+	}
+	block := s.ensureBlock(zero / lineageBlockEntries)
+	return &block.entries[zero%lineageBlockEntries]
+}
+
 func (s *lineageSegment) get(tid uint32, version uint64) uint32 {
 	headCell, found, _ := s.head(tid)
+	if headCell == nil {
+		return s.anchor.Get(tid)
+	}
 	if found {
 		head, _ := headCell.load()
 		target := uint64(0)
@@ -430,9 +569,7 @@ func (s *lineageSegment) prepareEntry(prev, previousClock, clock uint32, compact
 		return prev | delta<<lineageEntryPrevBits, compactEntries + 1, nil
 	}
 	index := s.overflows + 1
-	zero := index - 1
-	block := s.ensureOverflowBlock(zero / lineageBlockEntries)
-	checkpoint = &block.entries[zero%lineageBlockEntries]
+	checkpoint = s.ensureOverflow(index)
 	return lineageEntryOverflowFlag | index, 0, checkpoint
 }
 
@@ -462,9 +599,7 @@ func (s *lineageSegment) append(version uint64, tid, clock uint32) {
 		}
 	}
 	index := s.entries + 1
-	blockIndex := (index - 1) / lineageBlockEntries
-	block := s.ensureBlock(blockIndex)
-	entry := &block.entries[(index-1)%lineageBlockEntries]
+	entry := s.ensureEntry(index)
 	prev, previousCompact := head.load()
 	previousClock := head.clock
 	if !found {
@@ -490,11 +625,10 @@ func (s *lineageSegment) appendPrepared(version uint64, tid, clock, word, previo
 		}
 	}
 	index := s.entries + 1
-	block := s.blockAt((index - 1) / lineageBlockEntries)
-	if block == nil {
+	entry := s.entryAt(index)
+	if entry == nil {
 		runtimeThrow("race detector lost prepared clock-lineage block")
 	}
-	entry := &block.entries[(index-1)%lineageBlockEntries]
 	s.publishEntry(entry, checkpoint, word, previous, clock)
 	head.publish(index, clock, compactEntries)
 	s.entries = index
@@ -524,18 +658,91 @@ func (l *ClockLineage) Reserve(count uint64) bool {
 	if count > remaining {
 		return false
 	}
-	needed := (uint64(s.entries) + count + lineageBlockEntries - 1) / lineageBlockEntries
-	for i := uint64(0); i < needed; i++ {
-		s.ensureBlock(uint32(i))
+	for i := uint64(1); i <= count; i++ {
+		s.ensureEntry(s.entries + uint32(i))
 	}
 	// Every reserved append may require an exact checkpoint: the clock delta
 	// can exceed the compact field even when the previous compact chain is
 	// short. Reserve that worst case so the allocation-free contract does not
 	// depend on future clock values.
-	neededOverflows := (uint64(s.overflows) + count + lineageBlockEntries - 1) / lineageBlockEntries
-	for i := uint64(0); i < neededOverflows; i++ {
-		s.ensureOverflowBlock(uint32(i))
+	for i := uint64(1); i <= count; i++ {
+		s.ensureOverflow(s.overflows + uint32(i))
 	}
+	return true
+}
+
+// ReserveOwned prepares the precise storage required by the next owner
+// append without retaining the writer guard across the caller's hardware or
+// synchronization boundary.
+func (l *ClockLineage) ReserveOwned(tid, clock uint32) bool {
+	l.lock()
+	defer l.unlock()
+	if l.released || l.sealed || l.current == nil || !l.ensureIndexForTIDLocked(tid) {
+		return false
+	}
+	if uint64(l.current.entries) >= l.current.rotateAt {
+		l.rotateLocked()
+	}
+	head, found, _ := l.current.head(tid)
+	if head == nil {
+		return false
+	}
+	old := l.current.anchor.Get(tid)
+	if found {
+		old = head.clock
+	}
+	if clock == 0 || old == ^uint32(0) || clock <= old {
+		return true
+	}
+	index := l.current.entries + 1
+	l.current.ensureEntry(index)
+	prev, compact := head.load()
+	_, _, _ = l.current.prepareEntry(prev, old, clock, compact)
+	return true
+}
+
+// CanAppendOwned reports whether ReserveOwned has made the exact next append
+// allocation-free. It is conservative and does not mutate the lineage.
+func (l *ClockLineage) CanAppendOwned(tid, clock uint32) bool {
+	l.lock()
+	defer l.unlock()
+	if l.released || l.sealed || l.current == nil || uint64(l.current.entries) >= l.current.rotateAt {
+		return false
+	}
+	head, found, _ := l.current.head(tid)
+	if head == nil {
+		return false
+	}
+	old := l.current.anchor.Get(tid)
+	if found {
+		old = head.clock
+	}
+	if clock == 0 || old == ^uint32(0) || clock <= old {
+		return true
+	}
+	index := l.current.entries + 1
+	if l.current.entryAt(index) == nil {
+		return false
+	}
+	_, compact := head.load()
+	delta := clock - old
+	if delta > lineageEntryDeltaMask || compact >= lineageEntryCheckpointPeriod-1 {
+		overflowIndex := l.current.overflows + 1
+		if l.current.overflowAt(overflowIndex) == nil {
+			return false
+		}
+	}
+	return true
+}
+
+func (l *ClockLineage) ensureIndexForTIDLocked(tid uint32) bool {
+	if !l.ownerOnly || tid == l.ownerTID {
+		return true
+	}
+	// A non-owner append is supported exactly, but it is no longer the compact
+	// structured-fork shape. Rotate the pinned image into the generic index.
+	l.ownerOnly = false
+	l.rotateLocked()
 	return true
 }
 
@@ -549,6 +756,7 @@ func (l *ClockLineage) PrepareAppend(tid, clock uint32) (prepared PreparedCausal
 		l.unlock()
 		return PreparedCausalAppend{}, false
 	}
+	l.ensureIndexForTIDLocked(tid)
 	if uint64(l.current.entries) >= l.current.rotateAt {
 		l.rotateLocked()
 	}
@@ -712,6 +920,7 @@ func (l *ClockLineage) appendLocked(tid, clock uint32, pin bool) (CausalView, bo
 	if l.released || l.sealed || l.current == nil {
 		return CausalView{}, false
 	}
+	l.ensureIndexForTIDLocked(tid)
 	if uint64(l.current.entries) >= l.current.rotateAt {
 		l.rotateLocked()
 	}
@@ -839,7 +1048,11 @@ func (l *ClockLineage) reanchorLocked(anchor *VectorClock, forceVersion bool) bo
 	l.version++
 	old := l.current
 	old.sealed.Store(true)
-	l.current = newLineageSegment(l.family, newClockImage(anchor), l.version, lineageIndexHint{})
+	if l.ownerOnly {
+		l.current = newOwnerLineageSegment(l.family, newClockImage(anchor), l.version, l.ownerTID)
+	} else {
+		l.current = newLineageSegment(l.family, newClockImage(anchor), l.version, lineageIndexHint{})
+	}
 	old.release()
 	return true
 }
@@ -849,6 +1062,12 @@ func (l *ClockLineage) rotateLocked() {
 	var hint lineageIndexHint
 	anchorClock := old.anchor.materialize()
 	ranges := make([]FiniteRange, 0, len(old.denseHeads)+len(old.cells))
+	if old.ownerOnly {
+		if index, _ := old.ownerHead.load(); index != 0 {
+			hint.add(old.ownerTID)
+			ranges = append(ranges, FiniteRange{First: old.ownerTID, Last: old.ownerTID, Clock: old.ownerHead.clock})
+		}
+	}
 	for offset := range old.denseHeads {
 		if index, _ := old.denseHeads[offset].load(); index != 0 {
 			tid := old.denseBase + uint32(offset)
@@ -872,7 +1091,11 @@ func (l *ClockLineage) rotateLocked() {
 	anchor := newClockImage(anchorClock)
 	anchorClock.Release()
 	old.sealed.Store(true)
-	l.current = newLineageSegment(l.family, anchor, l.version, hint)
+	if l.ownerOnly {
+		l.current = newOwnerLineageSegment(l.family, anchor, l.version, l.ownerTID)
+	} else {
+		l.current = newLineageSegment(l.family, anchor, l.version, hint)
+	}
 	old.release()
 }
 
@@ -1006,6 +1229,13 @@ func (v CausalView) materialize() *VectorClock {
 	// segment deliberately keeps a large empty index. Start with a small bounded
 	// buffer and grow only when the view actually contains many mutable heads.
 	ranges := make([]FiniteRange, 0, 64)
+	if v.segment.ownerOnly {
+		if index, _ := v.segment.ownerHead.load(); index != 0 {
+			if clock := v.segment.get(v.segment.ownerTID, v.version); clock != 0 {
+				ranges = append(ranges, FiniteRange{First: v.segment.ownerTID, Last: v.segment.ownerTID, Clock: clock})
+			}
+		}
+	}
 	for offset := range v.segment.denseHeads {
 		if index, _ := v.segment.denseHeads[offset].load(); index != 0 {
 			tid := v.segment.denseBase + uint32(offset)
@@ -1025,6 +1255,46 @@ func (v CausalView) materialize() *VectorClock {
 	sortFiniteByFirst(ranges)
 	vc.JoinRanges(ranges)
 	return vc
+}
+
+// AppendReleaseComponents enumerates the exact pinned image directly. It
+// avoids allocating a temporary VectorClock for each coalesced ReleaseMerge
+// root; later canonicalization performs the pointwise maximum of overlaps.
+func (v CausalView) AppendReleaseComponents(finite *[]FiniteRange, retired *[]RetiredRange) {
+	if v.segment == nil {
+		return
+	}
+	v.segment.anchor.RangeRuns(func(first, last, clock uint32) bool {
+		*finite = append(*finite, FiniteRange{First: first, Last: last, Clock: clock})
+		return true
+	})
+	v.segment.anchor.RangeRetired(func(first, last uint32) bool {
+		*retired = append(*retired, RetiredRange{First: first, Last: last})
+		return true
+	})
+	appendHead := func(tid uint32, head *lineageHead) {
+		if index, _ := head.load(); index != 0 {
+			if clock := v.segment.get(tid, v.version); clock != 0 {
+				*finite = append(*finite, FiniteRange{First: tid, Last: tid, Clock: clock})
+			}
+		}
+	}
+	if v.segment.ownerOnly {
+		appendHead(v.segment.ownerTID, &v.segment.ownerHead)
+	}
+	for offset := range v.segment.denseHeads {
+		appendHead(v.segment.denseBase+uint32(offset), &v.segment.denseHeads[offset])
+	}
+	for i := range v.segment.cells {
+		if key := v.segment.cells[i].key.Load(); key != 0 {
+			appendHead(uint32(key-1), &v.segment.cells[i].head)
+		}
+	}
+}
+
+// Owns reports whether view belongs to this lineage family.
+func (l *ClockLineage) Owns(view CausalView) bool {
+	return l != nil && view.Valid() && view.segment.family == l.family
 }
 
 func (v CausalView) Snapshot() *ClockSnapshot {

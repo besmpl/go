@@ -232,6 +232,14 @@ type RaceContext struct {
 	// immutable identity, which makes a rooted stale entry fail revalidation.
 	SyncCache     [SyncCacheSlots]SyncCacheEntry
 	SyncCacheNext uint8
+
+	// Fork probation remains context-owned so the allocation-sensitive
+	// VectorClock stays in its original 448-byte allocator class. These fields
+	// occupy existing trailing padding on 64-bit targets. Five consecutive fork
+	// captures promote the exact clock to shared immutable ancestry; an import
+	// or unrelated owner advance restarts probation.
+	forkProbeCount      uint8
+	forkProbeOwnerClock uint32
 }
 
 // LookupSyncVar returns the rooted exact-address synchronization identity.
@@ -306,6 +314,35 @@ func (rc *RaceContext) advanceReadCacheGeneration() {
 func (rc *RaceContext) initializeAtomicReleaseTracking(freshOnlyOwn bool) {
 	rc.ForeignGeneration = 1
 	rc.freshOnlyOwn = freshOnlyOwn
+}
+
+// PrepareForkLineage selects immutable ancestry only after sibling-like reuse.
+// Small fan-outs stay canonical; once promoted, every later fork maintains the
+// exact lineage and inherits it with a shallow retained clone.
+func (rc *RaceContext) PrepareForkLineage() bool {
+	if rc == nil || rc.C == nil {
+		return false
+	}
+	if rc.C.ContinueOwnerLineage(rc.TID) {
+		rc.forkProbeCount = 5
+		rc.forkProbeOwnerClock = rc.C.Get(rc.TID)
+		return true
+	}
+	clock := rc.C.Get(rc.TID)
+	stable := rc.forkProbeCount != 0 && rc.forkProbeOwnerClock != ^uint32(0) &&
+		clock == rc.forkProbeOwnerClock+1
+	if stable {
+		if rc.forkProbeCount < 5 {
+			rc.forkProbeCount++
+		}
+	} else {
+		rc.forkProbeCount = 1
+	}
+	rc.forkProbeOwnerClock = clock
+	if rc.forkProbeCount < 5 {
+		return false
+	}
+	return rc.C.EnsureOwnerLineage(rc.TID)
 }
 
 // Alloc creates and initializes a new RaceContext for the given thread ID.
@@ -467,6 +504,9 @@ func (rc *RaceContext) NoteForeignImport() {
 	}
 	rc.ForeignGeneration++
 	rc.freshOnlyOwn = false
+	rc.forkProbeCount = 0
+	rc.forkProbeOwnerClock = 0
+	rc.C.CollapseIsolatedForkLineage()
 }
 
 // FreshOnlyOwn reports whether the context was constructed with no inherited
@@ -892,5 +932,26 @@ func AllocWithParentClock(tid uint32, parentClock *vectorclock.VectorClock, star
 	// Step 3: Initialize cached epoch.
 	ctx.Epoch = epoch.NewEpoch(tid, uint64(startClock))
 
+	return ctx
+}
+
+// AllocWithOwnedParentClock consumes an exclusively owned detached pre-fork
+// image as the child's live clock. Unlike AllocWithParentClock it performs no
+// second copy: the spawn record has already detached every mutable component
+// from the live parent before the parent advances past the fork.
+//
+// A non-nil parentClock is consumed even though the returned RaceContext keeps
+// the same pointer; the caller must neither use nor release it afterwards.
+func AllocWithOwnedParentClock(tid uint32, parentClock *vectorclock.VectorClock, startClock uint32) *RaceContext {
+	if parentClock == nil {
+		return nil
+	}
+	if startClock == 0 {
+		startClock = 1
+	}
+	parentClock.Set(tid, startClock)
+	ctx := &RaceContext{TID: tid, C: parentClock}
+	ctx.initializeAtomicReleaseTracking(false)
+	ctx.Epoch = epoch.NewEpoch(tid, uint64(startClock))
 	return ctx
 }

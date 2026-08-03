@@ -7,6 +7,54 @@ import (
 	"testing"
 )
 
+func TestOwnerClockLineageCompactPinnedVersions(t *testing.T) {
+	lineage, first := NewOwnerClockLineage(1<<20, 7)
+	defer lineage.Release()
+	defer first.Release()
+	if !first.segment.ownerOnly || len(first.segment.cells) != 0 || len(first.segment.denseHeads) != 0 {
+		t.Fatal("owner lineage allocated the generic coordinate index")
+	}
+	owned, ok := first.Duplicate()
+	if !ok {
+		t.Fatal("could not duplicate owner view")
+	}
+	if _, ok := lineage.AppendOwned(&owned, 1<<20, 8); !ok {
+		t.Fatal("owner append did not publish")
+	}
+	defer owned.Release()
+	if got := first.Get(1 << 20); got != 7 {
+		t.Fatalf("old pin observed later append: got %d want 7", got)
+	}
+	if got := owned.Get(1 << 20); got != 8 {
+		t.Fatalf("owned pin = %d, want 8", got)
+	}
+	var finite []FiniteRange
+	var retired []RetiredRange
+	first.AppendReleaseComponents(&finite, &retired)
+	finite, retired = CanonicalizeReleaseRanges(finite, retired)
+	clock := New()
+	clock.JoinCanonicalRanges(finite)
+	clock.RetireRanges(retired)
+	defer clock.Release()
+	if got := clock.Get(1 << 20); got != 7 {
+		t.Fatalf("direct pinned enumeration = %d, want 7", got)
+	}
+}
+
+func TestOwnerClockLineagePromotesOnForeignAppend(t *testing.T) {
+	lineage, view := NewOwnerClockLineage(77, 2)
+	defer lineage.Release()
+	defer view.Release()
+	if _, ok := lineage.Append(88, 5); !ok {
+		t.Fatal("foreign append did not rotate to generic index")
+	}
+	pinned := lineage.Pin()
+	defer pinned.Release()
+	if pinned.segment.ownerOnly || pinned.Get(77) != 2 || pinned.Get(88) != 5 {
+		t.Fatal("foreign append changed the exact owner-lineage image")
+	}
+}
+
 func TestClockLineagePinnedVersionsDifferential(t *testing.T) {
 	anchor := New()
 	anchor.Set(1, 7)

@@ -423,6 +423,10 @@ func (vc *VectorClock) Freeze() *ClockSnapshot {
 	root := vc.snapshotLogical()
 	vc.clearOwned()
 	vc.causal.Release()
+	if vc.ownerLineage != nil {
+		vc.ownerLineage.Release()
+		vc.ownerLineage = nil
+	}
 	vc.base = root
 	return root
 }
@@ -494,16 +498,21 @@ func (vc *VectorClock) materializeBase() {
 // base/owned representation. It is a cold boundary for overflow and destructive
 // operations; inline synchronization never reaches it before capacity.
 func (vc *VectorClock) materializeCausal() {
-	if !vc.causal.Valid() {
+	if !vc.causal.Valid() && vc.ownerLineage == nil {
 		return
 	}
 	roots := vc.causal
 	vc.causal = causalRootSet{}
+	owner := vc.ownerLineage
+	vc.ownerLineage = nil
 	for i := 0; i < int(roots.count); i++ {
 		imported := roots.roots[i].materialize()
 		roots.roots[i].Release()
 		vc.Join(imported)
 		imported.Release()
+	}
+	if owner != nil {
+		owner.Release()
 	}
 }
 

@@ -334,7 +334,7 @@ type spawnInfo struct {
 	id          uint64                   // Stable token returned by racegostart
 	parentGID   int64                    // GID of parent goroutine
 	childGoid   int64                    // GID of child goroutine (0 = unknown, use FIFO)
-	parentClock *vectorclock.VectorClock // Snapshot of parent's clock at fork
+	parentClock *vectorclock.VectorClock // Exclusive detached pre-fork image
 	pc          uintptr                  // Program counter of go statement (for stack traces)
 	createdAtNs int64                    // Creation time in nanoseconds (for TTL-based cleanup)
 	consumed    atomic.Uint32            // 1 if child has claimed this context
@@ -508,20 +508,26 @@ func racegostart(pc uintptr) uintptr {
 	return enqueueSpawn(pc, parentGID, parentCtx)
 }
 
-func enqueueSpawn(pc uintptr, parentGID int64, parentCtx *goroutine.RaceContext) uintptr {
-	var spawnClock *vectorclock.VectorClock
-	if parentCtx != nil && parentCtx.C != nil {
-		next := parentCtx.PreflightClockAdvance()
-		// Fork snapshots must not turn the live parent's dense tail into a
-		// copy-on-write source after its clock-advance preflight. The parent
-		// commits immediately below, so publish a fully detached child image.
-		spawnClock = parentCtx.C.CloneDetached()
-		parentCtx.CommitClockAdvance(next)
+func captureForkClock(parentCtx *goroutine.RaceContext) *vectorclock.VectorClock {
+	if parentCtx == nil || parentCtx.C == nil {
+		return nil
 	}
+	// After repeated sibling-like forks, collapse the exact parent image behind
+	// one immutable lineage root. CloneDetached then becomes a shallow retained
+	// fork image irrespective of ancestry width. The child consumes that image
+	// directly, avoiding both a second full copy and a projection holder.
+	shareLineage := parentCtx.PrepareForkLineage()
+	next := parentCtx.PreflightClockAdvance()
+	captured := parentCtx.C.CloneForkDetached(shareLineage)
+	parentCtx.CommitClockAdvance(next)
+	return captured
+}
+
+func enqueueSpawn(pc uintptr, parentGID int64, parentCtx *goroutine.RaceContext) uintptr {
 	info := &spawnInfo{
 		id:          nextSpawnID.Add(1),
 		parentGID:   parentGID,
-		parentClock: spawnClock,
+		parentClock: captureForkClock(parentCtx),
 		pc:          pc,
 		createdAtNs: nanotime(),
 	}
@@ -596,24 +602,12 @@ func raceContextStartFromRuntime(creationPC uintptr, spawnctx uintptr) uintptr {
 		return 0
 	}
 
-	var parent *goroutine.RaceContext
-	var parentNext uint64
+	var parentClock *vectorclock.VectorClock
 	if spawnctx > 1 {
-		parent = (*goroutine.RaceContext)(unsafe.Pointer(spawnctx))
-		if parent.C != nil {
-			parentNext = parent.PreflightClockAdvance()
-		}
+		parentClock = captureForkClock((*goroutine.RaceContext)(unsafe.Pointer(spawnctx)))
 	}
 	tid, startClock := allocTID()
-	var ctx *goroutine.RaceContext
-	if parent != nil {
-		if parentNext != 0 {
-			// Copy before advancing: the child observes everything before the
-			// fork, while later parent operations remain unordered with it.
-			ctx = goroutine.AllocWithParentClock(tid, parent.C, startClock)
-			parent.CommitClockAdvance(parentNext)
-		}
-	}
+	ctx := goroutine.AllocWithOwnedParentClock(tid, parentClock, startClock)
 	if ctx == nil {
 		ctx = goroutine.AllocWithStartClock(tid, startClock)
 	}
@@ -739,15 +733,10 @@ func raceGoSetChildIDWithCtx(childGoid int64, spawnID uintptr) uintptr {
 	// binding is lifecycle maintenance, so it remains active while access and
 	// synchronization events are disabled.
 	claimed := claimSpawnContextByID(spawnID, childGoid)
-	parentClock := claimed.parentClock
 
 	// Step 2: Eagerly create the child's RaceContext.
-	var ctx *goroutine.RaceContext
-	if parentClock != nil {
-		ctx = goroutine.AllocWithParentClock(tid, parentClock, startClock)
-		// Release the spawn clock clone back to pool (data already copied).
-		parentClock.Release()
-	} else {
+	ctx := goroutine.AllocWithOwnedParentClock(tid, claimed.parentClock, startClock)
+	if ctx == nil {
 		ctx = goroutine.AllocWithStartClock(tid, startClock)
 	}
 	det.RegisterGoroutineCreation(tid, claimed.creationPC)
@@ -1570,16 +1559,10 @@ func getCurrentContext() *goroutine.RaceContext {
 	// Step 3a: Try to find spawn context from parent (GoStart inheritance).
 	// If parent called racegostart() before spawning us, we inherit their clock.
 	claimed := findAndClaimSpawnContext()
-	parentClock := claimed.parentClock
 
 	// Create new RaceContext for this goroutine.
-	var ctx *goroutine.RaceContext
-	if parentClock != nil {
-		// GoStart path: inherit parent's clock.
-		ctx = goroutine.AllocWithParentClock(tid, parentClock, startClock)
-		// Release the spawn clock clone back to pool (data already copied).
-		parentClock.Release()
-	} else {
+	ctx := goroutine.AllocWithOwnedParentClock(tid, claimed.parentClock, startClock)
+	if ctx == nil {
 		// Legacy path: fresh clock.
 		ctx = goroutine.AllocWithStartClock(tid, startClock)
 	}

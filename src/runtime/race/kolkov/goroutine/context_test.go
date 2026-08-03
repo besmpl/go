@@ -11,6 +11,120 @@ import (
 	"runtime/race/kolkov/vectorclock"
 )
 
+func TestAllocWithOwnedParentClockConsumesExactImage(t *testing.T) {
+	parent := vectorclock.New()
+	parent.Set(5, 17)
+	parent.Set(1<<20, 9)
+	if !parent.EnsureOwnerLineage(5) {
+		t.Fatal("parent owner promotion missed")
+	}
+	want := parent.CloneDetached()
+	defer want.Release()
+
+	child := AllocWithOwnedParentClock(77, parent, 3)
+	if child == nil || child.C != parent {
+		t.Fatal("owned parent image was copied instead of consumed")
+	}
+	defer child.C.Release()
+	if got := child.C.Get(5); got != 17 {
+		t.Fatalf("inherited parent coordinate = %d, want 17", got)
+	}
+	if got := child.C.Get(1 << 20); got != 9 {
+		t.Fatalf("inherited sparse coordinate = %d, want 9", got)
+	}
+	if got := child.C.Get(77); got != 3 {
+		t.Fatalf("child coordinate = %d, want 3", got)
+	}
+	if got := want.Get(77); got != 0 {
+		t.Fatalf("immutable pre-child image observed child coordinate %d", got)
+	}
+	if child.Epoch != epoch.NewEpoch(77, 3) {
+		t.Fatalf("child epoch = %v, want tid 77 clock 3", child.Epoch)
+	}
+	if got := AllocWithOwnedParentClock(88, nil, 1); got != nil {
+		got.C.Release()
+		t.Fatal("nil owned image created a context")
+	}
+}
+
+func TestPrepareForkLineagePromotesOnlyStableFanOut(t *testing.T) {
+	ctx := Alloc(7)
+	defer ctx.C.Release()
+	if ctx.PrepareForkLineage() {
+		t.Fatal("first fork unexpectedly promoted")
+	}
+	for ownerClock := uint32(2); ownerClock < 5; ownerClock++ {
+		ctx.C.Set(ctx.TID, ownerClock)
+		if ctx.PrepareForkLineage() {
+			t.Fatalf("fork %d promoted before the fan-out threshold", ownerClock)
+		}
+	}
+	ctx.C.Set(ctx.TID, 5)
+	if !ctx.PrepareForkLineage() {
+		t.Fatal("stable larger fan-out did not promote")
+	}
+	ctx.C.Set(ctx.TID, 6)
+	if !ctx.PrepareForkLineage() {
+		t.Fatal("promoted lineage was not maintained")
+	}
+}
+
+func TestPrepareForkLineageRestartsAfterImportOrOwnerJump(t *testing.T) {
+	ctx := Alloc(9)
+	defer ctx.C.Release()
+	if ctx.PrepareForkLineage() {
+		t.Fatal("first fork unexpectedly promoted")
+	}
+	ctx.NoteForeignImport()
+	for ownerClock := uint32(2); ownerClock < 6; ownerClock++ {
+		ctx.C.Set(ctx.TID, ownerClock)
+		if ctx.PrepareForkLineage() {
+			t.Fatalf("fork %d promoted before post-import probation completed", ownerClock)
+		}
+	}
+	ctx.C.Set(ctx.TID, 6)
+	if !ctx.PrepareForkLineage() {
+		t.Fatal("stable post-import fan-out did not promote")
+	}
+
+	other := Alloc(11)
+	defer other.C.Release()
+	if other.PrepareForkLineage() {
+		t.Fatal("first fork unexpectedly promoted")
+	}
+	other.C.Set(other.TID, 3)
+	if other.PrepareForkLineage() {
+		t.Fatal("unrelated owner advance did not restart probation")
+	}
+}
+
+func BenchmarkForkInheritance(b *testing.B) {
+	parent := vectorclock.New()
+	defer parent.Release()
+	parent.JoinRange(1<<20, 1<<20+1023, 3)
+	parent.Set(5, 17)
+	if !parent.EnsureOwnerLineage(5) {
+		b.Fatal("parent owner promotion missed")
+	}
+	b.Run("canonical-capture-copy", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			captured := parent.CloneDetached()
+			child := AllocWithParentClock(1<<24, captured, 1)
+			captured.Release()
+			child.C.Release()
+		}
+	})
+	b.Run("lineage-capture-transfer", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			captured := parent.CloneDetached()
+			child := AllocWithOwnedParentClock(1<<24, captured, 1)
+			child.C.Release()
+		}
+	})
+}
+
 func TestRaceContextLayoutOffsets(t *testing.T) {
 	var ctx RaceContext
 	ptrSize := unsafe.Sizeof(uintptr(0))

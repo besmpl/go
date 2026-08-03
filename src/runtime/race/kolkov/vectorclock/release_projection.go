@@ -314,13 +314,7 @@ func (p *ReleaseProjection) AppendRanges(finite *[]FiniteRange, retired *[]Retir
 		})
 	}
 	for i := 0; i < int(p.rootN); i++ {
-		root := p.roots[i].materialize()
-		root.rangeOwnedRuns(func(first, last, clock uint32) bool {
-			*finite = append(*finite, FiniteRange{First: first, Last: last, Clock: clock})
-			return true
-		})
-		*retired = append(*retired, root.retired...)
-		root.Release()
+		p.roots[i].AppendReleaseComponents(finite, retired)
 	}
 	p.appendDenseRanges(finite)
 	*finite = append(*finite, p.finite[:p.finiteN]...)
@@ -754,13 +748,7 @@ func AppendCoalescedReleaseComponents(bases []*ClockSnapshot, roots []CausalView
 		i = j
 	}
 	for _, root := range coalesceReleaseRoots(roots) {
-		materialized := root.materialize()
-		materialized.rangeOwnedRuns(func(first, last, clock uint32) bool {
-			*finite = append(*finite, FiniteRange{First: first, Last: last, Clock: clock})
-			return true
-		})
-		*retired = append(*retired, materialized.retired...)
-		materialized.Release()
+		root.AppendReleaseComponents(finite, retired)
 		root.Release()
 	}
 }

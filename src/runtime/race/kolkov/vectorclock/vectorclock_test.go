@@ -8,6 +8,145 @@ import (
 	"unsafe"
 )
 
+func TestOwnerLineageAdvanceCloneAndCollapseExact(t *testing.T) {
+	clock := New()
+	defer clock.Release()
+	clock.Set(9000, 3)
+	clock.Set(42, 9)
+	if !clock.EnsureOwnerLineage(9000) {
+		t.Fatal("owner promotion missed")
+	}
+	clock.PrepareKnownMonotonicSet(9000)
+	if !clock.CanSetKnownMonotonicAlive(9000) {
+		t.Fatal("reserved owner append not allocation-free")
+	}
+	clock.SetKnownMonotonicAlive(9000, 4)
+	clone := clock.Clone()
+	defer clone.Release()
+	if clone.ownerLineage != nil || clone.Get(9000) != 4 || clone.Get(42) != 9 {
+		t.Fatal("clone did not inherit only the immutable owner view")
+	}
+	clock.Set(9000, 2)
+	if clock.ownerLineage != nil || clock.Get(9000) != 2 || clock.Get(42) != 9 {
+		t.Fatal("destructive owner set did not collapse exact roots")
+	}
+	if clone.Get(9000) != 4 {
+		t.Fatal("owner collapse mutated an existing immutable clone")
+	}
+}
+
+func TestOwnerLineageAnchorsFullClockAndReanchorsResidualExactly(t *testing.T) {
+	clock := New()
+	defer clock.Release()
+	const owner = uint32(9000)
+	clock.Set(owner, 3)
+	for tid := uint32(1); tid <= 128; tid++ {
+		clock.Set(tid, tid+10)
+	}
+	wantInitial := clock.CloneDetached()
+	defer wantInitial.Release()
+	if !clock.EnsureOwnerLineage(owner) {
+		t.Fatal("full-clock owner promotion missed")
+	}
+	if clock.base != nil || !clock.ownedEmpty() || clock.causal.count != 1 {
+		t.Fatalf("promotion did not collapse to one immutable root: base=%p ownedEmpty=%v roots=%d", clock.base, clock.ownedEmpty(), clock.causal.count)
+	}
+	if !clock.LessOrEqual(wantInitial) || !wantInitial.LessOrEqual(clock) {
+		t.Fatal("full-clock promotion changed the logical clock")
+	}
+
+	oldProjection := PinReleaseProjection(clock)
+	defer oldProjection.Release()
+	oldVersion := clock.causal.roots[0].Version()
+	oldFamily := clock.causal.roots[0]
+	clock.Set(owner, 4)
+	clock.Set(1<<20, 77)
+	wantReanchored := clock.CloneDetached()
+	defer wantReanchored.Release()
+	if !clock.EnsureOwnerLineage(owner) {
+		t.Fatal("residual reanchor missed")
+	}
+	if clock.base != nil || !clock.ownedEmpty() || clock.causal.count != 1 {
+		t.Fatalf("reanchor did not collapse residual: base=%p ownedEmpty=%v roots=%d", clock.base, clock.ownedEmpty(), clock.causal.count)
+	}
+	if !clock.causal.roots[0].SameFamily(oldFamily) || clock.causal.roots[0].Version() <= oldVersion {
+		t.Fatal("reanchor did not advance the existing lineage family")
+	}
+	if !clock.LessOrEqual(wantReanchored) || !wantReanchored.LessOrEqual(clock) {
+		t.Fatal("residual reanchor changed the logical clock")
+	}
+
+	oldClock := New()
+	defer oldClock.Release()
+	oldProjection.JoinInto(oldClock)
+	if !oldClock.LessOrEqual(wantInitial) || !wantInitial.LessOrEqual(oldClock) {
+		t.Fatal("reanchor mutated a previously pinned fork projection")
+	}
+}
+
+func TestCloneForkDetachedMaterializesProbationaryOwnerLineage(t *testing.T) {
+	clock := New()
+	defer clock.Release()
+	clock.Set(9000, 3)
+	clock.Set(1<<20, 7)
+	if !clock.EnsureOwnerLineage(9000) {
+		t.Fatal("owner promotion missed")
+	}
+
+	probationary := clock.CloneForkDetached(false)
+	defer probationary.Release()
+	if probationary.ownerLineage != nil || probationary.causal.Valid() ||
+		probationary.Get(9000) != 3 || probationary.Get(1<<20) != 7 {
+		t.Fatal("probationary fork did not materialize the exact owner ancestry")
+	}
+
+	shared := clock.CloneForkDetached(true)
+	defer shared.Release()
+	if shared.ownerLineage != nil || !shared.causal.Valid() ||
+		shared.Get(9000) != 3 || shared.Get(1<<20) != 7 {
+		t.Fatal("confirmed fan-out did not retain immutable owner ancestry")
+	}
+}
+
+func TestIsolatedForkLineageLowersButSiblingCohortStaysShared(t *testing.T) {
+	parent := New()
+	defer parent.Release()
+	parent.Set(9000, 3)
+	parent.Set(1<<20, 7)
+	if !parent.EnsureOwnerLineage(9000) {
+		t.Fatal("owner promotion missed")
+	}
+
+	isolated := parent.CloneForkDetached(true)
+	defer isolated.Release()
+	if !isolated.CollapseIsolatedForkLineage() || isolated.causal.Valid() ||
+		isolated.Get(9000) != 3 || isolated.Get(1<<20) != 7 {
+		t.Fatal("isolated child did not lower its exact inherited ancestry")
+	}
+	if parent.ContinueOwnerLineage(9000) {
+		t.Fatal("isolated family remained eligible for direct republication")
+	}
+	parent.PrepareKnownMonotonicSet(9000)
+	if parent.ownerLineage != nil || parent.Get(9000) != 3 || parent.Get(1<<20) != 7 {
+		t.Fatal("isolated private writer did not lower before its next publication")
+	}
+
+	cohortParent := New()
+	defer cohortParent.Release()
+	cohortParent.Set(77, 1)
+	if !cohortParent.EnsureOwnerLineage(77) {
+		t.Fatal("cohort parent promotion missed")
+	}
+	cohort := make([]*VectorClock, 16)
+	for i := range cohort {
+		cohort[i] = cohortParent.CloneForkDetached(true)
+		defer cohort[i].Release()
+	}
+	if cohort[0].CollapseIsolatedForkLineage() || !cohort[0].causal.Valid() {
+		t.Fatal("live sibling cohort was mistaken for an isolated child")
+	}
+}
+
 type pointClockModel struct {
 	finite  map[uint32]uint32
 	retired map[uint32]bool
